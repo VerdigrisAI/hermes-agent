@@ -2559,14 +2559,22 @@ def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "payment error",
-) -> Tuple[Optional[Any], Optional[str], str]:
+) -> Tuple[Optional[Any], Optional[str], str, str]:
     """Try alternative providers after a payment/credit or connection error.
 
     Iterates the standard auto-detection chain, skipping the provider that
     failed.
 
     Returns:
-        (client, model, provider_label) or (None, None, "") if no fallback.
+        (client, model, provider, provider_label) or (None, None, "", "")
+        if no fallback. ``provider`` is the canonical provider identifier
+        consumed by ``_build_call_kwargs``'s routing (e.g. "openrouter",
+        "azure-foundry"); ``provider_label`` is a human-readable string
+        used in logs only. They are kept distinct because ``_build_call_kwargs``
+        routes max_tokens vs max_completion_tokens by exact-string match on
+        provider — a label like ``main-agent(azure-foundry)`` would
+        silently fall through to the default ``max_tokens`` branch,
+        re-introducing Z2O-1623 (Azure 400 on reasoning models).
     """
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
@@ -2582,6 +2590,16 @@ def _try_payment_fallback(
                        "custom": "local/custom", "local/custom": "local/custom"}
     skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
 
+    # Map chain labels back to the canonical provider identifier
+    # ``_build_call_kwargs`` routes on. Most chain keys ARE the provider
+    # ("openrouter", "nous", "openai-codex"), but "local/custom" → "custom":
+    # the chain key is human-friendly, the routing key is bare. Without
+    # this inversion, payment-chain fallbacks to a custom endpoint pointed
+    # at api.openai.com would re-introduce the same class of bug as
+    # Z2O-1623 one frame deeper — emitting max_tokens instead of
+    # max_completion_tokens for reasoning models.
+    _label_to_provider = {"local/custom": "custom"}
+
     tried = []
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
@@ -2596,21 +2614,22 @@ def _try_payment_fallback(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
             )
-            return client, model, label
+            provider = _label_to_provider.get(label, label)
+            return client, model, provider, label
         tried.append(label)
 
     logger.warning(
         "Auxiliary %s: %s on %s and no fallback available (tried: %s)",
         task or "call", reason, failed_provider, ", ".join(tried),
     )
-    return None, None, ""
+    return None, None, "", ""
 
 
 def _try_main_agent_model_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "error",
-) -> Tuple[Optional[Any], Optional[str], str]:
+) -> Tuple[Optional[Any], Optional[str], str, str]:
     """Last-resort fallback to the user's main agent provider + model.
 
     Used after the configured fallback_chain is exhausted (or empty) for
@@ -2622,20 +2641,23 @@ def _try_main_agent_model_fallback(
     retrying the same backend that just failed).
 
     Returns:
-        (client, model, provider_label) or (None, None, "") if no fallback.
+        (client, model, provider, provider_label) or (None, None, "", "")
+        if no fallback. See ``_try_payment_fallback`` docstring for why the
+        provider identifier is returned separately from the human-readable
+        label.
     """
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
-        return None, None, ""
+        return None, None, "", ""
 
     skip = (failed_provider or "").lower().strip()
     if main_provider.lower() == skip:
         # The thing that failed IS the main model — nothing to fall back to.
-        return None, None, ""
+        return None, None, "", ""
     if _is_provider_unhealthy(main_provider):
         _log_skip_unhealthy(main_provider, task)
-        return None, None, ""
+        return None, None, "", ""
 
     try:
         client, resolved_model = resolve_provider_client(
@@ -2645,21 +2667,21 @@ def _try_main_agent_model_fallback(
         client, resolved_model = None, None
 
     if client is None:
-        return None, None, ""
+        return None, None, "", ""
 
     label = f"main-agent({main_provider})"
     logger.info(
         "Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
         task or "call", reason, failed_provider, label, resolved_model or main_model,
     )
-    return client, resolved_model or main_model, label
+    return client, resolved_model or main_model, main_provider, label
 
 
 def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
     reason: str = "error",
-) -> Tuple[Optional[Any], Optional[str], str]:
+) -> Tuple[Optional[Any], Optional[str], str, str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
     Reads auxiliary.<task>.fallback_chain from config.yaml and tries each
@@ -2667,15 +2689,22 @@ def _try_configured_fallback_chain(
     ``base_url``, and ``api_key`` are optional.
 
     Returns:
-        (client, model, provider_label) or (None, None, "") if no fallback.
+        (client, model, provider, provider_label) or (None, None, "", "")
+        if no fallback. ``provider`` is the canonical identifier from the
+        chain entry (e.g. "azure-foundry"); ``provider_label`` is a
+        formatted log-only string like ``fallback_chain[0](azure-foundry)``.
+        See ``_try_payment_fallback`` for why these are returned separately
+        — passing the label as the provider to ``_build_call_kwargs`` was
+        Z2O-1623: every chain entry pointed at Azure reasoning models got
+        max_tokens instead of max_completion_tokens and 400'd.
     """
     if not task:
-        return None, None, ""
+        return None, None, "", ""
 
     task_config = _get_auxiliary_task_config(task)
     chain = task_config.get("fallback_chain")
     if not chain or not isinstance(chain, list):
-        return None, None, ""
+        return None, None, "", ""
 
     skip = failed_provider.lower().strip()
     tried = []
@@ -2703,7 +2732,7 @@ def _try_configured_fallback_chain(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, fb_model or "default",
             )
-            return fb_client, fb_model, label
+            return fb_client, fb_model, fb_provider, label
         tried.append(label)
 
     if tried:
@@ -2711,7 +2740,7 @@ def _try_configured_fallback_chain(
             "Auxiliary %s: configured fallback_chain exhausted (tried: %s)",
             task, ", ".join(tried),
         )
-    return None, None, ""
+    return None, None, "", ""
 
 
 def _resolve_single_provider(
@@ -4751,20 +4780,24 @@ def call_llm(
             # when the user left `provider: auto`, defeating the point of
             # configuring a chain. Now the configured chain is consulted first
             # in BOTH branches.
-            fb_client, fb_model, fb_label = (None, None, "")
-            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+            # Z2O-1623: _build_call_kwargs routes max_tokens vs
+            # max_completion_tokens by exact-string provider match. Pass
+            # fb_provider (e.g. "azure-foundry") to that arg; reserve
+            # fb_label (e.g. "fallback_chain[0](azure-foundry)") for logs.
+            fb_client, fb_model, fb_provider, fb_label = (None, None, "", "")
+            fb_client, fb_model, fb_provider, fb_label = _try_configured_fallback_chain(
                 task, resolved_provider or "auto", reason=reason)
             if fb_client is None:
                 if is_auto:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                    fb_client, fb_model, fb_provider, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
                 else:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    fb_client, fb_model, fb_provider, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
+                    fb_provider, fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
@@ -5100,21 +5133,22 @@ async def async_call_llm(
 
             # Fallback order (#26882, #26803) — mirrors sync path above:
             # configured fallback_chain first regardless of auto, then auto
-            # chain or main-model.
-            fb_client, fb_model, fb_label = (None, None, "")
-            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+            # chain or main-model. Z2O-1623: pass fb_provider (not fb_label)
+            # to _build_call_kwargs — see sync branch above.
+            fb_client, fb_model, fb_provider, fb_label = (None, None, "", "")
+            fb_client, fb_model, fb_provider, fb_label = _try_configured_fallback_chain(
                 task, resolved_provider or "auto", reason=reason)
             if fb_client is None:
                 if is_auto:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                    fb_client, fb_model, fb_provider, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
                 else:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    fb_client, fb_model, fb_provider, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
                 fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
+                    fb_provider, fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,

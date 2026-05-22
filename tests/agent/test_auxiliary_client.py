@@ -1052,7 +1052,7 @@ class TestTryPaymentFallback:
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_nous", return_value=(mock_client, "nous-model")), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
-            client, model, label = _try_payment_fallback("openrouter", task="compression")
+            client, model, provider, label = _try_payment_fallback("openrouter", task="compression")
         assert client is mock_client
         assert model == "nous-model"
         assert label == "nous"
@@ -1063,7 +1063,7 @@ class TestTryPaymentFallback:
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
-            client, model, label = _try_payment_fallback("openrouter")
+            client, model, provider, label = _try_payment_fallback("openrouter")
         assert client is None
         assert label == ""
 
@@ -1072,7 +1072,7 @@ class TestTryPaymentFallback:
         mock_client = MagicMock()
         with patch("agent.auxiliary_client._try_openrouter", return_value=(mock_client, "or-model")), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openai-codex"):
-            client, model, label = _try_payment_fallback("openai-codex", task="vision")
+            client, model, provider, label = _try_payment_fallback("openai-codex", task="vision")
         assert client is mock_client
         assert label == "openrouter"
 
@@ -1087,7 +1087,7 @@ class TestTryPaymentFallback:
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
-            client, model, label = _try_payment_fallback("openrouter")
+            client, model, provider, label = _try_payment_fallback("openrouter")
         assert client is None
         assert model is None
         assert label == ""
@@ -1143,7 +1143,7 @@ class TestCallLlmPaymentFallback:
              patch("agent.auxiliary_client._resolve_task_provider_model",
                     return_value=("auto", "xiaomi/mimo-v2-pro", None, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
-                    return_value=(fallback_client, "fallback-model", "openrouter")):
+                    return_value=(fallback_client, "fallback-model", "openrouter", "openrouter")):
             result = call_llm(
                 task="session_search",
                 messages=[{"role": "user", "content": "hello"}],
@@ -1179,7 +1179,7 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
              patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(chain_client, "gpt-4o-mini", "fallback_chain[0](openai)")), \
+                   return_value=(chain_client, "gpt-4o-mini", "openai", "fallback_chain[0](openai)")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
                    side_effect=main_called):
             result = call_llm(
@@ -1208,9 +1208,9 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
              patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(None, None, "")), \
+                   return_value=(None, None, "", "")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
-                   return_value=(main_client, "claude-sonnet-4", "main-agent(openrouter)")):
+                   return_value=(main_client, "claude-sonnet-4", "openrouter", "main-agent(openrouter)")):
             result = call_llm(
                 task="vision",
                 messages=[{"role": "user", "content": "hello"}],
@@ -1230,9 +1230,9 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("glm", "glm-4v-flash", None, None, None)), \
              patch("agent.auxiliary_client._try_configured_fallback_chain",
-                   return_value=(None, None, "")), \
+                   return_value=(None, None, "", "")), \
              patch("agent.auxiliary_client._try_main_agent_model_fallback",
-                   return_value=(None, None, "")), \
+                   return_value=(None, None, "", "")), \
              caplog.at_level("WARNING", logger="agent.auxiliary_client"):
             with pytest.raises(Exception, match="Payment Required"):
                 call_llm(
@@ -1252,7 +1252,7 @@ class TestTryMainAgentModelFallback:
         from agent.auxiliary_client import _try_main_agent_model_fallback
         with patch("agent.auxiliary_client._read_main_provider", return_value="auto"), \
              patch("agent.auxiliary_client._read_main_model", return_value="some-model"):
-            client, model, label = _try_main_agent_model_fallback("glm", task="vision")
+            client, model, provider, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is None and model is None and label == ""
 
     def test_returns_none_when_failed_provider_equals_main(self):
@@ -1260,7 +1260,7 @@ class TestTryMainAgentModelFallback:
         from agent.auxiliary_client import _try_main_agent_model_fallback
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"):
-            client, model, label = _try_main_agent_model_fallback("openrouter", task="vision")
+            client, model, provider, label = _try_main_agent_model_fallback("openrouter", task="vision")
         assert client is None and label == ""
 
     def test_resolves_main_provider_client(self):
@@ -1271,7 +1271,7 @@ class TestTryMainAgentModelFallback:
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
              patch("agent.auxiliary_client.resolve_provider_client",
                    return_value=(fake_client, "anthropic/claude-sonnet-4")):
-            client, model, label = _try_main_agent_model_fallback("glm", task="vision")
+            client, model, provider, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is fake_client
         assert model == "anthropic/claude-sonnet-4"
         assert label == "main-agent(openrouter)"
@@ -1281,7 +1281,7 @@ class TestTryMainAgentModelFallback:
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"), \
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=True):
-            client, model, label = _try_main_agent_model_fallback("glm", task="vision")
+            client, model, provider, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is None
 
 
@@ -2551,7 +2551,7 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                 return_value=(poisoned, "gpt-5.5"),
             ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
-                return_value=(None, None, ""),
+                return_value=(None, None, "", ""),
             ):
                 with pytest.raises(ConnectionError):
                     call_llm(
@@ -2587,7 +2587,7 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                 return_value=(poisoned, "gpt-5.5"),
             ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
-                return_value=(None, None, ""),
+                return_value=(None, None, "", ""),
             ):
                 with pytest.raises(ConnectionError):
                     await async_call_llm(
@@ -2946,7 +2946,7 @@ class TestAuxUnhealthyCache:
              patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
              patch("agent.auxiliary_client._try_custom_endpoint") as custom_try, \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
-            client, model, label = _try_payment_fallback("openrouter", task="compression")
+            client, model, provider, label = _try_payment_fallback("openrouter", task="compression")
         assert client is nous_client
         assert label == "nous"
         # OR is skipped via skip_chain_labels (failed provider), custom via unhealthy cache.
@@ -2981,7 +2981,7 @@ class TestAuxUnhealthyCache:
              patch("agent.auxiliary_client._resolve_task_provider_model",
                     return_value=("auto", "google/gemini-3-flash-preview", None, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
-                    return_value=(nous_client, "n-model", "nous")), \
+                    return_value=(nous_client, "n-model", "nous", "nous")), \
              patch("agent.auxiliary_client._build_call_kwargs",
                     return_value={"model": "n-model", "messages": [{"role": "user", "content": "hi"}]}):
             assert _is_provider_unhealthy("openrouter") is False
@@ -3091,11 +3091,11 @@ class TestZ2O1579ConfiguredFallbackChainFix:
 
         def configured_chain_side_effect(*args, **kwargs):
             call_order.append("configured")
-            return (configured_fb_client, "gpt-5.5", "fallback_chain[0](azure-foundry)")
+            return (configured_fb_client, "gpt-5.5", "azure-foundry", "fallback_chain[0](azure-foundry)")
 
         def payment_fb_side_effect(*args, **kwargs):
             call_order.append("payment")
-            return (None, None, "")
+            return (None, None, "", "")
 
         with patch(
             "agent.auxiliary_client._get_cached_client",
@@ -3238,3 +3238,172 @@ class TestZ2O1620PoolMayRecoverFromRateLimitImport:
         # (returns False per the existing test in
         # tests/run_agent/test_provider_fallback.py).
         assert run_agent_mod._pool_may_recover_from_rate_limit(None) is False
+
+
+class TestZ2O1623FallbackProviderRouting:
+    """Regression for Z2O-1623. The three auxiliary fallback resolvers
+    (_try_configured_fallback_chain, _try_payment_fallback,
+    _try_main_agent_model_fallback) historically returned
+    (client, model, label) where ``label`` was a formatted log string
+    like ``fallback_chain[0](azure-foundry)`` or
+    ``main-agent(azure-foundry)``. The fallback call site in
+    ``call_llm`` then passed that label as the ``provider`` argument
+    to ``_build_call_kwargs``, defeating its exact-string routing
+    (``elif provider in {"azure", "azure-foundry"} and ...``). Result:
+    Azure reasoning-model fallbacks emitted ``max_tokens`` instead of
+    ``max_completion_tokens`` and 400'd, even though
+    ``_build_call_kwargs`` itself was correctly fixed in PR #8 / the
+    Z2O-1621 patch.
+
+    The fix extends the resolver return tuples to
+    (client, model, provider, label) and updates the call sites to
+    pass the provider — not the label — to ``_build_call_kwargs``.
+
+    These tests lock in:
+      1. Each resolver returns the canonical provider identifier as
+         the 3rd tuple element.
+      2. The full fallback flow in ``call_llm`` builds kwargs with
+         ``max_completion_tokens`` (not ``max_tokens``) when the
+         configured chain points at azure-foundry + gpt-5.5.
+    """
+
+    def test_configured_fallback_chain_returns_provider_identifier(self):
+        """The 3rd tuple element must be the chain entry's provider
+        string (e.g. 'azure-foundry'), not the formatted log label."""
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        fake_client = MagicMock()
+        with patch("agent.auxiliary_client._get_auxiliary_task_config",
+                   return_value={"fallback_chain": [
+                       {"provider": "azure-foundry", "model": "gpt-5.5",
+                        "base_url": "https://x.cognitiveservices.azure.com/openai/v1",
+                        "api_key": "fake"}
+                   ]}), \
+             patch("agent.auxiliary_client._resolve_single_provider",
+                   return_value=fake_client):
+            client, model, provider, label = _try_configured_fallback_chain(
+                "title_generation", "azure-foundry-primary", reason="rate limit")
+
+        assert client is fake_client
+        assert model == "gpt-5.5"
+        assert provider == "azure-foundry", (
+            "Resolver must return the canonical provider identifier as "
+            "the 3rd tuple element so _build_call_kwargs can route "
+            "max_tokens vs max_completion_tokens correctly. A label like "
+            "'fallback_chain[0](azure-foundry)' here re-introduces Z2O-1623."
+        )
+        assert label == "fallback_chain[0](azure-foundry)"
+
+    def test_payment_fallback_returns_canonical_provider_for_openrouter(self):
+        """Most payment-chain labels (openrouter, nous, openai-codex) match
+        the canonical provider identifier directly. Lock that in."""
+        from agent.auxiliary_client import _try_payment_fallback
+
+        fake_client = MagicMock()
+        with patch("agent.auxiliary_client._try_openrouter",
+                   return_value=(fake_client, "google/gemini-3-flash-preview")), \
+             patch("agent.auxiliary_client._read_main_provider",
+                   return_value="some-other-provider"):
+            client, model, provider, label = _try_payment_fallback(
+                "some-other-provider", task="title_generation")
+
+        assert client is fake_client
+        assert provider == "openrouter"
+        assert label == "openrouter"
+
+    def test_payment_fallback_inverts_local_custom_to_custom(self):
+        """The "local/custom" chain label must map to "custom" — the
+        canonical provider identifier _build_call_kwargs routes on.
+        Without this inversion, a payment-chain fallback to a custom
+        endpoint at api.openai.com re-introduces the Z2O-1623 bug class:
+        emits max_tokens for reasoning models that require
+        max_completion_tokens."""
+        from agent.auxiliary_client import _try_payment_fallback
+
+        fake_client = MagicMock()
+        with patch("agent.auxiliary_client._try_openrouter",
+                   return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_nous",
+                   return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_custom_endpoint",
+                   return_value=(fake_client, "gpt-5")), \
+             patch("agent.auxiliary_client._read_main_provider",
+                   return_value="some-other-provider"):
+            client, model, provider, label = _try_payment_fallback(
+                "some-other-provider", task="title_generation")
+
+        assert client is fake_client
+        assert provider == "custom", (
+            "local/custom chain label must invert to 'custom' so "
+            "_build_call_kwargs's `elif provider == \"custom\":` "
+            "branch fires. Without this, reasoning models on "
+            "api.openai.com via the custom chain emit max_tokens and 400."
+        )
+        assert label == "local/custom"
+
+    def test_main_agent_model_fallback_returns_provider_identifier(self):
+        """The 3rd tuple element must be the main provider identifier
+        (e.g. 'azure-foundry'), not 'main-agent(azure-foundry)'."""
+        from agent.auxiliary_client import _try_main_agent_model_fallback
+
+        fake_client = MagicMock()
+        with patch("agent.auxiliary_client._read_main_provider",
+                   return_value="azure-foundry"), \
+             patch("agent.auxiliary_client._read_main_model",
+                   return_value="gpt-5.5"), \
+             patch("agent.auxiliary_client._is_provider_unhealthy",
+                   return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fake_client, "gpt-5.5")):
+            client, model, provider, label = _try_main_agent_model_fallback(
+                "different-provider", task="title_generation")
+
+        assert client is fake_client
+        assert provider == "azure-foundry"
+        assert label == "main-agent(azure-foundry)"
+
+    def test_call_llm_fallback_to_azure_foundry_uses_max_completion_tokens(
+        self, monkeypatch
+    ):
+        """End-to-end: when the primary aux call fails and the
+        configured fallback_chain points at azure-foundry + gpt-5.5,
+        the kwargs handed to the fallback client must contain
+        max_completion_tokens (not max_tokens). This is the exact
+        Z2O-1623 production fingerprint."""
+        primary_client = MagicMock()
+        rate_err = Exception("HTTP 429 Too Many Requests")
+        rate_err.status_code = 429
+        primary_client.chat.completions.create.side_effect = rate_err
+
+        fb_client = MagicMock()
+        fb_resp = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="fallback title"))
+        ])
+        fb_client.chat.completions.create.return_value = fb_resp
+        fb_client.base_url = "https://swc.cognitiveservices.azure.com/openai/v1"
+
+        # Mirrors prod: auxiliary.title_generation has no explicit
+        # `provider:`, so resolved_provider is "auto" — that's the only
+        # gate that fires fallback on a 429 (see is_auto check in
+        # call_llm). With explicit providers, 429 propagates instead.
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fb_client, "gpt-5.5", "azure-foundry",
+                                 "fallback_chain[0](azure-foundry)")):
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=500,
+            )
+
+        assert result is fb_resp
+        fb_call_kwargs = fb_client.chat.completions.create.call_args.kwargs
+        assert fb_call_kwargs.get("max_completion_tokens") == 500, (
+            "Azure Foundry + gpt-5.5 fallback must emit "
+            "max_completion_tokens. If max_tokens leaks here, Z2O-1623 "
+            "has regressed and Azure returns HTTP 400 in prod."
+        )
+        assert "max_tokens" not in fb_call_kwargs
