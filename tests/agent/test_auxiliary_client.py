@@ -3207,6 +3207,100 @@ class TestZ2O1621BuildCallKwargsAzureReasoningModel:
         assert kwargs.get("max_tokens") == 500
 
 
+class TestAzureReasoningTemperatureStrip:
+    """Regression for the 6th-layer fallback bug surfaced after Z2O-1623
+    merged. Production fingerprint:
+
+        ⚠ Auxiliary title generation failed: HTTP 400: Unsupported value:
+        'temperature' does not support 0.3 with this model. Only the default
+        (1) value is supported.
+
+    Title-gen hardcodes temperature=0.3. The reactive temperature-retry
+    in call_llm wraps the PRIMARY call but the fallback call sites at
+    ~4800/5150 invoke .create() directly with no retry — so temperature
+    leaks through on the fallback path. Fix: strip non-default temperature
+    preemptively in _build_call_kwargs for Azure-style providers + reasoning
+    models, parallel to the existing max_completion_tokens routing."""
+
+    def test_azure_foundry_gpt5_strips_temperature(self):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="azure-foundry",
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.3,
+            max_tokens=500,
+        )
+        assert "temperature" not in kwargs, (
+            "Azure Foundry + gpt-5.5 must not emit temperature; "
+            "Azure rejects any non-default value with HTTP 400."
+        )
+        # Also confirm max_completion_tokens still routes correctly
+        assert kwargs.get("max_completion_tokens") == 500
+
+    def test_azure_classic_o3_strips_temperature(self):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="azure",
+            model="o3",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.5,
+        )
+        assert "temperature" not in kwargs
+
+    def test_azure_foundry_gpt4o_strips_temperature(self):
+        """gpt-4o is also a reasoning-family model on Azure."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="azure-foundry",
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.7,
+        )
+        assert "temperature" not in kwargs
+
+    def test_azure_with_legacy_gpt35_keeps_temperature(self):
+        """Non-reasoning legacy models on Azure should still respect the
+        passed temperature — they accept arbitrary values."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="azure",
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.3,
+        )
+        assert kwargs.get("temperature") == 0.3
+
+    def test_openai_direct_gpt5_keeps_temperature(self):
+        """api.openai.com accepts arbitrary temperature even on gpt-5
+        reasoning models. The strip must be scoped to azure providers."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="openai",
+            model="gpt-5",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.3,
+        )
+        assert kwargs.get("temperature") == 0.3
+
+    def test_openrouter_gpt5_keeps_temperature(self):
+        """OpenRouter normalizes parameters and accepts any temperature."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="openrouter",
+            model="openai/gpt-5",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.3,
+        )
+        assert kwargs.get("temperature") == 0.3
+
+
 class TestZ2O1620PoolMayRecoverFromRateLimitImport:
     """Regression test for the NameError that fired in
     agent/conversation_loop.py:2254 when a user with a configured

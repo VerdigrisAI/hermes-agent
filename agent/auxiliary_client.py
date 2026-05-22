@@ -202,6 +202,29 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     return bare == "trinity-large-thinking"
 
 
+def _is_reasoning_model(model: Optional[str]) -> bool:
+    """True for OpenAI reasoning model families (gpt-5.x, gpt-4o*, o1/o3/o4).
+
+    These models share two contracts that callers must honour when routed
+    through Azure OpenAI or Azure AI Foundry:
+    * ``max_completion_tokens`` instead of ``max_tokens``
+    * temperature must be the model default (no ``temperature=0.x`` passed)
+
+    Both contracts return HTTP 400 with "Unsupported parameter/value" on
+    Azure when violated. api.openai.com is more forgiving on temperature
+    (accepts any value) but still rejects ``max_tokens``. Callers that
+    need to route on this predicate should also branch on provider.
+    """
+    m = (model or "").lower()
+    return (
+        m.startswith("gpt-5")
+        or m.startswith("gpt-4o")
+        or m.startswith("o1")
+        or m.startswith("o3")
+        or m.startswith("o4")
+    )
+
+
 def _fixed_temperature_for_model(
     model: Optional[str],
     base_url: Optional[str] = None,
@@ -4338,6 +4361,20 @@ def _build_call_kwargs(
         if _forbids_sampling_params(model):
             temperature = None
 
+    # Azure-style providers (Azure OpenAI + Azure AI Foundry) reject any
+    # non-default temperature on reasoning models (gpt-5.x, gpt-4o*, o-series)
+    # with HTTP 400: "'temperature' does not support 0.3 with this model.
+    # Only the default (1) value is supported." The reactive temperature
+    # retry below catches this on the PRIMARY call, but the fallback call
+    # sites at lines ~4800/5150 invoke .create() directly with no retry
+    # wrapping — so temperature leaks through on the fallback path and
+    # surfaces as a user-visible aux warning. Strip preemptively here so
+    # every code path that builds kwargs through this function is
+    # protected, not just the ones with reactive-retry guards.
+    if temperature is not None and provider in {"azure", "azure-foundry"} \
+            and _is_reasoning_model(model):
+        temperature = None
+
     if temperature is not None:
         kwargs["temperature"] = temperature
 
@@ -4356,19 +4393,6 @@ def _build_call_kwargs(
             provider == "zai"
             and ("4v" in _model_lower or "5v" in _model_lower or "-v" in _model_lower)
         )
-
-        def _is_reasoning_model(m: str) -> bool:
-            """gpt-5.x, gpt-4o*, o1/o3/o4 series all require max_completion_tokens
-            instead of max_tokens on direct-OpenAI-compatible endpoints
-            (Azure, api.openai.com, GitHub Copilot)."""
-            m = m.lower()
-            return (
-                m.startswith("gpt-5")
-                or m.startswith("gpt-4o")
-                or m.startswith("o1")
-                or m.startswith("o3")
-                or m.startswith("o4")
-            )
 
         if _skip_max_tokens:
             pass  # ZAI vision models do not accept max_tokens
