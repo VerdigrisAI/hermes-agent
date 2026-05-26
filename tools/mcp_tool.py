@@ -1206,6 +1206,15 @@ class MCPServerTask:
         Periodically sends a lightweight keepalive (``list_tools``) to
         prevent TCP connections from going stale during long idle
         periods (#17003).  If the keepalive fails, triggers a reconnect.
+
+        Side benefit: on every successful keepalive, schedules a tool-
+        registry refresh. ``tools/list_changed`` notifications are the
+        primary discovery mechanism, but some MCP servers (notably
+        gateway-style services that proxy a backend registry) don't emit
+        them — leaving clients with a stale tool list until the next
+        process restart. Since the keepalive already exercises
+        ``list_tools()``, we get fresh tool discovery for free at the
+        keepalive cadence.
         """
         # Keepalive interval in seconds.  Must be shorter than typical
         # LB / NAT idle-timeout (commonly 300-600s).
@@ -1239,6 +1248,15 @@ class MCPServerTask:
                         )
                         self._reconnect_event.set()
                         break
+
+                    # Keepalive succeeded — also schedule a registry refresh
+                    # to pick up any tool-list changes from servers that don't
+                    # emit ``tools/list_changed`` notifications.
+                    # ``_refresh_tools`` is idempotent (set-diffs the result)
+                    # and lock-protected against overlapping refreshes from
+                    # rapid notifications, so this is safe to schedule even
+                    # when the tool list is unchanged.
+                    self._schedule_tools_refresh()
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
