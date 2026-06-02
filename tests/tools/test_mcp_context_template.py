@@ -348,6 +348,26 @@ def test_resolved_headers_survive_lost_caller_context(custom_var):
     assert req.headers["X-Meridian-Delegated-Principal"] == "thomas@verdigris.co"
 
 
+@pytest.mark.asyncio
+async def test_rpc_scopes_headers_to_call_and_clears():
+    """``_rpc`` exposes the resolved headers only for the duration of the call
+    and clears them after — so a later system RPC (keepalive) passing no
+    headers can't leak the prior user call's delegated principal (Z2O-1694)."""
+    server = MCPServerTask("meridian")
+    assert server._outbound_resolved_headers == {}
+
+    async with server._rpc({"X-Meridian-Delegated-Principal": "thomas@verdigris.co"}):
+        assert server._outbound_resolved_headers == {
+            "X-Meridian-Delegated-Principal": "thomas@verdigris.co",
+        }
+    assert server._outbound_resolved_headers == {}  # cleared after the call
+
+    # A system RPC (keepalive/discovery) passes no headers → slot stays empty.
+    async with server._rpc():
+        assert server._outbound_resolved_headers == {}
+    assert server._outbound_resolved_headers == {}
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: httpx request-event-hook mechanics
 # ---------------------------------------------------------------------------

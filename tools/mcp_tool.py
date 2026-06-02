@@ -79,6 +79,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import contextlib
 import inspect
 import json
 import logging
@@ -730,8 +731,8 @@ def _apply_resolved_headers(request, *, same_origin: bool, names, resolved: dict
         value = resolved.get(name, "")
         if value:
             request.headers[name] = value
-        elif name in request.headers:
-            del request.headers[name]
+        else:
+            request.headers.pop(name, None)
 
 
 def _split_static_and_templated_headers(
@@ -1230,6 +1231,25 @@ class MCPServerTask:
                 out[name] = value
         return out
 
+    @contextlib.asynccontextmanager
+    async def _rpc(self, resolved_headers: Optional[dict] = None):
+        """Serialize a single client-initiated RPC on this server and, for the
+        duration of the call, expose caller-resolved templated headers to the
+        request hook (which runs on the MCP background loop and cannot resolve
+        ``${context:}`` itself — Z2O-1694).
+
+        System RPCs (keepalive pings, discovery, refresh) pass no headers, so
+        they never carry a user's delegated principal. Holding ``_rpc_lock``
+        also guarantees a system ping can't overlap — and read — a user call's
+        stashed headers.
+        """
+        async with self._rpc_lock:
+            self._outbound_resolved_headers = resolved_headers or {}
+            try:
+                yield
+            finally:
+                self._outbound_resolved_headers = {}
+
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
@@ -1394,10 +1414,14 @@ class MCPServerTask:
                 # to exercise the connection and detect stale sockets.
                 if self.session:
                     try:
-                        await asyncio.wait_for(
-                            self.session.list_tools(),
-                            timeout=30.0,
-                        )
+                        # Hold _rpc_lock with NO templated headers so this
+                        # system keepalive can't overlap — and pick up — a
+                        # user call's stashed delegated principal (Z2O-1694).
+                        async with self._rpc():
+                            await asyncio.wait_for(
+                                self.session.list_tools(),
+                                timeout=30.0,
+                            )
                     except Exception as exc:
                         logger.warning(
                             "MCP server '%s' keepalive failed, "
@@ -2618,12 +2642,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         _resolved_headers = server._resolve_templated_headers()
 
         async def _call():
-            async with server._rpc_lock:
-                server._outbound_resolved_headers = _resolved_headers
-                try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
-                finally:
-                    server._outbound_resolved_headers = {}
+            async with server._rpc(_resolved_headers):
+                result = await server.session.call_tool(tool_name, arguments=args)
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
@@ -2734,8 +2754,10 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.list_resources()
             resources = []
             for r in (result.resources if hasattr(result, "resources") else []):
@@ -2798,8 +2820,10 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
         if not uri:
             return tool_error("Missing required parameter 'uri'")
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
@@ -2852,8 +2876,10 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.list_prompts()
             prompts = []
             for p in (result.prompts if hasattr(result, "prompts") else []):
@@ -2922,8 +2948,10 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.get_prompt(name, arguments=arguments)
             # GetPromptResult has .messages list
             messages = []
