@@ -21,6 +21,8 @@ from gateway.session_context import (
     register_session_context_var,
 )
 from tools.mcp_tool import (
+    MCPServerTask,
+    _apply_resolved_headers,
     _has_context_template,
     _resolve_context_templates,
     _resolve_frozen_headers,
@@ -250,7 +252,112 @@ class TestSplitStaticAndTemplatedHeaders:
 
 
 # ---------------------------------------------------------------------------
-# Integration test: the actual event-hook injection pattern using httpx
+# Z2O-1694: caller-side resolution + instance-attr bridge to the MCP loop
+# ---------------------------------------------------------------------------
+#
+# The real MCP request runs on a dedicated background event loop (and a task
+# spawned by the SDK's post_writer), so resolving ``${context:}`` inside the
+# httpx request hook *there* always saw an empty context — the per-turn
+# session vars are set on the caller's thread, never the MCP loop's. The fix
+# resolves on the caller side and bridges the values across via an instance
+# attribute (``MCPServerTask._outbound_resolved_headers``), applied under
+# ``_rpc_lock`` so per-server calls can't race. These tests pin that contract.
+
+class TestResolveTemplatedHeadersMethod:
+    """Caller-side resolution: ``MCPServerTask._resolve_templated_headers``
+    snapshots the current task's session context into concrete values."""
+
+    def test_resolves_configured_templates(self, custom_var):
+        server = MCPServerTask("meridian")
+        server._templated_headers = {
+            "X-Meridian-Delegated-Principal": "${context:TEST_PRINCIPAL}",
+        }
+        custom_var.set("thomas@verdigris.co")
+        assert server._resolve_templated_headers() == {
+            "X-Meridian-Delegated-Principal": "thomas@verdigris.co",
+        }
+
+    def test_unset_value_omitted_from_dict(self, custom_var):
+        server = MCPServerTask("meridian")
+        server._templated_headers = {
+            "X-Meridian-Delegated-Principal": "${context:TEST_PRINCIPAL}",
+        }
+        # custom_var unset → "" → dropped (not present with empty value).
+        assert server._resolve_templated_headers() == {}
+
+    def test_no_templates_returns_empty(self):
+        server = MCPServerTask("meridian")
+        assert server._resolve_templated_headers() == {}
+
+
+class TestApplyResolvedHeaders:
+    """Loop-side application: ``_apply_resolved_headers`` stamps the already-
+    resolved values onto the outbound request (no context lookup here)."""
+
+    def test_injects_when_same_origin(self):
+        req = httpx.Request("POST", "http://meridian.invalid/mcp")
+        _apply_resolved_headers(
+            req, same_origin=True,
+            names=["X-Meridian-Delegated-Principal"],
+            resolved={"X-Meridian-Delegated-Principal": "thomas@verdigris.co"},
+        )
+        assert req.headers["X-Meridian-Delegated-Principal"] == "thomas@verdigris.co"
+
+    def test_drops_when_value_missing(self):
+        req = httpx.Request("POST", "http://meridian.invalid/mcp")
+        req.headers["X-Meridian-Delegated-Principal"] = "stale@example.com"
+        _apply_resolved_headers(
+            req, same_origin=True,
+            names=["X-Meridian-Delegated-Principal"],
+            resolved={},  # nothing resolved this call → header must be removed
+        )
+        assert "X-Meridian-Delegated-Principal" not in req.headers
+
+    def test_strips_on_cross_origin(self):
+        req = httpx.Request("POST", "http://attacker.invalid/harvest")
+        req.headers["X-Meridian-Delegated-Principal"] = "thomas@verdigris.co"
+        _apply_resolved_headers(
+            req, same_origin=False,
+            names=["X-Meridian-Delegated-Principal"],
+            resolved={"X-Meridian-Delegated-Principal": "thomas@verdigris.co"},
+        )
+        assert "X-Meridian-Delegated-Principal" not in req.headers
+
+
+def test_resolved_headers_survive_lost_caller_context(custom_var):
+    """The crux of Z2O-1694: resolve while the per-turn var is set, then
+    apply *after* that context is gone (simulating the MCP background loop,
+    whose task never saw the var). The header must still be injected —
+    proving the value travels via the instance attr, not a live context
+    lookup at request time."""
+    server = MCPServerTask("meridian")
+    server._templated_headers = {
+        "X-Meridian-Delegated-Principal": "${context:TEST_PRINCIPAL}",
+    }
+    custom_var.set("thomas@verdigris.co")
+    resolved = server._resolve_templated_headers()        # caller thread/context
+    server._outbound_resolved_headers = resolved          # bridged onto instance
+    custom_var.set(_UNSET)                                 # caller context gone
+
+    req = httpx.Request("POST", "http://meridian.invalid/mcp")
+    _apply_resolved_headers(
+        req, same_origin=True,
+        names=server._templated_headers,
+        resolved=server._outbound_resolved_headers,
+    )
+    assert req.headers["X-Meridian-Delegated-Principal"] == "thomas@verdigris.co"
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: httpx request-event-hook mechanics
+# ---------------------------------------------------------------------------
+# NOTE: these exercise the httpx event-hook *mechanism* in the test's own
+# event loop, where the calling task's context IS visible. The real MCP
+# request runs on a dedicated background loop whose task can't see the
+# caller's context (Z2O-1694), so the production hook no longer resolves
+# ``${context:}`` here — it applies values resolved caller-side (see the
+# TestResolveTemplatedHeadersMethod / _apply_resolved_headers tests above).
+# These remain valid as httpx-behavior documentation.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
