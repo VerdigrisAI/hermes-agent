@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -56,7 +56,15 @@ def _patch_mcp_server():
     # `_rpc_lock` is acquired by _make_tool_handler's call path (mcp_tool.py
     # ~L2008) to serialize JSON-RPC against the server — build it inside the
     # fresh loop that _fake_run_on_mcp_loop spins up, not at fixture import.
-    fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
+    # The tool handler now resolves ${context:} headers caller-side and applies
+    # them via server._rpc() under the lock (Z2O-1694). Give the fake those
+    # members: an empty templated-header resolver and the real _rpc CM (which
+    # only needs _rpc_lock + _outbound_resolved_headers, both present here).
+    fake_server = SimpleNamespace(
+        session=fake_session, _rpc_lock=None, _outbound_resolved_headers={},
+    )
+    fake_server._resolve_templated_headers = lambda: {}
+    fake_server._rpc = MethodType(mcp_tool.MCPServerTask._rpc, fake_server)
     with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
          patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
         yield fake_session
