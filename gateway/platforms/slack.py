@@ -10,6 +10,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+from io import BytesIO
 import json
 import logging
 import os
@@ -1312,7 +1313,10 @@ class SlackAdapter(BasePlatformAdapter):
 
         if suffix in {".docx", ".xlsx", ".pptx", ".zip"}:
             try:
-                with ZipFile(candidate) as archive:
+                # Inspect the same immutable byte snapshot that will be sent to
+                # Slack. Reopening ``candidate`` here would reintroduce a
+                # check/use race: the path could change after ``read_bytes``.
+                with ZipFile(BytesIO(data)) as archive:
                     infos = [info for info in archive.infolist() if not info.is_dir()]
                     if len(infos) > 1_000 or sum(info.file_size for info in infos) > MAX_SLACK_UPLOAD_BYTES:
                         raise _SlackUploadPolicyError(
@@ -1328,8 +1332,16 @@ class SlackAdapter(BasePlatformAdapter):
                         raise _SlackUploadPolicyError(
                             "Slack upload denied: Office file contents do not match the declared type."
                         )
+                    remaining_expanded_bytes = MAX_SLACK_UPLOAD_BYTES
                     for info in infos:
-                        if _contains_secret(archive.read(info)):
+                        with archive.open(info) as member:
+                            member_data = member.read(remaining_expanded_bytes + 1)
+                        if len(member_data) > remaining_expanded_bytes:
+                            raise _SlackUploadPolicyError(
+                                "Slack upload denied: archive expansion exceeds the policy limit."
+                            )
+                        remaining_expanded_bytes -= len(member_data)
+                        if _contains_secret(member_data):
                             raise _SlackUploadPolicyError(
                                 "Slack upload denied: generated artifact appears to contain credentials."
                             )

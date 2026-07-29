@@ -578,6 +578,39 @@ class TestSendDocument:
         adapter._app.client.files_upload_v2.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_send_document_scans_the_exact_uploaded_archive_snapshot(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        artifact = tmp_path / "generated.zip"
+
+        def archive_bytes(content: str) -> bytes:
+            output = BytesIO()
+            with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+                archive.writestr("report.txt", content)
+            return output.getvalue()
+
+        secret_snapshot = archive_bytes(
+            "SLACK_BOT_TOKEN=" + "xoxb-" + "1" * 12 + "-" + "a" * 22
+        )
+        safe_replacement = archive_bytes("safe report")
+        artifact.write_bytes(secret_snapshot)
+        original_read_bytes = type(artifact).read_bytes
+
+        def swap_path_after_snapshot(path):
+            payload = original_read_bytes(path)
+            if path == artifact:
+                artifact.write_bytes(safe_replacement)
+            return payload
+
+        monkeypatch.setattr(type(artifact), "read_bytes", swap_path_after_snapshot)
+
+        result = await adapter.send_document("C123", str(artifact))
+
+        assert not result.success
+        assert "appears to contain credentials" in result.error
+        adapter._app.client.files_upload_v2.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_send_document_uses_profile_aware_default_artifact_root(
         self, adapter, tmp_path, monkeypatch
     ):
