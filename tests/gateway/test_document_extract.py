@@ -16,6 +16,18 @@ def _docx(document_xml: str) -> bytes:
     return buf.getvalue()
 
 
+def _docx_with_corrupted_document_stream(document_xml: str) -> bytes:
+    payload = bytearray(_docx(document_xml))
+    with ZipFile(BytesIO(payload)) as archive:
+        info = archive.getinfo("word/document.xml")
+        header = info.header_offset
+        name_length = int.from_bytes(payload[header + 26:header + 28], "little")
+        extra_length = int.from_bytes(payload[header + 28:header + 30], "little")
+        compressed_start = header + 30 + name_length + extra_length
+        payload[compressed_start + info.compress_size // 2] ^= 0xFF
+    return bytes(payload)
+
+
 def test_extract_docx_preserves_heading_paragraph_table_order() -> None:
     data = _docx(
         """<?xml version="1.0" encoding="UTF-8"?>
@@ -106,9 +118,53 @@ def test_extract_docx_caps_irregular_table_columns_and_output() -> None:
     assert "column-0" in result.text
 
 
-@pytest.mark.parametrize("data", [b"not a zip", _docx("<Types />")])
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"not a zip",
+        _docx("<Types />"),
+        _docx_with_corrupted_document_stream(
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+            'wordprocessingml/2006/main"><w:body /></w:document>'
+        ),
+    ],
+)
 def test_extract_docx_rejects_malformed_packages(data: bytes) -> None:
     with pytest.raises(DocumentExtractionError, match="DOCX") as exc_info:
         extract_docx_text(data)
 
     assert exc_info.value.code == "malformed_docx"
+
+
+def test_extract_docx_preserves_blocks_wrapped_in_content_controls() -> None:
+    data = _docx(
+        """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:sdt><w:sdtPr/><w:sdtContent>
+<w:p><w:r><w:t>Approval terms</w:t></w:r></w:p>
+</w:sdtContent></w:sdt>
+<w:p><w:r><w:t>After the control</w:t></w:r></w:p>
+</w:body></w:document>"""
+    )
+
+    result = extract_docx_text(data)
+
+    assert result.text == "Approval terms\n\nAfter the control"
+    assert result.truncated is False
+
+
+def test_table_column_cap_does_not_suppress_later_document_blocks() -> None:
+    cells = "".join(
+        f"<w:tc><w:p><w:r><w:t>column-{index}</w:t></w:r></w:p></w:tc>"
+        for index in range(65)
+    )
+    data = _docx(
+        """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"""
+        f"<w:tbl><w:tr>{cells}</w:tr></w:tbl>"
+        "<w:p><w:r><w:t>Required closing paragraph</w:t></w:r></w:p>"
+        "</w:body></w:document>"
+    )
+
+    result = extract_docx_text(data, max_chars=10_000)
+
+    assert "Required closing paragraph" in result.text
+    assert result.truncated is True

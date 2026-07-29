@@ -12,11 +12,15 @@ document.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
 import re
-from xml.etree import ElementTree
+from xml.etree.ElementTree import Element, ParseError
 from zipfile import BadZipFile, ZipFile
+
+from defusedxml import ElementTree as DefusedElementTree
+from defusedxml.common import DefusedXmlException
 
 
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -45,7 +49,7 @@ def _tag(local_name: str) -> str:
     return f"{{{WORD_NS}}}{local_name}"
 
 
-def _paragraph_text(paragraph: ElementTree.Element) -> str:
+def _paragraph_text(paragraph: Element) -> str:
     parts: list[str] = []
     for node in paragraph.iter():
         if node.tag == _tag("t"):
@@ -57,7 +61,7 @@ def _paragraph_text(paragraph: ElementTree.Element) -> str:
     return "".join(parts).strip()
 
 
-def _heading_prefix(paragraph: ElementTree.Element) -> str:
+def _heading_prefix(paragraph: Element) -> str:
     style = paragraph.find("./w:pPr/w:pStyle", NS)
     if style is None:
         return ""
@@ -75,19 +79,26 @@ def _escape_table_cell(value: str) -> str:
 
 
 def _table_markdown(
-    table: ElementTree.Element, *, max_chars: int
-) -> tuple[str, bool]:
+    table: Element, *, max_chars: int
+) -> tuple[str, bool, bool]:
     rows: list[list[str]] = []
     stored_chars = 0
-    truncated = False
+    structurally_truncated = False
+    budget_exhausted = False
     for row_index, row in enumerate(table.findall("./w:tr", NS)):
-        if row_index >= MAX_TABLE_ROWS or stored_chars >= max_chars:
-            truncated = True
+        if row_index >= MAX_TABLE_ROWS:
+            structurally_truncated = True
+            break
+        if stored_chars >= max_chars:
+            budget_exhausted = True
             break
         cells: list[str] = []
         for cell_index, cell in enumerate(row.findall("./w:tc", NS)):
-            if cell_index >= MAX_TABLE_COLUMNS or stored_chars >= max_chars:
-                truncated = True
+            if cell_index >= MAX_TABLE_COLUMNS:
+                structurally_truncated = True
+                break
+            if stored_chars >= max_chars:
+                budget_exhausted = True
                 break
             paragraphs = [
                 text
@@ -98,13 +109,14 @@ def _table_markdown(
             remaining = max_chars - stored_chars
             if len(value) > remaining:
                 value = value[:remaining]
-                truncated = True
+                budget_exhausted = True
             cells.append(value)
             stored_chars += len(value)
         if cells:
             rows.append(cells)
     if not rows:
-        return "", truncated
+        truncated = structurally_truncated or budget_exhausted
+        return "", truncated, budget_exhausted
     width = max(len(row) for row in rows)
     rendered = [
         "| " + " | ".join(row + [""] * (width - len(row))) + " |"
@@ -112,7 +124,24 @@ def _table_markdown(
     ]
     rendered.insert(1, "| " + " | ".join("---" for _ in range(width)) + " |")
     table_text = "\n".join(rendered)
-    return table_text[:max_chars], truncated or len(table_text) > max_chars
+    rendered_exceeds_budget = len(table_text) > max_chars
+    truncated = structurally_truncated or budget_exhausted or rendered_exceeds_budget
+    return (
+        table_text[:max_chars],
+        truncated,
+        budget_exhausted or rendered_exceeds_budget,
+    )
+
+
+def _iter_document_blocks(parent: Element) -> Iterator[Element]:
+    """Yield paragraphs/tables in document order, including SDT wrappers."""
+    for child in parent:
+        if child.tag in {_tag("p"), _tag("tbl")}:
+            yield child
+        elif child.tag == _tag("sdt"):
+            content = child.find("./w:sdtContent", NS)
+            if content is not None:
+                yield from _iter_document_blocks(content)
 
 
 def extract_docx_text(
@@ -151,13 +180,14 @@ def extract_docx_text(
             "docx_too_large",
             f"DOCX main document XML exceeds the {max_xml_bytes}-byte extraction limit",
         )
-    if b"<!DOCTYPE" in document_xml.upper():
-        raise DocumentExtractionError(
-            "malformed_docx", "DOCX main document XML contains a forbidden DTD"
-        )
     try:
-        root = ElementTree.fromstring(document_xml)
-    except ElementTree.ParseError as exc:
+        root = DefusedElementTree.fromstring(document_xml, forbid_dtd=True)
+    except DefusedXmlException as exc:
+        raise DocumentExtractionError(
+            "malformed_docx",
+            "DOCX main document XML contains a forbidden DTD or entity",
+        ) from exc
+    except ParseError as exc:
         raise DocumentExtractionError(
             "malformed_docx", "DOCX main document XML is malformed"
         ) from exc
@@ -171,28 +201,32 @@ def extract_docx_text(
     blocks: list[str] = []
     used_chars = 0
     truncated = False
-    for child in body:
+    for child in _iter_document_blocks(body):
         separator_chars = 2 if blocks else 0
         remaining = max_chars - used_chars - separator_chars
         if remaining <= 0:
             truncated = True
             break
         if child.tag == _tag("p"):
+            budget_exhausted = False
             paragraph = _paragraph_text(child)
             if paragraph:
                 block = _heading_prefix(child) + paragraph
                 if len(block) > remaining:
                     block = block[:remaining]
                     truncated = True
+                    budget_exhausted = True
                 blocks.append(block)
                 used_chars += separator_chars + len(block)
         elif child.tag == _tag("tbl"):
-            table, table_truncated = _table_markdown(child, max_chars=remaining)
+            table, table_truncated, budget_exhausted = _table_markdown(
+                child, max_chars=remaining
+            )
             if table:
                 blocks.append(table)
                 used_chars += separator_chars + len(table)
             truncated = truncated or table_truncated
-        if truncated:
+        if budget_exhausted:
             break
 
     text = "\n\n".join(blocks)
