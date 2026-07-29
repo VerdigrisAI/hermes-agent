@@ -43,7 +43,8 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from gateway.platforms.slack import SlackAdapter
+import gateway.platforms.slack as _slack_mod
+from gateway.platforms.slack import SlackAdapter, _SlackAttachmentError
 from gateway.config import Platform, PlatformConfig
 
 
@@ -273,6 +274,366 @@ class TestSlackThreadContext:
         assert "what do you think" not in context
         # Bot mention should be stripped from context
         assert "<@U_BOT>" not in context
+
+    @pytest.mark.asyncio
+    async def test_fetches_prior_thread_pdf_with_provenance(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "ts": "1000.0",
+                    "user": "U1",
+                    "text": "Please review the attached plan",
+                    "files": [{
+                        "id": "F_PLAN",
+                        "name": "plan.pdf",
+                        "mimetype": "application/pdf",
+                        "size": 14,
+                        "url_private_download": "https://files.slack.com/plan.pdf",
+                    }],
+                },
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.4 test")
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert "[Slack thread attachment]" in context
+        assert "channel=C1" in context
+        assert "message=1000.0" in context
+        assert "thread=1000.0" in context
+        assert "user=U1" in context
+        assert "file_id=F_PLAN" in context
+        assert "filename=plan.pdf" in context
+        assert "saved_at=" in context
+        adapter._download_slack_file_bytes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fetches_prior_reply_attachment_with_source_user(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "Parent"},
+                {
+                    "ts": "1000.05",
+                    "user": "U2",
+                    "text": "The requested revision",
+                    "files": [{
+                        "id": "F_REPLY",
+                        "name": "revision.pdf",
+                        "mimetype": "application/pdf",
+                        "size": 14,
+                        "url_private_download": "https://files.slack.com/revision.pdf",
+                    }],
+                },
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice", "U2": "Bob"}
+        adapter._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.4 test")
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert "message=1000.05" in context
+        assert "user=U2" in context
+        assert "file_id=F_REPLY" in context
+
+    @pytest.mark.asyncio
+    async def test_thread_attachment_count_budget_skips_excess_files(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        files = [
+            {
+                "id": f"F_{index}",
+                "name": f"file-{index}.pdf",
+                "mimetype": "application/pdf",
+                "size": 4,
+                "url_private_download": f"https://files.slack.com/file-{index}.pdf",
+            }
+            for index in range(11)
+        ]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "Parent", "files": files},
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._download_slack_file_bytes = AsyncMock(return_value=b"%PDF")
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert adapter._download_slack_file_bytes.await_count == 10
+        assert "bounded attachment-context budget was reached" in context
+        assert "file_id=F_9" in context
+        assert "file_id=F_10" not in context
+
+    @pytest.mark.asyncio
+    async def test_thread_byte_budget_counts_rejected_misreported_downloads(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        files = [
+            {
+                "id": f"F_LIED_{index}",
+                "name": f"lied-{index}.pdf",
+                "mimetype": "application/pdf",
+                "size": 1,
+                "url_private_download": f"https://files.slack.com/lied-{index}.pdf",
+            }
+            for index in range(3)
+        ]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "Parent", "files": files},
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._download_slack_file_bytes = AsyncMock(
+            side_effect=[
+                _SlackAttachmentError(
+                    "download exceeded limit", bytes_consumed=20 * 1024 * 1024
+                ),
+                _SlackAttachmentError(
+                    "download exceeded limit", bytes_consumed=20 * 1024 * 1024
+                ),
+            ]
+        )
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert adapter._download_slack_file_bytes.await_count == 2
+        assert "bounded attachment-context byte budget was reached" in context
+
+    @pytest.mark.asyncio
+    async def test_thread_byte_budget_counts_malformed_docx_downloads(self, monkeypatch):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        monkeypatch.setattr(_slack_mod, "MAX_THREAD_ATTACHMENT_BYTES", 20)
+        files = [
+            {
+                "id": f"F_BAD_{index}",
+                "name": f"bad-{index}.docx",
+                "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "size": 10,
+                "url_private_download": f"https://files.slack.com/bad-{index}.docx",
+            }
+            for index in range(3)
+        ]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "Parent", "files": files},
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._download_slack_file_bytes = AsyncMock(
+            return_value=(b"not-a-zip", 10)
+        )
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert adapter._download_slack_file_bytes.await_count == 2
+        assert "bounded attachment-context byte budget was reached" in context
+
+    @pytest.mark.asyncio
+    async def test_extracted_text_budget_does_not_skip_later_pdf(self, monkeypatch):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "ts": "1000.0",
+                    "user": "U1",
+                    "text": "Parent",
+                    "files": [
+                        {"id": "F_DOCX", "name": "full.docx"},
+                        {"id": "F_PDF", "name": "later.pdf"},
+                    ],
+                },
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+        monkeypatch.setattr(_slack_mod, "MAX_THREAD_EXTRACTED_CHARS", 10)
+        adapter._format_thread_attachment = AsyncMock(side_effect=[
+            ("[DOCX]", 5, 10),
+            ("[PDF file_id=F_PDF]", 5, 0),
+        ])
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert "[PDF file_id=F_PDF]" in context
+        assert adapter._format_thread_attachment.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("file_obj", "expected"),
+        [
+            (
+                {
+                    "id": "F_UNSUPPORTED",
+                    "name": "sheet.exe",
+                    "mimetype": "application/octet-stream",
+                    "size": 10,
+                    "url_private_download": "https://files.slack.com/sheet.exe",
+                },
+                "unsupported file type",
+            ),
+            (
+                {
+                    "id": "F_LARGE",
+                    "name": "large.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 21 * 1024 * 1024,
+                    "url_private_download": "https://files.slack.com/large.pdf",
+                },
+                "oversized",
+            ),
+        ],
+    )
+    async def test_thread_attachment_limits_surface_actionable_notices(
+        self, file_obj, expected
+    ):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "Parent", "files": [file_obj]},
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert "[Slack thread attachment notice]" in context
+        assert expected in context
+
+    @pytest.mark.asyncio
+    async def test_thread_attachment_access_denial_surfaces_scope_guidance(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "ts": "1000.0",
+                    "user": "U1",
+                    "text": "Parent",
+                    "files": [{"id": "F_DENIED", "file_access": "check_file_info"}],
+                },
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        mock_client.files_info = AsyncMock(return_value={
+            "ok": False,
+            "error": "missing_scope",
+            "needed": "files:read",
+            "provided": "channels:history",
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert "[Slack thread attachment notice]" in context
+        assert "files:read" in context
+        assert "reinstall" in context.lower()
+
+    @pytest.mark.asyncio
+    async def test_thread_attachment_stub_uses_files_info_and_deduplicates(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        stub = {"id": "F_SHARED", "file_access": "check_file_info"}
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "parent", "files": [stub]},
+                {"ts": "1000.05", "user": "U2", "text": "same file", "files": [stub]},
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        mock_client.files_info = AsyncMock(return_value={
+            "ok": True,
+            "file": {
+                "id": "F_SHARED",
+                "name": "shared.pdf",
+                "mimetype": "application/pdf",
+                "size": 14,
+                "url_private_download": "https://files.slack.com/shared.pdf",
+            },
+        })
+        adapter._user_name_cache = {"U1": "Alice", "U2": "Bob"}
+        adapter._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.4 test")
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert context.count("file_id=F_SHARED") == 1
+        mock_client.files_info.assert_awaited_once_with(file="F_SHARED")
+        adapter._download_slack_file_bytes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_thread_attachment_stub_retries_transient_files_info_failure(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "ts": "1000.0",
+                    "user": "U1",
+                    "text": "parent",
+                    "files": [{"id": "F_RETRY", "file_access": "check_file_info"}],
+                },
+                {"ts": "1000.1", "user": "U1", "text": "Current"},
+            ]
+        })
+        mock_client.files_info = AsyncMock(side_effect=[
+            RuntimeError("connection reset by peer"),
+            {
+                "ok": True,
+                "file": {
+                    "id": "F_RETRY",
+                    "name": "retry.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 14,
+                    "url_private_download": "https://files.slack.com/retry.pdf",
+                },
+            },
+        ])
+        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.4 test")
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+            context = await adapter._fetch_thread_context(
+                channel_id="C1",
+                thread_ts="1000.0",
+                current_ts="1000.1",
+                team_id="T1",
+            )
+
+        assert "file_id=F_RETRY" in context
+        assert mock_client.files_info.await_count == 2
+        sleep_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_skips_bot_messages(self):

@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
 def _run(coro):
@@ -292,12 +292,15 @@ from gateway.platforms.slack import SlackAdapter  # noqa: E402
 
 class TestSlackMultiImage:
     @pytest.fixture
-    def adapter(self):
+    def adapter(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_SLACK_ARTIFACT_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_SLACK_LOCAL_UPLOADS_ENABLED", "true")
         config = PlatformConfig(enabled=True, token="xoxb-fake")
         a = SlackAdapter(config)
         a._app = MagicMock()
         a._resolve_thread_ts = MagicMock(return_value=None)
         a._record_uploaded_file_thread = MagicMock()
+        a.send = AsyncMock(return_value=SendResult(success=True))
         client = MagicMock()
         client.files_upload_v2 = AsyncMock(return_value={"ok": True})
         a._get_client = MagicMock(return_value=client)
@@ -307,7 +310,7 @@ class TestSlackMultiImage:
         paths = []
         for i in range(3):
             p = tmp_path / f"img_{i}.png"
-            p.write_bytes(b"\x89PNG" + b"\x00" * 20)
+            p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
@@ -322,7 +325,7 @@ class TestSlackMultiImage:
         paths = []
         for i in range(12):
             p = tmp_path / f"img_{i}.png"
-            p.write_bytes(b"\x89PNG" + b"\x00" * 5)
+            p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 5)
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
@@ -337,6 +340,17 @@ class TestSlackMultiImage:
         _run(adapter.send_multiple_images("C12345", []))
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_not_called()
+
+    def test_all_policy_denied_images_emit_visible_notice(self, adapter):
+        _run(adapter.send_multiple_images(
+            "C12345", [("file:///etc/hosts", "requested image")]
+        ))
+
+        client = adapter._get_client("C12345")
+        client.files_upload_v2.assert_not_called()
+        adapter.send.assert_awaited_once()
+        notice = adapter.send.await_args.args[1]
+        assert "failed the Slack artifact policy" in notice
 
 
 # ---------------------------------------------------------------------------

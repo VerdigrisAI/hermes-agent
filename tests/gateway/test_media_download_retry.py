@@ -801,6 +801,33 @@ class TestSlackDownloadSlackFileBytes:
         assert result == b"final bytes"
         assert mock_client.get.call_count == 2
 
+    def test_retries_on_connection_error_then_succeeds(self):
+        """Transport resets are transient and use the same bounded retry path."""
+        adapter = _make_slack_adapter()
+
+        ok_response = MagicMock()
+        ok_response.content = b"final bytes"
+        ok_response.raise_for_status = MagicMock()
+        ok_response.headers = {"content-type": "application/pdf"}
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(
+            side_effect=[httpx.ConnectError("connection reset"), ok_response]
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def run():
+            with patch("httpx.AsyncClient", return_value=mock_client), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                return await adapter._download_slack_file_bytes(
+                    "https://files.slack.com/file.bin"
+                )
+
+        result = asyncio.run(run())
+        assert result == b"final bytes"
+        assert mock_client.get.call_count == 2
+
     def test_raises_after_max_retries(self):
         """Persistent timeouts raise after all 3 attempts are exhausted."""
         adapter = _make_slack_adapter()
@@ -821,6 +848,29 @@ class TestSlackDownloadSlackFileBytes:
             asyncio.run(run())
 
         assert mock_client.get.call_count == 3
+
+    def test_streaming_byte_limit_aborts_before_full_download(self):
+        adapter = _make_slack_adapter()
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "application/pdf"},
+                content=b"x" * 11,
+            )
+
+        async def run():
+            real_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            with patch("httpx.AsyncClient", return_value=real_client):
+                await adapter._download_slack_file_bytes(
+                    "https://files.slack.com/file.bin", max_bytes=10
+                )
+
+        with pytest.raises(ValueError, match="10-byte limit") as exc_info:
+            asyncio.run(run())
+
+        assert exc_info.value.bytes_consumed == 11
 
 
 # ---------------------------------------------------------------------------

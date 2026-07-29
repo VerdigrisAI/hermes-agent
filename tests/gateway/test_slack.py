@@ -9,9 +9,12 @@ We mock the slack modules at import time to avoid collection errors.
 """
 
 import asyncio
+from io import BytesIO
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
@@ -90,6 +93,8 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
     )
+    monkeypatch.setenv("HERMES_SLACK_ARTIFACT_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLACK_LOCAL_UPLOADS_ENABLED", "true")
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +500,7 @@ class TestSendDocument:
         adapter._app.client.files_upload_v2.assert_called_once()
         call_kwargs = adapter._app.client.files_upload_v2.call_args[1]
         assert call_kwargs["channel"] == "C123"
-        assert call_kwargs["file"] == str(test_file)
+        assert call_kwargs["content"] == test_file.read_bytes()
         assert call_kwargs["filename"] == "report.pdf"
         assert call_kwargs["initial_comment"] == "Here's the report"
 
@@ -527,6 +532,85 @@ class TestSendDocument:
         assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
+    async def test_send_document_denies_paths_outside_artifact_roots(self, adapter):
+        sensitive_path = "/etc/hosts"
+
+        result = await adapter.send_document(
+            chat_id="C123",
+            file_path=sensitive_path,
+        )
+
+        assert not result.success
+        assert "outside approved generated-artifact roots" in result.error
+        adapter._app.client.files_upload_v2.assert_not_called()
+        adapter._app.client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_document_denies_symlink_escape_from_artifact_root(
+        self, adapter, tmp_path
+    ):
+        link = tmp_path / "looks-safe.txt"
+        link.symlink_to("/etc/hosts")
+
+        result = await adapter.send_document(
+            chat_id="C123",
+            file_path=str(link),
+        )
+
+        assert not result.success
+        assert "outside approved generated-artifact roots" in result.error
+        adapter._app.client.files_upload_v2.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_document_denies_credential_content_in_artifact_root(
+        self, adapter, tmp_path
+    ):
+        artifact = tmp_path / "copied-config.txt"
+        artifact.write_text(
+            "SLACK_BOT_TOKEN=" + "xoxb-" + "1" * 12 + "-" + "a" * 22,
+            encoding="utf-8",
+        )
+
+        result = await adapter.send_document("C123", str(artifact))
+
+        assert not result.success
+        assert "appears to contain credentials" in result.error
+        adapter._app.client.files_upload_v2.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_document_uses_profile_aware_default_artifact_root(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        profile_home = tmp_path / "profile-home"
+        artifact_root = profile_home / "artifacts" / "slack"
+        artifact_root.mkdir(parents=True)
+        artifact = artifact_root / "report.txt"
+        artifact.write_text("safe report", encoding="utf-8")
+        monkeypatch.delenv("HERMES_SLACK_ARTIFACT_ROOT")
+        monkeypatch.setattr(_slack_mod, "get_hermes_home", lambda: profile_home)
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
+
+        result = await adapter.send_document("C123", str(artifact))
+
+        assert result.success
+        uploaded = adapter._app.client.files_upload_v2.await_args.kwargs["content"]
+        assert uploaded == artifact.read_bytes()
+
+    @pytest.mark.asyncio
+    async def test_send_document_is_disabled_without_governed_workflow(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        artifact = tmp_path / "report.txt"
+        artifact.write_text("safe report", encoding="utf-8")
+        monkeypatch.delenv("HERMES_SLACK_LOCAL_UPLOADS_ENABLED")
+
+        result = await adapter.send_document("C123", str(artifact))
+
+        assert not result.success
+        assert "governed artifact workflow is disabled" in result.error
+        adapter._app.client.files_upload_v2.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_send_document_not_connected(self, adapter):
         adapter._app = None
         result = await adapter.send_document(
@@ -540,7 +624,7 @@ class TestSendDocument:
     @pytest.mark.asyncio
     async def test_send_document_api_error_falls_back(self, adapter, tmp_path):
         test_file = tmp_path / "doc.pdf"
-        test_file.write_bytes(b"content")
+        test_file.write_bytes(b"%PDF-1.4 content")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
             side_effect=RuntimeError("Slack API error")
@@ -797,6 +881,18 @@ class TestIncomingDocumentHandling:
             "attachments": attachments or [],
         }
 
+    @staticmethod
+    def _docx(text: str) -> bytes:
+        buf = BytesIO()
+        xml = (
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f'<w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+            f'<w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>'
+        )
+        with ZipFile(buf, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("word/document.xml", xml)
+        return buf.getvalue()
+
     @pytest.mark.asyncio
     async def test_pdf_document_cached(self, adapter):
         """A PDF attachment should be downloaded, cached, and set as DOCUMENT type."""
@@ -817,6 +913,59 @@ class TestIncomingDocumentHandling:
         assert len(msg_event.media_urls) == 1
         assert os.path.exists(msg_event.media_urls[0])
         assert msg_event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_video_url_does_not_emit_unsupported_document_notice(self, adapter):
+        with patch.object(
+            adapter, "_download_slack_file_bytes", new_callable=AsyncMock
+        ) as download:
+            event = self._make_event(files=[{
+                "mimetype": "video/mp4",
+                "name": "clip.mp4",
+                "url_private_download": "https://files.slack.com/clip.mp4",
+                "size": 10,
+            }])
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "unsupported file type" not in msg_event.text
+        download.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_current_message_document_count_budget_skips_excess(
+        self, adapter, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(_slack_mod, "MAX_THREAD_ATTACHMENT_FILES", 2)
+        documents = []
+        for index in range(2):
+            path = tmp_path / f"doc-{index}.pdf"
+            path.write_bytes(b"%PDF")
+            documents.append(SimpleNamespace(
+                path=str(path),
+                filename=path.name,
+                mimetype="application/pdf",
+                size=4,
+                transfer_bytes=4,
+                extracted_text="",
+                extraction_truncated=False,
+            ))
+        adapter._ingest_slack_document = AsyncMock(side_effect=documents)
+        files = [
+            {
+                "id": f"F{index}",
+                "mimetype": "application/pdf",
+                "name": f"doc-{index}.pdf",
+                "url_private_download": f"https://files.slack.com/doc-{index}.pdf",
+                "size": 4,
+            }
+            for index in range(3)
+        ]
+
+        await adapter._handle_slack_message(self._make_event(files=files))
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert adapter._ingest_slack_document.await_count == 2
+        assert "bounded attachment-context budget was reached" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_txt_document_injects_content(self, adapter):
@@ -858,6 +1007,93 @@ class TestIncomingDocumentHandling:
 
         msg_event = adapter.handle_message.call_args[0][0]
         assert "# Title" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_docx_document_injects_grounded_content(self, adapter):
+        """DOCX content is extracted into the invoking turn, not path-only."""
+        content = self._docx("Energy Hub 360 Support")
+
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = content
+            event = self._make_event(
+                text="summarize this",
+                files=[{
+                    "id": "F_DOCX",
+                    "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "name": "support-plan.docx",
+                    "url_private_download": "https://files.slack.com/support-plan.docx",
+                    "size": len(content),
+                }],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert "Untrusted Slack attachment content" in msg_event.text
+        assert "[Extracted content of support-plan.docx]" in msg_event.text
+        assert "# Energy Hub 360 Support" in msg_event.text
+        assert "summarize this" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_malformed_docx_surfaces_actionable_notice(self, adapter):
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = b"not-a-docx"
+            event = self._make_event(
+                text="read this",
+                files=[{
+                    "id": "F_BAD",
+                    "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "name": "broken.docx",
+                    "url_private_download": "https://files.slack.com/broken.docx",
+                    "size": 10,
+                }],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "broken.docx" in msg_event.text
+        assert "malformed" in msg_event.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_document_without_authorized_url_surfaces_notice(self, adapter):
+        event = self._make_event(
+            text="read this",
+            files=[{
+                "id": "F_NO_URL",
+                "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "name": "unreachable.docx",
+                "size": 10,
+            }],
+        )
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "no authorized download URL" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_document_download_size_is_bounded_even_when_metadata_is_wrong(self, adapter):
+        max_bytes = 20 * 1024 * 1024
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = b"x" * (max_bytes + 1)
+            event = self._make_event(
+                text="read this",
+                files=[{
+                    "id": "F_LIED",
+                    "mimetype": "application/pdf",
+                    "name": "lied-about-size.pdf",
+                    "url_private_download": "https://files.slack.com/lied.pdf",
+                    "size": 10,
+                }],
+            )
+
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.media_urls == []
+        assert "download is oversized" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_json_snippet_injects_content(self, adapter):
@@ -907,6 +1143,25 @@ class TestIncomingDocumentHandling:
         msg_event = adapter.handle_message.call_args[0][0]
         assert len(msg_event.media_urls) == 1
         assert "[Content of" not in (msg_event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_text_injection_uses_actual_bytes_not_declared_size(self, adapter):
+        content = b"x" * (101 * 1024)
+
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = content
+            event = self._make_event(files=[{
+                "mimetype": "text/plain",
+                "name": "misreported.txt",
+                "url_private_download": "https://files.slack.com/misreported.txt",
+                "size": 10,
+            }], text="summarize")
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert len(msg_event.media_urls) == 1
+        assert "[Content of misreported.txt]" not in msg_event.text
+        assert msg_event.text == "summarize"
 
     @pytest.mark.asyncio
     async def test_zip_file_cached(self, adapter):

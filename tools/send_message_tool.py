@@ -139,7 +139,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+                "description": "The message text to send. For Slack, attach only a governed artifact by including the exact MEDIA:<approved_path> returned by a trusted artifact tool; arbitrary local paths are denied. Other platforms retain their platform-specific MEDIA behavior."
             }
         },
         "required": []
