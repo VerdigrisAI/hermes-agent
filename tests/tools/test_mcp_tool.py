@@ -1142,7 +1142,7 @@ class TestToolsetInjection:
             call_count = 0
 
             # Second call: should retry broken, skip good
-            result2 = discover_mcp_tools()
+            result2 = discover_mcp_tools(force_retry=True)
             assert "mcp_good_ping" in result2
             assert "mcp_broken_ping" in result2
             assert call_count == 1  # Only broken retried

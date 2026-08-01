@@ -25,7 +25,7 @@ import ssl
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from agent.anthropic_adapter import _is_oauth_token
 from agent.auxiliary_client import set_runtime_main
@@ -80,6 +80,84 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _refresh_tools_for_registry_change(agent) -> str | None:
+    """Refresh a live agent once dynamic tools change between turns.
+
+    The comparison happens only at a turn boundary. Past messages and the
+    cached system prompt remain untouched; a synthetic notice is appended to
+    the next request so the model can reason about the newly available tools.
+    """
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    current_generation = registry._generation
+    previous_generation = getattr(agent, "_tool_registry_generation", None)
+    if previous_generation is None:
+        agent._tool_registry_generation = current_generation
+        return None
+    if previous_generation == current_generation:
+        return None
+
+    previous_names = set(getattr(agent, "valid_tool_names", set()) or set())
+    previous_registry_names = set(
+        getattr(agent, "_registry_tool_names", previous_names) or set()
+    )
+    try:
+        refreshed = get_tool_definitions(
+            enabled_toolsets=cast(List[str], getattr(agent, "enabled_toolsets", None)),
+            disabled_toolsets=cast(List[str], getattr(agent, "disabled_toolsets", None)),
+            quiet_mode=True,
+        )
+    except Exception:
+        logger.exception("Failed to refresh tools after registry generation changed")
+        return None
+
+    refreshed_registry_names = {
+        tool["function"]["name"] for tool in refreshed
+    } if refreshed else set()
+    local_tools = [
+        tool
+        for tool in (getattr(agent, "tools", None) or [])
+        if tool.get("function", {}).get("name") not in previous_registry_names
+        and tool.get("function", {}).get("name") not in refreshed_registry_names
+    ]
+    agent.tools = [*refreshed, *local_tools]
+    agent._registry_tool_names = refreshed_registry_names
+    agent.valid_tool_names = {
+        tool["function"]["name"] for tool in agent.tools
+    } if agent.tools else set()
+    agent._tool_registry_generation = current_generation
+    added = sorted(agent.valid_tool_names - previous_names)
+    removed = sorted(previous_names - agent.valid_tool_names)
+    if not added and not removed:
+        return None
+    parts = []
+    if added:
+        parts.append("Added tools: " + ", ".join(added))
+    if removed:
+        parts.append("Removed tools: " + ", ".join(removed))
+    return (
+        "[IMPORTANT: The tool registry changed between turns. "
+        + ". ".join(parts)
+        + ". Use the updated tool list for this turn.]"
+    )
+
+
+def _append_ephemeral_user_context(content: Any, injections: list[str]) -> Any:
+    """Return API-only user content without mutating persisted messages."""
+    parts = [part for part in injections if part]
+    if not parts:
+        return content
+    suffix = "\n\n" + "\n\n".join(parts)
+    if isinstance(content, str):
+        return content + suffix
+    if isinstance(content, list):
+        blocks = list(content)
+        blocks.append({"type": "text", "text": suffix})
+        return blocks
+    return content
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
@@ -215,6 +293,8 @@ def run_conversation(
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     # Installed once, transparent when streams are healthy, prevents crash on write.
     _install_safe_stdio()
+
+    tool_change_notice = _refresh_tools_for_registry_change(agent)
 
     agent._ensure_db_session()
 
@@ -756,10 +836,12 @@ def run_conversation(
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
+                if tool_change_notice:
+                    _injections.append(tool_change_notice)
                 if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                    api_msg["content"] = _append_ephemeral_user_context(
+                        api_msg.get("content", ""), _injections
+                    )
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved

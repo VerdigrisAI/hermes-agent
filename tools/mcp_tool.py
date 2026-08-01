@@ -263,6 +263,8 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+_MAX_BACKGROUND_CONNECT_BACKOFF_SECONDS = 300
+_TRANSPORT_CANCEL_TIMEOUT_SECONDS = 10
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1966,7 +1968,29 @@ class MCPServerTask:
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
         self._task = asyncio.ensure_future(self.run(config))
-        await self._ready.wait()
+        try:
+            await self._ready.wait()
+        except BaseException:
+            # ``asyncio.wait_for(_connect_server(...))`` cancels this waiter on
+            # connect timeout. The transport owner is ``self._task``; leaving
+            # it alive would orphan a subprocess/session on every retry.
+            self._shutdown_event.set()
+            self._reconnect_event.set()
+            if self._task and not self._task.done():
+                self._task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._task),
+                        timeout=_TRANSPORT_CANCEL_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    _track_unreaped_transport_task(self._task)
+                except asyncio.CancelledError:
+                    if not self._task.done():
+                        _track_unreaped_transport_task(self._task)
+                        raise
+            self.session = None
+            raise
         if self._error:
             raise self._error
 
@@ -1981,29 +2005,35 @@ class MCPServerTask:
         # there's no race where the helper misses the shutdown flag after
         # returning "reconnect".
         self._reconnect_event.set()
-        if self._task and not self._task.done():
-            try:
-                await asyncio.wait_for(self._task, timeout=10)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "MCP server '%s' shutdown timed out, cancelling task",
-                    self.name,
+        try:
+            if self._task and not self._task.done():
+                _, pending = await asyncio.wait(
+                    [self._task], timeout=_TRANSPORT_CANCEL_TIMEOUT_SECONDS
                 )
-                self._task.cancel()
-                try:
-                    await self._task
-                except asyncio.CancelledError:
-                    pass
-        if self._pending_refresh_tasks:
-            for task in list(self._pending_refresh_tasks):
-                task.cancel()
-            await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
-            self._pending_refresh_tasks.clear()
-        for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
-        self._registered_tool_names = []
-        self.session = None
+                if pending:
+                    logger.warning(
+                        "MCP server '%s' shutdown timed out, cancelling task",
+                        self.name,
+                    )
+                    self._task.cancel()
+                    _, still_pending = await asyncio.wait(
+                        [self._task], timeout=_TRANSPORT_CANCEL_TIMEOUT_SECONDS
+                    )
+                    if still_pending:
+                        _track_unreaped_transport_task(self._task)
+            if self._pending_refresh_tasks:
+                for task in list(self._pending_refresh_tasks):
+                    task.cancel()
+                await asyncio.gather(
+                    *self._pending_refresh_tasks, return_exceptions=True
+                )
+                self._pending_refresh_tasks.clear()
+        finally:
+            for tool_name in list(getattr(self, "_registered_tool_names", [])):
+                registry.deregister(tool_name)
+                _forget_mcp_tool_server(tool_name)
+            self._registered_tool_names = []
+            self.session = None
 
 
 # ---------------------------------------------------------------------------
@@ -2011,6 +2041,9 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+_background_connect_tasks: Dict[str, asyncio.Task] = {}
+_unreaped_transport_tasks: set[asyncio.Task] = set()
+_mcp_shutting_down = False
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -2116,6 +2149,12 @@ def _is_auth_error(exc: BaseException) -> bool:
     response status code is 401. Other HTTP errors fall through to the
     generic error path in the tool handlers.
     """
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        return any(_is_auth_error(child) for child in nested)
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, BaseException) and _is_auth_error(cause):
+        return True
     types = _get_auth_error_types()
     if not types or not isinstance(exc, types):
         return False
@@ -2387,6 +2426,19 @@ _mcp_thread: Optional[threading.Thread] = None
 # Protects _mcp_loop, _mcp_thread, _servers, _parallel_safe_servers,
 # _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
+_mcp_lifecycle_lock = threading.RLock()
+
+
+def _track_unreaped_transport_task(task: asyncio.Task) -> None:
+    """Keep timed-out transport owners reachable until shutdown or completion."""
+    with _lock:
+        _unreaped_transport_tasks.add(task)
+
+    def _forget(done: asyncio.Task) -> None:
+        with _lock:
+            _unreaped_transport_tasks.discard(done)
+
+    task.add_done_callback(_forget)
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
 # them on shutdown if the graceful cleanup (SDK context-manager teardown)
@@ -2447,6 +2499,8 @@ def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
     global _mcp_loop, _mcp_thread
     with _lock:
+        if _mcp_shutting_down:
+            raise RuntimeError("MCP shutdown is in progress")
         if _mcp_loop is not None and _mcp_loop.is_running():
             return
         _mcp_loop = asyncio.new_event_loop()
@@ -3356,8 +3410,10 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
 
 def _existing_tool_names() -> List[str]:
     """Return tool names for all currently connected servers."""
+    with _lock:
+        servers_snapshot = list(_servers.values())
     names: List[str] = []
-    for _sname, server in _servers.items():
+    for server in servers_snapshot:
         if hasattr(server, "_registered_tool_names"):
             names.extend(server._registered_tool_names)
             continue
@@ -3367,7 +3423,13 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
-def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+def _register_server_tools(
+    name: str,
+    server: MCPServerTask,
+    config: dict,
+    *,
+    publish_progress: bool = False,
+) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
     Handles include/exclude filtering and utility tools. Toolset resolution
@@ -3433,6 +3495,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
+        if publish_progress:
+            server._registered_tool_names = list(registered_names)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
     # only when the server actually supports the corresponding capability.
@@ -3470,6 +3534,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)
+        if publish_progress:
+            server._registered_tool_names = list(registered_names)
 
     if registered_names:
         registry.register_toolset_alias(name, toolset_name)
@@ -3487,11 +3553,30 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _connect_server(name, config),
         timeout=connect_timeout,
     )
+    server._registered_tool_names = []
+    try:
+        registered_names = _register_server_tools(
+            name, server, config, publish_progress=True
+        )
+        server._registered_tool_names = list(registered_names)
+    except BaseException:
+        await server.shutdown()
+        raise
     with _lock:
-        _servers[name] = server
+        publish = not _mcp_shutting_down
+        if publish:
+            _servers[name] = server
+    if not publish:
+        await server.shutdown()
+        raise RuntimeError("MCP shutdown is in progress")
+    # Registration happened before publication so readers could not observe a
+    # half-built server. Re-open availability caches now that check_fns can see
+    # the fully initialized server, and bump the registry generation once more
+    # so existing agents refresh at their next turn boundary.
+    from tools.registry import invalidate_check_fn_cache, registry
 
-    registered_names = _register_server_tools(name, server, config)
-    server._registered_tool_names = list(registered_names)
+    invalidate_check_fn_cache()
+    registry.register_toolset_alias(name, f"mcp-{name}")
 
     transport_type = "HTTP" if "url" in config else "stdio"
     logger.info(
@@ -3502,11 +3587,125 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     return registered_names
 
 
+def _should_retry_failed_initial_connection(exc: BaseException) -> bool:
+    """Return whether an initial registration failure may heal by itself."""
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        return all(_should_retry_failed_initial_connection(child) for child in nested)
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, BaseException) and not _should_retry_failed_initial_connection(cause):
+        return False
+    if isinstance(exc, (InvalidMcpUrlError, ImportError, ValueError)):
+        return False
+    return not _is_auth_error(exc)
+
+
+async def _retry_failed_server_registration(name: str, config: dict) -> None:
+    """Reconnect a server that exhausted synchronous startup attempts.
+
+    Initial discovery must finish promptly so one unavailable dependency does
+    not block the whole agent boot. This task remains on the MCP event loop and
+    retries the complete connect -> discover -> register path until it succeeds
+    or shutdown cancels it.
+    """
+    backoff = 1.0
+    attempts = 0
+    try:
+        while True:
+            await asyncio.sleep(backoff)
+            with _lock:
+                if name in _servers:
+                    return
+            attempts += 1
+            try:
+                registered = await _discover_and_register_server(name, config)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not _should_retry_failed_initial_connection(exc):
+                    logger.warning(
+                        "MCP server '%s' background reconnect stopped after "
+                        "non-retryable failure: %s",
+                        name,
+                        _format_connect_error(exc),
+                    )
+                    return
+                logger.warning(
+                    "MCP server '%s' still unavailable after background "
+                    "reconnect attempt %d; retrying in %.0fs: %s",
+                    name,
+                    attempts,
+                    min(backoff * 2, _MAX_BACKGROUND_CONNECT_BACKOFF_SECONDS),
+                    _format_connect_error(exc),
+                )
+                backoff = min(
+                    backoff * 2, _MAX_BACKGROUND_CONNECT_BACKOFF_SECONDS
+                )
+                continue
+            logger.info(
+                "MCP server '%s' recovered in background after %d attempt(s); "
+                "registered %d tool(s)",
+                name,
+                attempts,
+                len(registered),
+            )
+            return
+    finally:
+        current = asyncio.current_task()
+        with _lock:
+            if _background_connect_tasks.get(name) is current:
+                _background_connect_tasks.pop(name, None)
+
+
+def _schedule_failed_server_retry(
+    name: str, config: dict, initial_error: BaseException
+) -> bool:
+    """Schedule one idempotent background registration retry for ``name``."""
+    if not _should_retry_failed_initial_connection(initial_error):
+        return False
+    with _lock:
+        if _mcp_shutting_down:
+            return False
+        existing = _background_connect_tasks.get(name)
+        if existing is not None and not existing.done():
+            return False
+        task = asyncio.create_task(
+            _retry_failed_server_registration(name, dict(config)),
+            name=f"mcp-background-connect-{name}",
+        )
+        _background_connect_tasks[name] = task
+    logger.warning(
+        "MCP server '%s' exhausted startup attempts; background reconnect armed",
+        name,
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(
+    servers: Dict[str, dict], *, force_retry: bool = False
+) -> List[str]:
+    """Serialize discovery against shutdown and reject starts during teardown."""
+    with _lock:
+        shutting_down = _mcp_shutting_down
+    if shutting_down:
+        logger.warning("MCP discovery skipped because shutdown is in progress")
+        return _existing_tool_names()
+    with _mcp_lifecycle_lock:
+        with _lock:
+            shutting_down = _mcp_shutting_down
+        if shutting_down:
+            logger.warning("MCP discovery skipped because shutdown is in progress")
+            return _existing_tool_names()
+        return _register_mcp_servers_impl(servers, force_retry=force_retry)
+
+
+def _register_mcp_servers_impl(
+    servers: Dict[str, dict], *, force_retry: bool = False
+) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
     Idempotent for already-connected server names. Servers with
@@ -3528,18 +3727,43 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
+    retries_to_cancel: list[asyncio.Task] = []
     with _lock:
-        new_servers = {
-            k: v
-            for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
-        }
+        if force_retry:
+            for name in servers:
+                task = _background_connect_tasks.pop(name, None)
+                if task is not None and not task.done():
+                    retries_to_cancel.append(task)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
             else:
                 _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
+
+    if retries_to_cancel:
+        async def _cancel_retries() -> None:
+            for task in retries_to_cancel:
+                task.cancel()
+            await asyncio.gather(*retries_to_cancel, return_exceptions=True)
+
+        _run_on_mcp_loop(_cancel_retries, timeout=15)
+
+    # A background retry may publish just before cancellation lands. Build the
+    # foreground work set only after awaiting cancellation so that recovered
+    # server is reused instead of overwritten and leaked.
+    with _lock:
+        new_servers = {
+            k: v
+            for k, v in servers.items()
+            if k not in _servers
+            and (
+                force_retry
+                or k not in _background_connect_tasks
+                or _background_connect_tasks[k].done()
+            )
+            and _parse_boolish(v.get("enabled", True), default=True)
+        }
 
     if not new_servers:
         return _existing_tool_names()
@@ -3567,6 +3791,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     f" (command={command})" if command else "",
                     _format_connect_error(result),
                 )
+                _schedule_failed_server_retry(name, new_servers[name], result)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -3601,14 +3826,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(*, force_retry: bool = False) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
     the ``mcp`` package is not installed (returns empty list).
 
-    Idempotent for already-connected servers. If some servers failed on a
-    previous call, only the missing ones are retried.
+    Idempotent for already-connected servers. Missing servers with an armed
+    background retry keep their backoff unless ``force_retry=True`` explicitly
+    cancels and awaits that task before reconnecting immediately.
 
     Returns:
         List of all registered MCP tool names.
@@ -3626,10 +3852,16 @@ def discover_mcp_tools() -> List[str]:
         new_server_names = [
             name
             for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+            if name not in _servers
+            and (
+                force_retry
+                or name not in _background_connect_tasks
+                or _background_connect_tasks[name].done()
+            )
+            and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
-    tool_names = register_mcp_servers(servers)
+    tool_names = register_mcp_servers(servers, force_retry=force_retry)
     if not new_server_names:
         return tool_names
 
@@ -3775,32 +4007,99 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
 
 
 def shutdown_mcp_servers():
+    """Serialize teardown against foreground discovery."""
+    with _mcp_lifecycle_lock:
+        _shutdown_mcp_servers_impl()
+
+
+def _shutdown_mcp_servers_impl():
     """Close all MCP server connections and stop the background loop.
 
     Each server Task is signalled to exit its ``async with`` block so that
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
     """
+    global _mcp_shutting_down
     with _lock:
+        _mcp_shutting_down = True
         servers_snapshot = list(_servers.values())
+        retry_tasks_snapshot = list(_background_connect_tasks.values())
+        unreaped_tasks_snapshot = list(_unreaped_transport_tasks)
 
     # Fast path: nothing to shut down.
-    if not servers_snapshot:
+    if not servers_snapshot and not retry_tasks_snapshot and not unreaped_tasks_snapshot:
         _stop_mcp_loop()
+        with _lock:
+            _mcp_shutting_down = False
         return
 
     async def _shutdown():
-        results = await asyncio.gather(
-            *(server.shutdown() for server in servers_snapshot),
-            return_exceptions=True,
-        )
-        for server, result in zip(servers_snapshot, results):
-            if isinstance(result, Exception):
-                logger.debug(
-                    "Error closing MCP server '%s': %s", server.name, result,
+        try:
+            for task in retry_tasks_snapshot:
+                task.cancel()
+            if retry_tasks_snapshot:
+                await asyncio.gather(*retry_tasks_snapshot, return_exceptions=True)
+            with _lock:
+                # Retry cancellation can newly expose a stubborn transport.
+                all_unreaped = list({
+                    id(task): task for task in [
+                        *unreaped_tasks_snapshot, *_unreaped_transport_tasks
+                    ]
+                }.values())
+            live_loop = asyncio.get_running_loop()
+            live_unreaped: list[asyncio.Task] = []
+            for task in all_unreaped:
+                try:
+                    if task.done() or task.get_loop() is not live_loop:
+                        continue
+                    task.cancel()
+                    live_unreaped.append(task)
+                except RuntimeError:
+                    logger.debug(
+                        "Discarding MCP transport task owned by a closed loop"
+                    )
+            if live_unreaped:
+                _, pending = await asyncio.wait(
+                    live_unreaped,
+                    timeout=_TRANSPORT_CANCEL_TIMEOUT_SECONDS,
                 )
-        with _lock:
-            _servers.clear()
+                if pending:
+                    logger.warning(
+                        "%d MCP transport task(s) did not stop before loop teardown",
+                        len(pending),
+                    )
+            with _lock:
+                all_servers = list({id(server): server for server in [
+                    *servers_snapshot, *_servers.values()
+                ]}.values())
+            shutdown_tasks = [
+                asyncio.create_task(server.shutdown()) for server in all_servers
+            ]
+            if shutdown_tasks:
+                done, pending = await asyncio.wait(
+                    shutdown_tasks, timeout=_TRANSPORT_CANCEL_TIMEOUT_SECONDS
+                )
+            else:
+                done, pending = set(), set()
+            for task in pending:
+                task.cancel()
+            if pending:
+                logger.warning(
+                    "%d MCP server shutdown(s) exceeded the cleanup deadline",
+                    len(pending),
+                )
+            for server, task in zip(all_servers, shutdown_tasks):
+                if task in done and not task.cancelled() and task.exception() is not None:
+                    logger.debug(
+                        "Error closing MCP server '%s': %s",
+                        getattr(server, "name", "unknown"),
+                        task.exception(),
+                    )
+        finally:
+            with _lock:
+                _servers.clear()
+                _background_connect_tasks.clear()
+                _unreaped_transport_tasks.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -3813,11 +4112,23 @@ def shutdown_mcp_servers():
         )
         if future is not None:
             try:
-                future.result(timeout=15)
+                # Retry cancellation, transport reaping, and server context
+                # teardown each have their own bounded phase.
+                future.result(timeout=_TRANSPORT_CANCEL_TIMEOUT_SECONDS * 3 + 5)
             except Exception as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
+                future.cancel()
+
+    # Fail closed even if the loop was unavailable or cleanup exceeded its
+    # deadline. Stale maps must never suppress registration on a new loop.
+    with _lock:
+        _servers.clear()
+        _background_connect_tasks.clear()
+        _unreaped_transport_tasks.clear()
 
     _stop_mcp_loop()
+    with _lock:
+        _mcp_shutting_down = False
 
 
 def _kill_orphaned_mcp_children(include_active: bool = False) -> None:

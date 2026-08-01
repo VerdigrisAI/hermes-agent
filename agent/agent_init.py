@@ -71,6 +71,21 @@ def _ra():
     return run_agent
 
 
+def _resolve_tool_snapshot(
+    *, enabled_toolsets, disabled_toolsets, quiet_mode: bool
+) -> tuple[list[dict[str, Any]], int]:
+    """Resolve tools while retaining a generation that cannot mask a race."""
+    from tools.registry import registry
+
+    generation_before_resolution = registry._generation
+    definitions = _ra().get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=quiet_mode,
+    )
+    return definitions, generation_before_resolution
+
+
 def _normalized_custom_base_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -879,12 +894,17 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
-    # Get available tools with filtering
-    agent.tools = _ra().get_tool_definitions(
+    # Capture the generation before resolving definitions. If the registry
+    # changes during resolution, the next turn necessarily refreshes instead
+    # of binding an old snapshot to the newest generation.
+    agent.tools, agent._tool_registry_generation = _resolve_tool_snapshot(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    agent._registry_tool_names = {
+        tool["function"]["name"] for tool in agent.tools
+    } if agent.tools else set()
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
