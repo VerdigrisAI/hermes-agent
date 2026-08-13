@@ -108,8 +108,21 @@ class RunState:
 # stays API-valid.
 CLIENT_TOOL_PLACEHOLDER = json.dumps({"status": "pending_client_execution"})
 
+# Client-declared names are registered for the life of the process: a name may
+# be bound to an in-flight run's handler at any moment, so eviction is not safe
+# without run-level refcounting. Bound the set instead, so a client that invents
+# a fresh name per request cannot grow the registry without limit. The cap is
+# far above any legitimate client (the policy-bound Mercator surface serves a
+# fixed schema list and never grows at all); crossing it means something is
+# wrong, so it fails closed rather than degrading quietly.
+_MAX_ADAPTER_TOOL_NAMES = 4096
+_ADAPTER_TOOL_NAME_WARN_AT = 3072
+
 _registered_frontend_names: set[str] = set()
-_reg_lock = threading.Lock()
+# Re-entrant: the check-then-register sequence in ``build_run_agent`` holds
+# this across ``_reject_name_collisions`` and the ``_ensure_*`` helpers,
+# each of which also acquires it when called on its own.
+_reg_lock = threading.RLock()
 
 # Toolsets this adapter itself registers into the process-global registry, one
 # per kind of client declaration. An entry in one of these is the adapter's OWN
@@ -153,6 +166,15 @@ def _reject_name_collisions(frontend_names: set[str], state_writer_names: set[st
     both = set(frontend_names) & set(state_writer_names)
     if both:
         raise ToolNameCollisionError(both)
+
+    # Held across the registry reads below so a concurrent run cannot register
+    # one of these names between the check and this run's own registration.
+    with _reg_lock:
+        _assert_no_registry_collisions(registry, frontend_names, state_writer_names)
+
+
+def _assert_no_registry_collisions(registry, frontend_names, state_writer_names) -> None:
+    """Registry half of the collision check. Caller must hold ``_reg_lock``."""
 
     # The adapter's own leftover registration is exempt only when the name is
     # being re-declared as the SAME kind of tool. A blanket "is it one of our
@@ -273,6 +295,34 @@ def _make_state_writer_handler(tool_name: str):
     return _handler
 
 
+class FrontendOnlyPolicyError(RuntimeError):
+    """Raised when the environment contradicts a frontend-only tool surface."""
+
+
+class AdapterToolRegistryFullError(RuntimeError):
+    """Raised when adapter-owned tool registrations exceed their process cap."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(
+            f"AG-UI adapter has registered {count} client-declared tool names "
+            f"(cap {_MAX_ADAPTER_TOOL_NAMES}); refusing further registrations"
+        )
+
+
+def _reserve_adapter_tool_name() -> None:
+    """Account for one new adapter-owned registration. Caller holds ``_reg_lock``."""
+    count = len(_registered_frontend_names) + len(_registered_state_writer_names)
+    if count >= _MAX_ADAPTER_TOOL_NAMES:
+        raise AdapterToolRegistryFullError(count)
+    if count == _ADAPTER_TOOL_NAME_WARN_AT:
+        logger.warning(
+            "AG-UI adapter has registered %d client-declared tool names (cap %d); "
+            "a client is likely declaring a fresh name per request",
+            count,
+            _MAX_ADAPTER_TOOL_NAMES,
+        )
+
+
 def _ensure_state_writer_tools_registered(specs: Dict[str, StateWriterSpec]) -> None:
     """Register a server-side dispatch handler for each state-writer tool name.
 
@@ -292,6 +342,7 @@ def _ensure_state_writer_tools_registered(specs: Dict[str, StateWriterSpec]) -> 
                 continue
             arg = spec.arg
             properties = {arg: {}} if arg else {}
+            _reserve_adapter_tool_name()
             registry.register(
                 name=name,
                 toolset="agui-state-writer",
@@ -323,6 +374,7 @@ def _ensure_frontend_tools_registered(names: set[str]) -> None:
                 continue
             if registry.get_entry(name) is not None:
                 continue
+            _reserve_adapter_tool_name()
             registry.register(
                 name=name,
                 toolset="agui-frontend",
@@ -438,14 +490,29 @@ def build_run_agent(
     """
     from run_agent import AIAgent
 
-    # Reject shadowing declarations before anything is merged or registered.
-    # Keep this BELOW the run_agent import: that import is what populates the
-    # tool registry (model_tools runs discover_builtin_tools() at import), so
-    # hoisting the check above it would silently make it a no-op.
+    # Fail fast, before any agent is constructed. Keep this BELOW the run_agent
+    # import: that import is what populates the tool registry (model_tools runs
+    # discover_builtin_tools() at import), so hoisting the check above it would
+    # silently make it a no-op. This is the cheap check; the authoritative one
+    # runs again under _reg_lock immediately before registration, because a
+    # check released before the write cannot exclude a concurrent run.
     _reject_name_collisions(
         set(frontend_tool_names or set()),
         set(state_writer_specs or {}),
     )
+
+    # Also fail fast on an environment that contradicts frontend_only.
+    # get_tool_definitions() appends the "kanban" toolset whenever
+    # HERMES_KANBAN_TASK is set, even for enabled_toolsets=[]
+    # (model_tools._compute_tool_definitions), so clearing agent.tools below
+    # would be undone by any later tool refresh in this process. Refuse the
+    # combination rather than depending on nothing ever refreshing.
+    if config.frontend_only and os.environ.get("HERMES_KANBAN_TASK"):
+        raise FrontendOnlyPolicyError(
+            "frontend_only requires an empty server-tool surface, but "
+            "HERMES_KANBAN_TASK is set and re-adds the kanban toolset on "
+            "every tool-definition refresh"
+        )
 
     settings = _resolve_agent_settings(config)
 
@@ -470,6 +537,9 @@ def build_run_agent(
     if config.frontend_only:
         # A policy-bound embedding must not advertise Hermes core/server tools.
         # The frontend schemas merged below are the entire callable surface.
+        # Clearing here is necessary but not sufficient; see the
+        # HERMES_KANBAN_TASK guard above for why the contradictory environment
+        # is refused before we get this far.
         agent.tools = []
         agent.valid_tool_names = set()
     if cwd:
@@ -478,13 +548,23 @@ def build_run_agent(
         _apply_default_headers(agent, default_headers)
 
     names = frontend_tool_names or set()
-    if names:
-        _ensure_frontend_tools_registered(names)
-        _merge_frontend_tools(agent, frontend_tool_schemas or [], names)
-
     specs = state_writer_specs or {}
+
+    # Validate and register as one critical section. The check reads the same
+    # registry the registration writes, so releasing the lock between them lets
+    # two concurrent runs both pass the check for a name neither has registered
+    # yet; the loser then advertises that name while it is bound to the winner's
+    # handler. Nothing is merged or registered before the check inside the block.
+    with _reg_lock:
+        _reject_name_collisions(set(names), set(specs))
+        if names:
+            _ensure_frontend_tools_registered(names)
+        if specs:
+            _ensure_state_writer_tools_registered(specs)
+
+    if names:
+        _merge_frontend_tools(agent, frontend_tool_schemas or [], names)
     if specs:
-        _ensure_state_writer_tools_registered(specs)
         # State-writer tools are server-executed; advertise them exactly like
         # frontend tools (name + parameters) so the model can call them.
         _merge_frontend_tools(agent, state_writer_schemas or [], set(specs))

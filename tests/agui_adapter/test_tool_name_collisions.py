@@ -192,3 +192,121 @@ class TestGuardIsWiredIntoBuildRunAgent:
         entry_after = registry.get_entry(server_tool_name)
         assert entry_after is entry_before
         assert entry_after.toolset not in _ADAPTER_TOOLSETS
+
+
+class TestCheckAndRegisterAreAtomic:
+    """The registry read must happen under the lock that guards registry writes.
+
+    Releasing the lock between the check and the registration lets two
+    concurrent runs both pass the check for a name neither has registered yet.
+    The loser then advertises that name in ``valid_tool_names`` while the
+    registry has it bound to the winner's handler — the exact shadowing this
+    module exists to prevent, one layer in.
+    """
+
+    def test_reject_name_collisions_acquires_the_registration_lock(self, registry):
+        import threading
+
+        from agui_adapter import session
+
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def hold_lock():
+            with session._reg_lock:
+                entered.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        assert entered.wait(timeout=5), "lock holder never started"
+
+        def check():
+            _reject_name_collisions({"ui_atomic_probe"}, set())
+            finished.set()
+
+        checker = threading.Thread(target=check, daemon=True)
+        checker.start()
+
+        # Must NOT complete while another thread holds the registration lock.
+        assert not finished.wait(timeout=0.5), (
+            "_reject_name_collisions completed while _reg_lock was held; the "
+            "registry read is outside the lock and the check-then-register "
+            "sequence is racy"
+        )
+
+        release.set()
+        holder.join(timeout=5)
+        assert finished.wait(timeout=5), "check never completed after lock release"
+        checker.join(timeout=5)
+
+    def test_registration_lock_is_reentrant(self):
+        """build_run_agent holds the lock across helpers that re-acquire it."""
+        from agui_adapter import session
+
+        with session._reg_lock:
+            with session._reg_lock:
+                pass
+
+
+class TestAdapterRegistryIsBounded:
+    """Client-declared names are never evicted, so the set must be capped.
+
+    A client that invents a fresh tool name per request would otherwise grow
+    the process-global registry for the lifetime of the process.
+    """
+
+    def test_registration_fails_closed_at_the_cap(self, registry, monkeypatch):
+        from agui_adapter import session
+
+        monkeypatch.setattr(session, "_MAX_ADAPTER_TOOL_NAMES", 2)
+        monkeypatch.setattr(session, "_registered_frontend_names", set())
+        monkeypatch.setattr(session, "_registered_state_writer_names", set())
+
+        session._ensure_frontend_tools_registered({"ui_cap_probe_a"})
+        session._ensure_frontend_tools_registered({"ui_cap_probe_b"})
+
+        with pytest.raises(session.AdapterToolRegistryFullError) as excinfo:
+            session._ensure_frontend_tools_registered({"ui_cap_probe_c"})
+        assert "refusing further registrations" in str(excinfo.value)
+
+    def test_reregistering_a_known_name_does_not_consume_capacity(
+        self, registry, monkeypatch
+    ):
+        from agui_adapter import session
+
+        monkeypatch.setattr(session, "_MAX_ADAPTER_TOOL_NAMES", 1)
+        monkeypatch.setattr(session, "_registered_frontend_names", set())
+        monkeypatch.setattr(session, "_registered_state_writer_names", set())
+
+        session._ensure_frontend_tools_registered({"ui_cap_repeat"})
+        # Same name again: already registered, so it must not raise.
+        session._ensure_frontend_tools_registered({"ui_cap_repeat"})
+
+
+class TestFrontendOnlySurfaceIsEnforced:
+    """`frontend_only` promises zero server tools; kanban contradicts that.
+
+    `model_tools._compute_tool_definitions` appends the "kanban" toolset
+    whenever HERMES_KANBAN_TASK is set, even for `enabled_toolsets=[]`, so
+    clearing `agent.tools` at construction is undone by any later refresh.
+    """
+
+    def test_frontend_only_refuses_a_kanban_worker_environment(
+        self, registry, monkeypatch
+    ):
+        from agui_adapter.session import (
+            AgentConfig,
+            FrontendOnlyPolicyError,
+            build_run_agent,
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+        config = AgentConfig()
+        config.enabled_toolsets = []
+        config.frontend_only = True
+
+        with pytest.raises(FrontendOnlyPolicyError) as excinfo:
+            build_run_agent(config, frontend_tool_names={"ui_confirm"})
+        assert "kanban" in str(excinfo.value)
