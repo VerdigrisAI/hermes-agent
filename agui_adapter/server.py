@@ -39,6 +39,7 @@ produced, post-run, in message order.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import threading
@@ -79,6 +80,8 @@ logger = logging.getLogger(__name__)
 resume_shim.install()
 
 _FORWARD_HEADERS = ("x-aimock-context", "x-test-id", "x-aimock-strict")
+
+MERCATOR_ACCEPTANCE_POLICY_API = 1
 
 
 def _new_message_id(prefix: str = "msg") -> str:
@@ -345,13 +348,18 @@ def _interrupt_run(thread_id: str, run_id: str) -> None:
 
 
 async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
-                        config: AgentConfig, fwd_headers: Dict[str, str]):
+                        config: AgentConfig, fwd_headers: Dict[str, str],
+                        policy_contract=None):
     from agui_adapter import approvals
 
     loop = asyncio.get_running_loop()
+    worker_context = contextvars.copy_context()
 
     # ---- Resume run: re-attach to a parked worker and resolve its decision ----
     if getattr(run_input, "resume", None):
+        if policy_contract is not None:
+            yield encoder.encode(RunErrorEvent(message="Acceptance action resume is not enabled."))
+            return
         parked = approvals.take(run_input.thread_id)
         yield encoder.encode(RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))
         if parked is None:
@@ -421,7 +429,7 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
     bridge = AGUIEventBridge(emit)
     known_ids = _input_tool_call_ids(run_input.messages)
 
-    approval_cb = approvals.make_approval_callback(
+    approval_cb = None if policy_contract is not None else approvals.make_approval_callback(
         thread_id=run_input.thread_id,
         emit=emit, queue=queue,
         last_tool_call_id=bridge.last_tool_call_id,
@@ -486,6 +494,23 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
                     emit(StateSnapshotEvent(snapshot=snapshots[snap_idx]))
                     snap_idx += 1
             for tcid, name, args in deferred_frontend:
+                if policy_contract is not None:
+                    try:
+                        parsed_args = json.loads(args) if isinstance(args, str) else args
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("frontend action arguments are not valid JSON") from exc
+                    if not isinstance(parsed_args, dict):
+                        raise ValueError("frontend action arguments must be an object")
+                    principal = policy_contract.current_principal()
+                    policy_contract.policy_store.authorize(
+                        run_id=principal.run_id,
+                        candidate_id=principal.candidate_id,
+                        principal=principal,
+                        action_name=name,
+                        arguments=parsed_args,
+                        invocation_id=tcid,
+                        manual_approval_id=None,
+                    )
                 handed_off = True
                 # Anchor the client-side tool call to a fresh assistant message.
                 # The AG-UI → CopilotKit conversion maps TOOL_CALL_START →
@@ -542,7 +567,11 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
             emit(approvals.DONE)
             _unregister_run_agent(run_input.thread_id, worker_agent["agent"])
 
-    threading.Thread(target=worker, name="hermes-agui-run", daemon=True).start()
+    threading.Thread(
+        target=lambda: worker_context.run(worker),
+        name="hermes-agui-run",
+        daemon=True,
+    ).start()
 
     yield encoder.encode(RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))
     try:
@@ -633,6 +662,62 @@ def create_app(config: Optional[AgentConfig] = None, *,
         fwd_headers = _collect_forward_headers(request.headers)
         return StreamingResponse(
             _event_stream(run_input, encoder, config, fwd_headers),
+            media_type=encoder.get_content_type(),
+        )
+
+    return app
+
+
+def create_mercator_acceptance_app(*, contract) -> FastAPI:
+    """Build the policy-bound, frontend-only Mercator acceptance adapter.
+
+    Authentication remains Mercator's outer ASGI responsibility. This inner
+    app rejects client-selected tools, advertises only the exact registry
+    supplied by Mercator, copies its verified principal context into the worker
+    thread, and authorizes every frontend handoff before emitting it.
+    """
+    if getattr(contract, "policy_api_version", None) != MERCATOR_ACCEPTANCE_POLICY_API:
+        raise ValueError("unsupported Mercator acceptance policy API")
+    if getattr(contract, "allow_core_tools", True):
+        raise ValueError("Mercator acceptance must disable Hermes core tools")
+    if tuple(getattr(contract, "server_toolsets", ())) or tuple(
+        getattr(contract, "server_tool_names", ())
+    ):
+        raise ValueError("Mercator acceptance must expose zero server tools")
+    if getattr(contract, "use_hermes_approvals", True):
+        raise ValueError("Mercator acceptance must disable Hermes approval state")
+    if getattr(contract, "allow_inherited_approval_state", True):
+        raise ValueError("Mercator acceptance must reject inherited approval state")
+    schemas = contract.frontend_tool_schemas()
+    if not isinstance(schemas, list) or not schemas:
+        raise ValueError("Mercator acceptance frontend schemas are required")
+
+    config = AgentConfig()
+    config.enabled_toolsets = []
+    config.frontend_only = True
+    app = FastAPI(title="Hermes Mercator Acceptance Adapter")
+
+    @app.post("/")
+    async def run_agent_endpoint(request: Request) -> Response:
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or body.get("tools"):
+                raise ValueError("client-selected tools are forbidden")
+            principal = contract.current_principal()
+            if principal is None:
+                raise ValueError("verified Mercator principal is required")
+            body["tools"] = schemas
+            run_input = RunAgentInput.model_validate(body)
+            if run_input.thread_id != principal.run_id:
+                raise ValueError("AG-UI thread must equal the verified acceptance run")
+            contract.ensure_run(principal)
+        except Exception:  # noqa: BLE001 - fail closed without identity details
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=400, content={"detail": "Invalid acceptance run."})
+        encoder = EventEncoder(accept=request.headers.get("accept"))
+        return StreamingResponse(
+            _event_stream(run_input, encoder, config, {}, policy_contract=contract),
             media_type=encoder.get_content_type(),
         )
 

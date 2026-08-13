@@ -255,6 +255,19 @@ declarative mapping).
 
 ## Tests
 
+### Mercator policy-bound embedding
+
+`create_mercator_acceptance_app(contract=...)` is the reviewed embedding used
+by Mercator. It rejects client-selected tools, requires zero server/core tools,
+injects only Mercator's exact frontend schemas, copies the verified principal
+context into the worker thread, and calls Mercator's per-action authorization
+before any frontend handoff is emitted. Native Hermes approval/resume state is
+disabled on this surface. Until Mercator activates its durable grant resolver,
+the embedding is chat-only and every proposed browser action fails closed.
+
+The standalone `create_app()` surface remains upstream-compatible and is not
+the operating-model ingress.
+
 ```bash
 pip install -e '.[agui]' && pip install pytest pytest-asyncio
 python -m pytest tests/agui_adapter/ -q

@@ -206,6 +206,9 @@ class AgentConfig:
         self.api_mode = os.environ.get("HERMES_AGUI_API_MODE") or None
         raw_toolsets = os.environ.get("HERMES_AGUI_TOOLSETS", "hermes-acp")
         self.enabled_toolsets = [t for t in (raw_toolsets.split(",") if raw_toolsets else []) if t.strip()]
+        # Integration-owned adapters may explicitly expose only frontend tools.
+        # This is never inferred from a request body.
+        self.frontend_only = False
 
 
 def set_current_agent(agent) -> contextvars.Token:
@@ -458,6 +461,11 @@ def build_run_agent(
         kwargs["args"] = list(settings.get("args") or [])
 
     agent = AIAgent(**kwargs)
+    if config.frontend_only:
+        # A policy-bound embedding must not advertise Hermes core/server tools.
+        # The frontend schemas merged below are the entire callable surface.
+        agent.tools = []
+        agent.valid_tool_names = set()
     if cwd:
         agent.session_cwd = cwd
     if default_headers:

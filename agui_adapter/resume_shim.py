@@ -45,7 +45,15 @@ def install() -> None:
         return
     import agent.conversation_loop as cl
 
-    original = cl.build_turn_context
+    original = getattr(cl, "build_turn_context", None)
+    if original is None:
+        # The Verdigris pin predates the extracted turn-context helper. The
+        # policy-bound Mercator surface does not permit frontend handoffs until
+        # an explicit grant resolver is activated, so resume is unreachable and
+        # must remain disabled rather than monkeypatching the older monolith.
+        logger.warning("AG-UI resume shim unavailable on this Hermes pin; resume remains disabled")
+        _installed = True
+        return
 
     def _wrapped(agent, *args, **kwargs):
         ctx = original(agent, *args, **kwargs)
