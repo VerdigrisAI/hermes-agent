@@ -273,6 +273,36 @@ def test_multimodal_data_source_becomes_data_uri():
     assert content == [{"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]
 
 
+def test_multimodal_data_source_honours_camelcase_mime_type():
+    """A non-PNG mimeType must survive the raw-dict path.
+
+    The sibling test uses image/png, which is also the fallback default, so it
+    passes whether or not the key is actually read. Only a different mime type
+    can catch the camelCase miss.
+    """
+    msg = UserMessage(
+        id="u",
+        role="user",
+        content=[{"type": "image", "source": {"type": "data", "value": "QUJD", "mimeType": "image/jpeg"}}],
+    )
+    hermes = agui_messages_to_hermes([msg])
+    assert hermes[0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}}
+    ]
+
+
+def test_prepare_run_treats_no_messages_as_a_fresh_run():
+    """An empty message list has no tool result to resume from.
+
+    Returning is_resume=True here arms the resume shim for a run with nothing
+    to strip.
+    """
+    prepared = prepare_run([])
+    assert prepared.is_resume is False
+    assert prepared.user_message == ""
+    assert prepared.conversation_history == []
+
+
 def test_pure_text_message_stays_plain_string():
     msg = UserMessage(id="u", role="user", content="just text")
     assert agui_messages_to_hermes([msg])[0]["content"] == "just text"

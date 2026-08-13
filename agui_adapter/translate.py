@@ -48,10 +48,19 @@ def _text_content(content: Any) -> str:
 
 
 def _block_field(block: Any, name: str) -> Any:
-    """Read a field from an AG-UI content block (pydantic model or dict)."""
+    """Read a field from an AG-UI content block (pydantic model or dict).
+
+    Pydantic models expose the snake_case field name, but raw AG-UI JSON
+    carries the camelCase alias (``mimeType``), so a plain dict must be probed
+    both ways or ``mime_type`` silently reads as ``None``.
+    """
     val = getattr(block, name, None)
     if val is None and isinstance(block, dict):
         val = block.get(name)
+        if val is None:
+            head, *rest = name.split("_")
+            if rest:
+                val = block.get(head + "".join(part.title() for part in rest))
     return val
 
 
@@ -201,7 +210,16 @@ def prepare_run(
     if leading:
         hermes = leading + hermes
 
-    last_role = getattr(messages[-1], "role", None) if messages else None
+    if not messages:
+        # No tool result and no user turn: arming the resume shim here would
+        # strip a message that does not exist. Treat it as a normal empty run.
+        return PreparedRun(
+            user_message="",
+            conversation_history=hermes,
+            is_resume=False,
+        )
+
+    last_role = getattr(messages[-1], "role", None)
     if last_role == "user":
         return PreparedRun(
             user_message=_content_to_parts(messages[-1].content),

@@ -236,7 +236,13 @@ def _frontend_tool_handler(args, **kwargs) -> str:
         try:
             agent.interrupt("client-side tool handoff")
         except Exception:
-            logger.debug("agent.interrupt() failed in frontend tool handler", exc_info=True)
+            # The run continues, the model reads the placeholder as a real
+            # result, and the client never receives the handoff. That is a
+            # broken run, not a debug detail.
+            logger.warning(
+                "agent.interrupt() failed in frontend tool handler; client handoff lost",
+                exc_info=True,
+            )
     return CLIENT_TOOL_PLACEHOLDER
 
 

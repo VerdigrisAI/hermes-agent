@@ -169,7 +169,7 @@ toolset for capability parity; excluding them is the operator's hardening lever.
 doesn't match `HERMES_AGUI_HOST`, so a proxy must either forward a matching
 `Host` or you set `HERMES_AGUI_HOST` to the public hostname (which then requires
 a token, since it's non-loopback). If you call `create_app(bound_host=…)`
-directly instead of using `hermes-agui`, pass the real serve interface — the
+directly instead of using `hermes-agui`, pass the actual serving interface — the
 token/Host checks are enforced against that value.
 
 ## How it works
