@@ -1632,6 +1632,7 @@ agui = [
     { name = "uvicorn" },
 ]
 all = [
+    { name = "ag-ui-protocol" },
     { name = "agent-client-protocol" },
     { name = "aiohttp" },
     { name = "debugpy" },
@@ -1832,6 +1833,7 @@ requires-dist = [
     { name = "google-auth-oauthlib", marker = "extra == 'google'", specifier = "==1.3.1" },
     { name = "hermes-agent", extras = ["acp"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["acp"], marker = "extra == 'termux'" },
+    { name = "hermes-agent", extras = ["agui"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["cli"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["cli"], marker = "extra == 'termux'" },
     { name = "hermes-agent", extras = ["cron"], marker = "extra == 'all'" },
