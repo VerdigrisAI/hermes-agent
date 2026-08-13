@@ -27,7 +27,9 @@ else:
     # Stop a ``utils/``/``proxy/``/``ui/`` package in the launch directory from
     # shadowing Hermes's own modules — ``hermes agui`` can be started from any
     # cwd, including a project that has same-named packages on its path.
-    hermes_bootstrap.harden_import_path()
+    harden_import_path = getattr(hermes_bootstrap, "harden_import_path", None)
+    if harden_import_path is not None:
+        harden_import_path()
 
 # No ``from __future__ import annotations`` here: a future statement must
 # precede every other import, which would displace hermes_bootstrap and break

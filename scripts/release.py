@@ -61,6 +61,8 @@ AUTHOR_MAP = {
     "altriatree@gmail.com": "TruaShamu",
     "contact-me@stark-x.cn": "Stark-X",
     "chungty@gmail.com": "chungty",
+    "mark@copilotkit.ai": "contextablemark",
+    "markus.ecker@gmail.com": "mme",
     "nat@nthrow.io": "nthrow",
     "m@mobrienv.dev": "mikeyobrien",
     "saeed919@pm.me": "falasi",

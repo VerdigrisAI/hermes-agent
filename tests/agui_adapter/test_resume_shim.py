@@ -26,7 +26,7 @@ def test_resume_off_is_pure_passthrough_and_install_idempotent(monkeypatch):
 
     # Force a clean wrap around our stub (the process may already have installed
     # the shim at import time; monkeypatch restores everything afterwards).
-    monkeypatch.setattr(cl, "build_turn_context", _orig)
+    monkeypatch.setattr(cl, "build_turn_context", _orig, raising=False)
     monkeypatch.setattr(resume_shim, "_installed", False)
 
     resume_shim.install()
@@ -46,7 +46,12 @@ def test_resume_off_is_pure_passthrough_and_install_idempotent(monkeypatch):
 def test_resume_on_drops_trailing_user_after_tool(monkeypatch):
     import agent.conversation_loop as cl
 
-    monkeypatch.setattr(cl, "build_turn_context", lambda agent, *a, **k: _fresh_ctx())
+    monkeypatch.setattr(
+        cl,
+        "build_turn_context",
+        lambda agent, *a, **k: _fresh_ctx(),
+        raising=False,
+    )
     monkeypatch.setattr(resume_shim, "_installed", False)
     resume_shim.install()
     wrapped = cl.build_turn_context
@@ -76,7 +81,7 @@ def test_resume_on_non_matching_tail_is_untouched(monkeypatch):
             current_turn_user_idx=99,
         )
 
-    monkeypatch.setattr(cl, "build_turn_context", _orig)
+    monkeypatch.setattr(cl, "build_turn_context", _orig, raising=False)
     monkeypatch.setattr(resume_shim, "_installed", False)
     resume_shim.install()
     wrapped = cl.build_turn_context

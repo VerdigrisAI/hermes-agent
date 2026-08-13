@@ -100,6 +100,7 @@ def set_session_vars(
     user_name: str = "",
     session_key: str = "",
     message_id: str = "",
+    async_delivery: bool = True,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -109,6 +110,11 @@ def set_session_vars(
     Returns a list of ``Token`` objects (one per variable) that can be
     passed to ``clear_session_vars``.
     """
+    # ``async_delivery`` is accepted for adapter compatibility. This Verdigris
+    # pin predates Hermes' background-delivery capability ContextVar; the
+    # policy-bound operating-model surface disables all background/core tools,
+    # so there is no async delivery promise to fulfill here.
+    del async_delivery
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_CHAT_ID.set(chat_id),

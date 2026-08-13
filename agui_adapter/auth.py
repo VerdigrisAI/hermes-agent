@@ -20,19 +20,28 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 
 def _usable(token: Optional[str]) -> bool:
+    t = (token or "").strip()
+    placeholders = {
+        "changeme",
+        "placeholder",
+        "your_api_key_here",
+        "changeme00000000",
+        "placeholder-value",
+        "secret",
+        "token",
+        "your_token_here",
+    }
+    if len(t) < _MIN_TOKEN_LEN or t.lower() in placeholders:
+        return False
     try:
         from hermes_cli.auth import has_usable_secret
-        return bool(token) and has_usable_secret(token, min_length=_MIN_TOKEN_LEN)
+        return has_usable_secret(t, min_length=_MIN_TOKEN_LEN)
     except ImportError:
         logger.warning(
             "hermes_cli.auth.has_usable_secret unavailable; using a reduced "
             "inline length + placeholder-denylist check for the AG-UI bind (the "
             "full hermes_cli placeholder set was not applied).", )
-        t = (token or "").strip()
-        _FALLBACK_PLACEHOLDERS = {"changeme", "placeholder", "your_api_key_here",
-                                  "changeme00000000", "placeholder-value", "secret",
-                                  "token", "your_token_here"}
-        return len(t) >= _MIN_TOKEN_LEN and t.lower() not in _FALLBACK_PLACEHOLDERS
+        return True
 
 
 def require_token_or_refuse(host: str, token: Optional[str]) -> None:
