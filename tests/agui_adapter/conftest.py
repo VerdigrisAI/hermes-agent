@@ -15,6 +15,22 @@ def _clean_parked_registry():
     spurious one downstream). Living in a package ``conftest`` protects both
     ``test_approvals.py`` and ``test_e2e_aimock.py``.
     """
-    approvals._parked.clear()
+    _release_parked()
     yield
+    _release_parked()
+
+
+def _release_parked() -> None:
+    """Deny every pending decision, then drop the entry.
+
+    Clearing the registry alone removes the bookkeeping but leaves
+    ``PendingApproval.decision`` unresolved, so a worker thread parked by a
+    failed test stays blocked on a future nobody will ever complete -- it only
+    unwinds on the approval timeout. Failing closed ("deny") matches the
+    timeout path in approvals.py.
+    """
+    for parked in list(approvals._parked.values()):
+        decision = getattr(getattr(parked, "pending", None), "decision", None)
+        if decision is not None and not decision.done():
+            decision.set_result("deny")
     approvals._parked.clear()

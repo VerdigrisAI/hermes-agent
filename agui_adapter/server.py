@@ -358,6 +358,12 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
     # ---- Resume run: re-attach to a parked worker and resolve its decision ----
     if getattr(run_input, "resume", None):
         if policy_contract is not None:
+            # Open the run first, like every other terminal path here. Emitting
+            # RunErrorEvent alone hands a client that correlates by run
+            # lifecycle an error for a run it never saw start.
+            yield encoder.encode(
+                RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id)
+            )
             yield encoder.encode(RunErrorEvent(message="Acceptance action resume is not enabled."))
             return
         parked = approvals.take(run_input.thread_id)
@@ -703,6 +709,16 @@ def create_mercator_acceptance_app(*, contract) -> FastAPI:
             body = await request.json()
             if not isinstance(body, dict) or body.get("tools"):
                 raise ValueError("client-selected tools are forbidden")
+            # forwardedProps is a second declaration channel. _run_turn feeds it
+            # to translate.parse_state_writer_props, and build_run_agent then
+            # registers a SERVER-EXECUTED handler for every name it declares --
+            # so rejecting body["tools"] alone still let a client grow the tool
+            # surface past contract.frontend_tool_schemas(), contradicting the
+            # server_tool_names/server_toolsets emptiness checks below and
+            # consuming process-global adapter registry capacity.
+            props = body.get("forwardedProps") or body.get("forwarded_props")
+            if isinstance(props, dict) and props.get(translate.STATE_WRITER_PROPS_KEY):
+                raise ValueError("client-declared state-writer tools are forbidden")
             principal = contract.current_principal()
             if principal is None:
                 raise ValueError("verified Mercator principal is required")

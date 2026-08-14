@@ -69,6 +69,44 @@ def test_policy_bound_factory_rejects_client_selected_tools() -> None:
     assert contract.started == []
 
 
+def test_policy_bound_factory_rejects_client_declared_state_writer_tools() -> None:
+    """forwardedProps is a second tool-declaration channel.
+
+    Rejecting body["tools"] alone was not enough: _run_turn feeds
+    forwarded_props to translate.parse_state_writer_props and build_run_agent
+    then registers a SERVER-EXECUTED handler for every name declared there, so
+    a client could grow the surface past contract.frontend_tool_schemas() on
+    the one adapter whose whole purpose is a fixed, frontend-only tool list.
+    """
+    from agui_adapter import translate
+
+    for key in ("forwardedProps", "forwarded_props"):
+        contract = _Contract()
+        client = TestClient(server.create_mercator_acceptance_app(contract=contract))
+        response = client.post(
+            "/",
+            json=_body(
+                **{
+                    key: {
+                        translate.STATE_WRITER_PROPS_KEY: [
+                            {"name": "write_doc", "stateKey": "document"}
+                        ]
+                    }
+                }
+            ),
+        )
+        assert response.status_code == 400, key
+        assert contract.started == [], key
+
+
+def test_policy_bound_factory_allows_unrelated_forwarded_props() -> None:
+    """Only the state-writer channel is refused; ordinary props still pass."""
+    contract = _Contract()
+    client = TestClient(server.create_mercator_acceptance_app(contract=contract))
+    response = client.post("/", json=_body(forwardedProps={"locale": "en-GB"}))
+    assert response.status_code == 200
+
+
 def test_policy_bound_factory_injects_exact_frontend_surface(monkeypatch) -> None:
     contract = _Contract()
     captured = {}
