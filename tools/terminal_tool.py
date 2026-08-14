@@ -245,6 +245,26 @@ def _get_approval_callback():
     return getattr(_callback_tls, "approval", None)
 
 
+def _can_prompt_for_sudo() -> bool:
+    """True only when a sudo prompt can actually reach a human.
+
+    ``is_interactive_cli()`` is necessary but not sufficient. AG-UI runs set the
+    interactive ContextVar so approvals route to the adapter's callback, but
+    they have no controlling terminal and register no sudo-password callback.
+    Without this guard ``_prompt_for_sudo_password`` falls through to its
+    ``/dev/tty`` reader and blocks the AG-UI worker for the full 45s timeout.
+    """
+    if not is_interactive_cli():
+        return False
+    if _get_sudo_password_callback() is not None:
+        return True  # CLI registered a prompt_toolkit-backed prompt
+    import sys as _sys
+    try:
+        return _sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def set_sudo_password_callback(cb):
     """Register a callback for sudo password prompts (used by CLI).
 
@@ -871,7 +891,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     if not has_configured_password and not sudo_password and _sudo_nopasswd_works():
         return command, None
 
-    if not has_configured_password and not sudo_password and is_interactive_cli():
+    if not has_configured_password and not sudo_password and _can_prompt_for_sudo():
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45)
         if sudo_password:
             _set_cached_sudo_password(sudo_password)

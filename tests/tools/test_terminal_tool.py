@@ -168,3 +168,48 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+class TestSudoPromptReachability:
+    """An AG-UI run is "interactive" for approval routing but has no TTY.
+
+    `is_interactive_cli()` alone would send such a run into
+    `_prompt_for_sudo_password`, whose /dev/tty fallback blocks the worker for
+    the full 45s timeout. `_can_prompt_for_sudo` must also require a way to
+    actually reach a human.
+    """
+
+    def test_agui_run_without_tty_or_callback_does_not_prompt(self, monkeypatch):
+        import tools.terminal_tool as tt
+        from tools import approval
+
+        token = approval.set_hermes_interactive_context(True)
+        try:
+            monkeypatch.setattr(tt, "_get_sudo_password_callback", lambda: None)
+            monkeypatch.setattr(tt.sys.stdin, "isatty", lambda: False, raising=False)
+            assert tt.is_interactive_cli() is True, "precondition: run looks interactive"
+            assert tt._can_prompt_for_sudo() is False
+        finally:
+            approval.reset_hermes_interactive_context(token)
+
+    def test_registered_sudo_callback_allows_prompting(self, monkeypatch):
+        import tools.terminal_tool as tt
+        from tools import approval
+
+        token = approval.set_hermes_interactive_context(True)
+        try:
+            monkeypatch.setattr(tt, "_get_sudo_password_callback", lambda: (lambda: "pw"))
+            assert tt._can_prompt_for_sudo() is True
+        finally:
+            approval.reset_hermes_interactive_context(token)
+
+    def test_non_interactive_never_prompts(self, monkeypatch):
+        import tools.terminal_tool as tt
+        from tools import approval
+
+        token = approval.set_hermes_interactive_context(False)
+        try:
+            monkeypatch.setattr(tt, "_get_sudo_password_callback", lambda: (lambda: "pw"))
+            assert tt._can_prompt_for_sudo() is False
+        finally:
+            approval.reset_hermes_interactive_context(token)
