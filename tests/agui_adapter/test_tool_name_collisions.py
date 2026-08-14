@@ -58,6 +58,21 @@ def adapter_registration(registry):
 
 
 @pytest.fixture
+def deregister_after(registry):
+    """Remove probe names from the process-global registry after a test.
+
+    ``monkeypatch`` restores ``_registered_frontend_names``, but the registry
+    entries written by ``_ensure_frontend_tools_registered`` outlive it. A later
+    test in this file declaring the same name as a state-writer would otherwise
+    hit an unexpected ToolNameCollisionError.
+    """
+    names = []
+    yield names.append
+    for name in names:
+        registry.deregister(name)
+
+
+@pytest.fixture
 def server_tool_name(registry):
     """A real, registered server tool name to collide against."""
     for candidate in ("terminal", "write_file", "execute_code"):
@@ -257,13 +272,17 @@ class TestAdapterRegistryIsBounded:
     the process-global registry for the lifetime of the process.
     """
 
-    def test_registration_fails_closed_at_the_cap(self, registry, monkeypatch):
+    def test_registration_fails_closed_at_the_cap(
+        self, registry, monkeypatch, deregister_after
+    ):
         from agui_adapter import session
 
         monkeypatch.setattr(session, "_MAX_ADAPTER_TOOL_NAMES", 2)
         monkeypatch.setattr(session, "_registered_frontend_names", set())
         monkeypatch.setattr(session, "_registered_state_writer_names", set())
 
+        deregister_after("ui_cap_probe_a")
+        deregister_after("ui_cap_probe_b")
         session._ensure_frontend_tools_registered({"ui_cap_probe_a"})
         session._ensure_frontend_tools_registered({"ui_cap_probe_b"})
 
@@ -272,7 +291,7 @@ class TestAdapterRegistryIsBounded:
         assert "refusing further registrations" in str(excinfo.value)
 
     def test_reregistering_a_known_name_does_not_consume_capacity(
-        self, registry, monkeypatch
+        self, registry, monkeypatch, deregister_after
     ):
         from agui_adapter import session
 
@@ -280,6 +299,7 @@ class TestAdapterRegistryIsBounded:
         monkeypatch.setattr(session, "_registered_frontend_names", set())
         monkeypatch.setattr(session, "_registered_state_writer_names", set())
 
+        deregister_after("ui_cap_repeat")
         session._ensure_frontend_tools_registered({"ui_cap_repeat"})
         # Same name again: already registered, so it must not raise.
         session._ensure_frontend_tools_registered({"ui_cap_repeat"})

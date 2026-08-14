@@ -165,12 +165,15 @@ To make the interrupt cover **all** local code execution: run the default
 toolset for capability parity; excluding them is the operator's hardening lever.
 </details>
 
-**Reverse proxy / embedding notes.** The Host guard rejects any `Host` that
-doesn't match `HERMES_AGUI_HOST`, so a proxy must either forward a matching
-`Host` or you set `HERMES_AGUI_HOST` to the public hostname (which then requires
-a token, since it's non-loopback). If you call `create_app(bound_host=…)`
-directly instead of using `hermes-agui`, pass the actual serving interface — the
-token/Host checks are enforced against that value.
+**Reverse proxy / embedding notes.** The Host guard's strictness depends on the
+bind. For loopback and specific-IP binds it requires a `Host` matching
+`HERMES_AGUI_HOST`, so a proxy must either forward a matching `Host` or you set
+`HERMES_AGUI_HOST` to the public hostname (which then requires a token, since
+it's non-loopback). For wildcard binds (`0.0.0.0`, `::`) any `Host` is accepted
+— the operator opted into every interface — and the session token is the only
+authorization control. If you call `create_app(bound_host=…)` directly instead
+of using `hermes-agui`, pass the actual serving interface — the token/Host
+checks are enforced against that value.
 
 ## How it works
 
@@ -211,10 +214,15 @@ exposes.
   `Current shared state: <json>` system message.
 - **Multimodal** — image blocks pass through as OpenAI-style content parts;
   pure-text messages stay a plain string.
-- **Resume** — when the history tail is a tool result with no new user turn,
-  `resume_shim.py` (a narrow, flag-gated wrapper around `build_turn_context`)
-  drops the synthetic trailing user turn so the run continues from history. It's
-  a pure pass-through when the resume flag isn't set, keeping core untouched.
+- **Resume** — **disabled on the current Verdigris fork pin.** The pin predates
+  `agent.conversation_loop.build_turn_context`, so `resume_shim.install()` logs a
+  warning and leaves resume off rather than patching the older monolith; the
+  policy-bound Mercator surface is chat-only until a grant resolver is active.
+  Do not build a client flow that depends on it. Where the helper *is* available:
+  when the history tail is a tool result with no new user turn, `resume_shim.py`
+  (a narrow, flag-gated wrapper around `build_turn_context`) drops the synthetic
+  trailing user turn so the run continues from history, and is a pure
+  pass-through when the resume flag isn't set, keeping core untouched.
 
 ### Outbound shared state (state-writer tools)
 
