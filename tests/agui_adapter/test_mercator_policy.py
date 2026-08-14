@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextvars
 import asyncio
 import json
+
+import pytest
 from types import SimpleNamespace
 
 from ag_ui.core import RunAgentInput
@@ -10,6 +12,7 @@ from ag_ui.encoder import EventEncoder
 from fastapi.testclient import TestClient
 
 from agui_adapter import server
+from agui_adapter.server import MERCATOR_ACCEPTANCE_POLICY_API
 
 
 class _Contract:
@@ -132,15 +135,38 @@ def test_policy_bound_factory_injects_exact_frontend_surface(monkeypatch) -> Non
     assert contract.started == ["arn_123"]
 
 
-def test_policy_bound_factory_requires_zero_server_and_core_tools() -> None:
+@pytest.mark.parametrize(
+    "attr, value, fragment",
+    [
+        ("policy_api_version", MERCATOR_ACCEPTANCE_POLICY_API + 1, "policy API"),
+        ("allow_core_tools", True, "core tools"),
+        ("server_toolsets", ("hermes-acp",), "zero server tools"),
+        ("server_tool_names", ("terminal",), "zero server tools"),
+        ("use_hermes_approvals", True, "approval state"),
+        ("allow_inherited_approval_state", True, "inherited approval state"),
+    ],
+)
+def test_policy_bound_factory_fails_closed_on_every_gate(attr, value, fragment) -> None:
+    """Each contract gate is a separate fail-closed check; cover them all.
+
+    The previous version of this test set only allow_core_tools, despite its
+    name claiming server-tool coverage -- so the server_toolsets and
+    server_tool_names branches it was named for, plus the policy-API,
+    approval-state and inherited-approval gates, never executed.
+    """
     bad = _Contract()
-    bad.allow_core_tools = True
-    try:
+    setattr(bad, attr, value)
+    with pytest.raises(ValueError, match=fragment):
         server.create_mercator_acceptance_app(contract=bad)
-    except ValueError as exc:
-        assert "core tools" in str(exc)
-    else:
-        raise AssertionError("core-tool policy must fail closed")
+
+
+def test_policy_bound_factory_requires_a_non_empty_frontend_surface() -> None:
+    """An empty schema list would advertise no tools while still mounting."""
+    for schemas in ([], "not-a-list", None):
+        bad = _Contract()
+        bad.frontend_tool_schemas = lambda schemas=schemas: schemas
+        with pytest.raises(ValueError, match="frontend schemas"):
+            server.create_mercator_acceptance_app(contract=bad)
 
 
 def test_worker_context_and_every_frontend_handoff_reach_policy(monkeypatch) -> None:
