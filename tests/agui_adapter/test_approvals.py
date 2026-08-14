@@ -301,3 +301,33 @@ def test_dangerous_command_reaches_interactive_callback_not_gateway_fallback(mon
     # callback and returns status 'pending_approval').
     assert result.get("status") != "pending_approval"
     assert result.get("approved") is False  # our callback denied
+
+
+def test_release_all_resolves_pending_decisions_and_drains() -> None:
+    """A drained entry must never leave a worker blocked on its future."""
+    import concurrent.futures
+
+    from agui_adapter import approvals as _approvals
+
+    decision: concurrent.futures.Future = concurrent.futures.Future()
+    run = _approvals.ParkedRun(
+        thread_id="thread-release-all",
+        queue=None,
+        pending=_approvals.PendingApproval(
+            interrupt_id="i1",
+            command="rm -rf /",
+            description="dangerous",
+            tool_call_id=None,
+            allow_permanent=False,
+            decision=decision,
+        ),
+    )
+    assert _approvals.register(run) is True
+
+    assert _approvals.release_all() == 1
+    assert decision.done()
+    assert decision.result() == "deny"
+    assert _approvals.is_parked("thread-release-all") is False
+
+    # Draining an empty registry is a no-op, not an error.
+    assert _approvals.release_all() == 0

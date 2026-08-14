@@ -114,6 +114,28 @@ def is_parked(thread_id: str) -> bool:
         return thread_id in _parked
 
 
+def release_all(decision: str = "deny") -> int:
+    """Drain the registry, resolving every pending decision. Returns the count.
+
+    Removal and resolution happen under ``_lock`` together, so a registration
+    landing concurrently is either fully drained (its decision resolved) or not
+    drained at all -- it can never be dropped from the registry with a worker
+    still blocked on an unresolved future. Callers that clear ``_parked``
+    directly cannot offer that guarantee, and a parked worker whose decision is
+    never resolved only unwinds on the approval timeout.
+
+    Defaults to "deny", matching the fail-closed timeout path above.
+    """
+    with _lock:
+        parked = list(_parked.values())
+        _parked.clear()
+        for run in parked:
+            future = getattr(run.pending, "decision", None)
+            if future is not None and not future.done():
+                future.set_result(decision)
+        return len(parked)
+
+
 def resume_to_decision(resume_entries, interrupt_id: str) -> str:
     """Map AG-UI resume[] → Hermes decision. Fail closed to 'deny'."""
     for e in resume_entries or []:
