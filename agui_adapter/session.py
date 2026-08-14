@@ -289,7 +289,16 @@ def _make_state_writer_handler(tool_name: str):
             try:
                 run_state.apply(tool_name, args if isinstance(args, dict) else {})
             except Exception:
-                logger.debug("state-writer apply failed for %s", tool_name, exc_info=True)
+                # Reporting the confirmation here would tell the model "State
+                # updated." while the shared state is unchanged and no
+                # StateSnapshotEvent is emitted for the call. Fail loudly so the
+                # model can react and the operator can see it.
+                logger.warning(
+                    "state-writer apply failed for %s; shared state not updated",
+                    tool_name,
+                    exc_info=True,
+                )
+                return json.dumps({"status": "error", "error": "state update failed"})
         return _STATE_WRITER_CONFIRMATION
 
     return _handler

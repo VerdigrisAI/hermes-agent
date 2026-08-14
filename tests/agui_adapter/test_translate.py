@@ -238,9 +238,59 @@ def test_run_state_append_mode_accumulates_list():
 
 
 def test_run_state_no_arg_merges_args_dict_into_key():
-    rs = RunState(specs={"write_doc": StateWriterSpec(state_key="document", arg="document")})
+    # arg=None selects the "merge the whole args dict" path. Naming an arg here
+    # would instead exercise the spec.arg path that
+    # test_run_state_replace_merges_arg_into_key_and_keeps_seed already covers.
+    rs = RunState(specs={"write_doc": StateWriterSpec(state_key="document")})
     snap = rs.apply("write_doc", {"document": "hello world"})
-    assert snap["document"] == "hello world"
+    assert snap["document"] == {"document": "hello world"}
+
+
+def test_state_writer_reports_error_when_apply_fails():
+    """A failed state write must not report success to the model.
+
+    Returning the confirmation here would tell the model "State updated." while
+    the shared state is unchanged and no StateSnapshotEvent is emitted.
+    """
+    import json as _json
+
+    from agui_adapter.session import (
+        _make_state_writer_handler,
+        reset_current_state,
+        set_current_state,
+    )
+
+    class _Exploding(RunState):
+        def apply(self, tool_name, args):
+            raise RuntimeError("boom")
+
+    handler = _make_state_writer_handler("write_doc")
+    token = set_current_state(_Exploding())
+    try:
+        result = handler({"document": "hello"})
+    finally:
+        reset_current_state(token)
+
+    assert _json.loads(result) == {"status": "error", "error": "state update failed"}
+
+
+def test_state_writer_confirms_when_apply_succeeds():
+    from agui_adapter.session import (
+        _make_state_writer_handler,
+        reset_current_state,
+        set_current_state,
+    )
+
+    rs = RunState(specs={"write_doc": StateWriterSpec(state_key="document")})
+    handler = _make_state_writer_handler("write_doc")
+    token = set_current_state(rs)
+    try:
+        result = handler({"document": "hello"})
+    finally:
+        reset_current_state(token)
+
+    assert result == "State updated."
+    assert rs.state["document"] == {"document": "hello"}
 
 
 # --- feature 3: multimodal image passthrough -------------------------------

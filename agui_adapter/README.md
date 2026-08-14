@@ -23,7 +23,7 @@ so you don't set any API keys or endpoints yourself. Because it binds loopback,
 
 You should see:
 
-```
+```text
 Starting Hermes AG-UI adapter on 127.0.0.1:8000
 ```
 
@@ -174,7 +174,7 @@ token/Host checks are enforced against that value.
 
 ## How it works
 
-```
+```text
 POST /  (RunAgentInput JSON)
   → translate.prepare_run(messages, context)   # AG-UI → Hermes history
   → session.build_run_agent(...)               # merge frontend + state-writer tool schemas; register handlers

@@ -48,11 +48,23 @@ def reset_hermes_interactive_context(token: contextvars.Token) -> None:
     _hermes_interactive_ctx.reset(token)
 
 
-def _is_interactive_cli() -> bool:
+def is_interactive_cli() -> bool:
+    """True if this task/thread is an interactive CLI run.
+
+    Prefers the run-scoped ContextVar over ``HERMES_INTERACTIVE`` so concurrent
+    adapter workers (AG-UI) route interactivity per run instead of per process.
+    Public because tools outside this module must not read the env var directly:
+    doing so misroutes AG-UI runs whose ContextVar is set but whose environment
+    variable is unset.
+    """
     value = _hermes_interactive_ctx.get()
     if value is not None:
         return is_truthy_value(value)
     return env_var_enabled("HERMES_INTERACTIVE")
+
+
+# Back-compat alias for this module's existing internal call sites.
+_is_interactive_cli = is_interactive_cli
 
 
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:

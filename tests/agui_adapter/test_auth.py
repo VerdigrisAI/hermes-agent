@@ -71,10 +71,29 @@ def test_post_with_header_token_is_authorized(monkeypatch):
 
 
 def test_post_with_query_token_is_authorized(monkeypatch):
+    # Loopback bind only: the query carrier is accepted here because the OS
+    # boundary is the real authorization. See the non-loopback test below.
     _stub_agent(monkeypatch)
     client = TestClient(create_app(session_token="x" * 32), base_url="http://127.0.0.1")
     r = client.post("/?token=" + "x" * 32, json=_run_body())
     assert r.status_code == 200
+
+
+def test_query_token_rejected_on_non_loopback_bind(monkeypatch):
+    """A network bind must not accept ?token=; the header carrier still works.
+
+    A query token leaks into browser history, Referer headers and reverse-proxy
+    access logs. Uvicorn's own access log is suppressed at the configured
+    warning level, but a proxy in front of this process is outside its control.
+    """
+    _stub_agent(monkeypatch)
+    app = create_app(session_token="x" * 32, bound_host="0.0.0.0")
+    client = TestClient(app, base_url="http://10.0.0.5")
+    r = client.post("/?token=" + "x" * 32, json=_run_body())
+    assert r.status_code == 401
+    r2 = client.post("/", json=_run_body(),
+                     headers={"X-Hermes-Session-Token": "x" * 32})
+    assert r2.status_code == 200
 
 
 def test_no_token_configured_allows_loopback_post(monkeypatch):

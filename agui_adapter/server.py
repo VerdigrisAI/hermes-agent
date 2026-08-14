@@ -641,7 +641,7 @@ def create_app(config: Optional[AgentConfig] = None, *,
         # /health needs no token (the Host guard above still applies); everything
         # else is token-gated when a session token is configured.
         if session_token and request.url.path != "/health":
-            if not token_valid(request, session_token):
+            if not token_valid(request, session_token, bound_host):
                 return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
         return await call_next(request)
 

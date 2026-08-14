@@ -732,9 +732,12 @@ def check_cronjob_requirements() -> bool:
     every consumer of these flags agrees on the truthy set.
     """
     from utils import env_var_enabled
+    # Imported lazily: approval.py is imported very early, so a module-level
+    # import here would be circular.
+    from tools.approval import is_interactive_cli
 
     return (
-        env_var_enabled("HERMES_INTERACTIVE")
+        is_interactive_cli()
         or env_var_enabled("HERMES_GATEWAY_SESSION")
         or env_var_enabled("HERMES_EXEC_ASK")
     )

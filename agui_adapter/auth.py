@@ -60,11 +60,22 @@ def require_token_or_refuse(host: str, token: Optional[str]) -> None:
         raise SystemExit(1)
 
 
-def token_valid(request, token: str) -> bool:
-    """True if the request carries the configured session token (header or ?token=)."""
+def token_valid(request, token: str, bound_host: str = "127.0.0.1") -> bool:
+    """True if the request carries the configured session token.
+
+    The header is accepted on every bind. ``?token=`` is accepted only on a
+    loopback bind: a query token leaks into browser history, ``Referer``
+    headers, and reverse-proxy access logs, none of which this process
+    controls. Uvicorn's own access log is suppressed at the configured
+    ``warning`` level, but that says nothing about a proxy in front. No known
+    AG-UI/CopilotKit client requires the query form -- they can send
+    ``X-Hermes-Session-Token`` -- so restricting it costs nothing.
+    """
     header = request.headers.get(_SESSION_HEADER_NAME, "")
     if header and hmac.compare_digest(header.encode(), token.encode()):
         return True
+    if is_network_accessible(bound_host):
+        return False
     q = request.query_params.get("token", "")
     return bool(q) and hmac.compare_digest(q.encode(), token.encode())
 
