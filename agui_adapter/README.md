@@ -97,8 +97,11 @@ determines the auth posture (this mirrors the Hermes API server and dashboard):
   specific non-loopback IP **refuses to start** without a usable
   `HERMES_AGUI_SESSION_TOKEN` (≥16 chars, not a placeholder) — an open bind to a
   terminal-capable agent is remote code execution. Clients send the token as the
-  `X-Hermes-Session-Token` header (preferred) or a `?token=` query param (can
-  leak into logs/history — prefer the header). `/health` is always open.
+  `X-Hermes-Session-Token` header. On a network bind the `?token=` query
+  parameter is **refused** — a query credential leaks into browser history,
+  `Referer` headers and reverse-proxy access logs, none of which this process
+  controls. It is accepted only on a loopback bind, where the OS boundary is
+  the real authorization. `/health` is always open.
 - **DNS-rebinding Host guard.** Every request's `Host` must match the bound
   interface (loopback names on a loopback bind; exact host on a specific-IP bind;
   any host on a `0.0.0.0`/`::` bind, where the token is the authorization). A
