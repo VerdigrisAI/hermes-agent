@@ -63,6 +63,20 @@ def is_interactive_cli() -> bool:
     return env_var_enabled("HERMES_INTERACTIVE")
 
 
+def interactive_signal_source() -> str | None:
+    """Where the interactive signal came from: "context", "env", or None.
+
+    The two sources are not equivalent for every decision. The run-scoped
+    ContextVar is set by adapters (AG-UI) so approvals route to their callback;
+    the environment variable is set by a human running the CLI. Anything that
+    would touch a real terminal must distinguish them, because an adapter run
+    has a remote caller and the process may still own a tty.
+    """
+    if _hermes_interactive_ctx.get() is not None:
+        return "context"
+    return "env" if env_var_enabled("HERMES_INTERACTIVE") else None
+
+
 # Back-compat alias for this module's existing internal call sites.
 _is_interactive_cli = is_interactive_cli
 

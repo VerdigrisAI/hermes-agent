@@ -179,6 +179,42 @@ class TestSudoPromptReachability:
     actually reach a human.
     """
 
+    def test_an_adapter_run_never_prompts_even_when_the_process_owns_a_tty(
+        self, monkeypatch
+    ):
+        """The case the first version of this guard missed.
+
+        hermes-agui is normally started by uvicorn in a foreground terminal, so
+        stdin IS a tty. That tty belongs to the operator, not to the remote
+        client issuing the command. Prompting there asks the operator for a
+        root password on behalf of a stranger, and plain `sudo cmd` is excluded
+        from the dangerous-command patterns for being TTY-bound, so nothing
+        gates it first.
+        """
+        import tools.terminal_tool as tt
+        from tools import approval
+
+        token = approval.set_hermes_interactive_context(True)
+        try:
+            monkeypatch.setattr(tt, "_get_sudo_password_callback", lambda: None)
+            monkeypatch.setattr(tt.sys.stdin, "isatty", lambda: True, raising=False)
+            assert tt.is_interactive_cli() is True, "precondition: run looks interactive"
+            assert approval.interactive_signal_source() == "context"
+            assert tt._can_prompt_for_sudo() is False
+        finally:
+            approval.reset_hermes_interactive_context(token)
+
+    def test_a_cli_run_still_prompts_on_a_real_tty(self, monkeypatch):
+        """The behaviour that must not regress: a human at a terminal."""
+        import tools.terminal_tool as tt
+        from tools import approval
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setattr(tt, "_get_sudo_password_callback", lambda: None)
+        monkeypatch.setattr(tt.sys.stdin, "isatty", lambda: True, raising=False)
+        assert approval.interactive_signal_source() == "env"
+        assert tt._can_prompt_for_sudo() is True
+
     def test_agui_run_without_tty_or_callback_does_not_prompt(self, monkeypatch):
         import tools.terminal_tool as tt
         from tools import approval
