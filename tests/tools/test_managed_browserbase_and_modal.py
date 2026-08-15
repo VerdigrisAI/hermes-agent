@@ -151,10 +151,13 @@ def _install_fake_tools_package():
         check_dangerous_command=lambda *args, **kwargs: {"approved": True},
         check_all_command_guards=lambda *args, **kwargs: {"approved": True},
         load_permanent_allowlist=lambda *args, **kwargs: [],
-        # terminal_tool imports this at module scope for the sudo prompt gate.
+        # terminal_tool imports these at module scope for the sudo prompt gate.
         # These tests exercise backend selection, not sudo, so a non-interactive
-        # answer keeps the prompt path inert.
+        # answer keeps the prompt path inert. This stub must carry every name
+        # `tools/terminal_tool.py` imports from tools.approval, or collection
+        # fails with an ImportError that looks unrelated to the change.
         is_interactive_cli=lambda: False,
+        interactive_signal_source=lambda: None,
         DANGEROUS_PATTERNS=[],
     )
 
