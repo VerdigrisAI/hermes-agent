@@ -114,12 +114,16 @@ determines the auth posture (this mirrors the Hermes API server and dashboard):
   the client. A name also cannot be declared as both kinds, or switch between
   frontend and state-writer across runs in the same process (registration is
   process-global). Rename the client tool.
-- **Dangerous-command approvals** ride AG-UI's native interrupt: the run finishes
-  with `outcome:{type:"interrupt"}`, the client renders it (`useInterrupt`) and
-  resumes with `resume:[{interruptId, status:"resolved", payload:{approved,
-  scope}}]`. The Hermes turn parks until the decision or the approval timeout
-  (default **60s** via `approvals.timeout` — raise it for a human-in-the-loop web
-  UI). Silence/timeout → **deny**. Run a **single uvicorn worker**.
+- **Dangerous-command approvals** ride AG-UI's native interrupt **only where
+  resume is available** — it is disabled on the current Verdigris fork pin (see
+  *Resume* below), so do not build a client flow on `resume:[...]` until the
+  required core capability and the durable grant resolver are active. Where it
+  *is* available: the run finishes with `outcome:{type:"interrupt"}`, the client
+  renders it (`useInterrupt`) and resumes with `resume:[{interruptId,
+  status:"resolved", payload:{approved, scope}}]`. The Hermes turn parks until
+  the decision or the approval timeout (default **60s** via `approvals.timeout`
+  — raise it for a human-in-the-loop web UI). Silence/timeout → **deny**. Run a
+  **single uvicorn worker**.
 
 <details>
 <summary><b>What the interrupt does NOT cover (read before exposing off-loopback)</b></summary>
