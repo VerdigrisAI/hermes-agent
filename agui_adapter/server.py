@@ -682,7 +682,12 @@ def create_mercator_acceptance_app(*, contract) -> FastAPI:
     supplied by Mercator, copies its verified principal context into the worker
     thread, and authorizes every frontend handoff before emitting it.
     """
-    if getattr(contract, "policy_api_version", None) != MERCATOR_ACCEPTANCE_POLICY_API:
+    # `type(...) is not int` rather than `isinstance`: bool subclasses int, so
+    # isinstance would admit True, and `True != 1` is False. A loosely typed
+    # gate is the wrong shape for the only version check protecting a
+    # SHA-pinned consumer in another repository.
+    _version = getattr(contract, "policy_api_version", None)
+    if type(_version) is not int or _version != MERCATOR_ACCEPTANCE_POLICY_API:
         raise ValueError("unsupported Mercator acceptance policy API")
     if getattr(contract, "allow_core_tools", True):
         raise ValueError("Mercator acceptance must disable Hermes core tools")

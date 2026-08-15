@@ -274,6 +274,34 @@ def test_state_writer_reports_error_when_apply_fails():
     assert _json.loads(result) == {"status": "error", "error": "state update failed"}
 
 
+def test_state_writer_reports_error_when_no_run_state_is_in_context():
+    """A thread that never inherited the run context must not report success.
+
+    Any worker outside the run's context -- a subagent or delegate thread --
+    reads None here. Falling through to the confirmation would tell the model
+    "State updated." when no state object exists at all.
+    """
+    import json as _json
+
+    from agui_adapter.session import (
+        _make_state_writer_handler,
+        reset_current_state,
+        set_current_state,
+    )
+
+    handler = _make_state_writer_handler("write_doc")
+    token = set_current_state(None)
+    try:
+        result = handler({"document": "hello"})
+    finally:
+        reset_current_state(token)
+
+    assert _json.loads(result) == {
+        "status": "error",
+        "error": "no run state in context",
+    }
+
+
 def test_state_writer_confirms_when_apply_succeeds():
     from agui_adapter.session import (
         _make_state_writer_handler,

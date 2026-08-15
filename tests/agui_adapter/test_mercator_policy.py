@@ -103,11 +103,57 @@ def test_policy_bound_factory_rejects_client_declared_state_writer_tools() -> No
 
 
 def test_policy_bound_factory_allows_unrelated_forwarded_props() -> None:
-    """Only the state-writer channel is refused; ordinary props still pass."""
+    """Only the state-writer channel is refused; ordinary props still pass.
+
+    Assert on ensure_run, not on the status code. A policy-bound stream returns
+    200 as soon as it starts streaming, so the status proves only that the
+    request cleared the pre-stream gate -- the body of this very response is a
+    RUN_ERROR, because no model is reachable in the test environment. Reaching
+    ensure_run is what proves the props passed every gate.
+    """
     contract = _Contract()
     client = TestClient(server.create_mercator_acceptance_app(contract=contract))
     response = client.post("/", json=_body(forwardedProps={"locale": "en-GB"}))
     assert response.status_code == 200
+    assert contract.started == ["arn_123"]
+
+
+def test_policy_bound_factory_rejects_a_thread_from_another_run() -> None:
+    """The cross-run guard: one run's principal must not drive another's agent."""
+    contract = _Contract()
+    client = TestClient(server.create_mercator_acceptance_app(contract=contract))
+    response = client.post("/", json=_body(threadId="arn_someone_else"))
+    assert response.status_code == 400
+    assert contract.started == []
+
+
+def test_policy_bound_factory_rejects_a_missing_principal() -> None:
+    """Fail closed when the outer ASGI layer did not bind a verified principal."""
+    contract = _Contract()
+    contract.current_principal = lambda: None
+    client = TestClient(server.create_mercator_acceptance_app(contract=contract))
+    response = client.post("/", json=_body())
+    assert response.status_code == 400
+    assert contract.started == []
+
+
+def test_policy_bound_app_refuses_resume() -> None:
+    """Resume must not re-attach a parked, terminal-capable worker here.
+
+    The acceptance surface is chat-only. Falling through to approvals.take()
+    would re-attach a worker on a surface whose contract is frontend-only with
+    Hermes approvals disabled.
+    """
+    contract = _Contract()
+    client = TestClient(server.create_mercator_acceptance_app(contract=contract))
+    body = _body()
+    body["resume"] = [
+        {"interruptId": "int-1", "status": "resolved", "payload": {"approved": True}}
+    ]
+    response = client.post("/", json=body)
+    assert response.status_code == 200
+    assert "RUN_STARTED" in response.text
+    assert "Acceptance action resume is not enabled." in response.text
 
 
 def test_policy_bound_factory_injects_exact_frontend_surface(monkeypatch) -> None:
@@ -139,6 +185,10 @@ def test_policy_bound_factory_injects_exact_frontend_surface(monkeypatch) -> Non
     "attr, value, fragment",
     [
         ("policy_api_version", MERCATOR_ACCEPTANCE_POLICY_API + 1, "policy API"),
+        # bool subclasses int and True == 1, so a loose gate would admit this.
+        ("policy_api_version", True, "policy API"),
+        ("policy_api_version", float(MERCATOR_ACCEPTANCE_POLICY_API), "policy API"),
+        ("policy_api_version", None, "policy API"),
         ("allow_core_tools", True, "core tools"),
         ("server_toolsets", ("hermes-acp",), "zero server tools"),
         ("server_tool_names", ("terminal",), "zero server tools"),

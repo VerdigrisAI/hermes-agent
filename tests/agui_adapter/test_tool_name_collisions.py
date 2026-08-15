@@ -330,3 +330,79 @@ class TestFrontendOnlySurfaceIsEnforced:
         with pytest.raises(FrontendOnlyPolicyError) as excinfo:
             build_run_agent(config, frontend_tool_names={"ui_confirm"})
         assert "kanban" in str(excinfo.value)
+
+
+class TestFrontendOnlyClearsTheCoreSurface:
+    """`frontend_only` is what makes the Mercator embedding frontend-only.
+
+    session.py sets `agent.tools = []` and `agent.valid_tool_names = set()`
+    under this flag, and the comment beside it calls the merged frontend
+    schemas "the entire callable surface". Nothing exercised that assignment:
+    every other build_run_agent test asserts a raise that happens earlier, and
+    the Mercator factory tests monkeypatch the stream away. So the load-bearing
+    line of the whole zero-server-tools claim had never run.
+    """
+
+    def _config(self):
+        from agui_adapter.session import AgentConfig
+
+        config = AgentConfig()
+        config.frontend_only = True
+        # Explicit endpoint: skips the hermes model resolver, so the test needs
+        # no provider credentials and makes no network call.
+        config.base_url = "http://127.0.0.1:9/v1"
+        config.api_key = "test"
+        return config
+
+    @staticmethod
+    def _schema(name: str) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "x",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+
+    def test_frontend_only_advertises_exactly_the_frontend_schemas(
+        self, registry, monkeypatch, deregister_after
+    ):
+        from agui_adapter import session
+
+        monkeypatch.setattr(session, "_registered_frontend_names", set())
+        monkeypatch.setattr(session, "_registered_state_writer_names", set())
+        deregister_after("ui_only_confirm")
+
+        agent = session.build_run_agent(
+            self._config(),
+            frontend_tool_names={"ui_only_confirm"},
+            frontend_tool_schemas=[self._schema("ui_only_confirm")],
+        )
+
+        advertised = {(t.get("function") or {}).get("name") for t in (agent.tools or [])}
+        assert advertised == {"ui_only_confirm"}
+        assert agent.valid_tool_names == {"ui_only_confirm"}
+
+    def test_frontend_only_leaves_no_hermes_core_tool_callable(
+        self, registry, monkeypatch, deregister_after
+    ):
+        """The point of the flag: terminal and friends must not survive it."""
+        from agui_adapter import session
+
+        monkeypatch.setattr(session, "_registered_frontend_names", set())
+        monkeypatch.setattr(session, "_registered_state_writer_names", set())
+        deregister_after("ui_only_confirm")
+
+        # These exist in the process-global registry, which is exactly why the
+        # flag has to clear the agent's own view of it.
+        assert registry.get_entry("terminal") is not None
+
+        agent = session.build_run_agent(
+            self._config(),
+            frontend_tool_names={"ui_only_confirm"},
+            frontend_tool_schemas=[self._schema("ui_only_confirm")],
+        )
+
+        for forbidden in ("terminal", "execute_code", "write_file", "patch", "delegate_task"):
+            assert forbidden not in agent.valid_tool_names, forbidden

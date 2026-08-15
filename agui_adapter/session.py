@@ -285,20 +285,32 @@ def _make_state_writer_handler(tool_name: str):
 
     def _handler(args, **kwargs) -> str:
         run_state = _CURRENT_STATE.get()
-        if run_state is not None:
-            try:
-                run_state.apply(tool_name, args if isinstance(args, dict) else {})
-            except Exception:
-                # Reporting the confirmation here would tell the model "State
-                # updated." while the shared state is unchanged and no
-                # StateSnapshotEvent is emitted for the call. Fail loudly so the
-                # model can react and the operator can see it.
-                logger.warning(
-                    "state-writer apply failed for %s; shared state not updated",
-                    tool_name,
-                    exc_info=True,
-                )
-                return json.dumps({"status": "error", "error": "state update failed"})
+        if run_state is None:
+            # Same reasoning as the exception branch below, and the same fix.
+            # A thread that never inherited the run context (a subagent or a
+            # delegate worker) reads None here. Falling through to the
+            # confirmation would tell the model "State updated." when no state
+            # object exists at all -- a silent success on the path most likely
+            # to be wrong.
+            logger.warning(
+                "state-writer %s ran with no run state in context; "
+                "shared state not updated",
+                tool_name,
+            )
+            return json.dumps({"status": "error", "error": "no run state in context"})
+        try:
+            run_state.apply(tool_name, args if isinstance(args, dict) else {})
+        except Exception:
+            # Reporting the confirmation here would tell the model "State
+            # updated." while the shared state is unchanged and no
+            # StateSnapshotEvent is emitted for the call. Fail loudly so the
+            # model can react and the operator can see it.
+            logger.warning(
+                "state-writer apply failed for %s; shared state not updated",
+                tool_name,
+                exc_info=True,
+            )
+            return json.dumps({"status": "error", "error": "state update failed"})
         return _STATE_WRITER_CONFIRMATION
 
     return _handler
