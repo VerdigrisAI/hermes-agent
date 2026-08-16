@@ -42,6 +42,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import os
 import threading
 from collections import deque
 from concurrent.futures import InvalidStateError
@@ -224,7 +225,14 @@ def _run_turn(run_input: RunAgentInput, config: AgentConfig, bridge: AGUIEventBr
         # HERMES_EXEC_ASK, read from os.environ, not the contextvar) is
         # neutralized once at create_app(). async_delivery stays False: AG-UI
         # has no background push channel (like the API server).
-        session_tokens = set_session_vars(session_key=run_input.thread_id,
+        # Namespaced. The caller chooses thread_id, and the approval layer keys
+        # its skip-prompts set (tools.approval._session_yolo) on this string,
+        # process-wide. Unprefixed, a caller who sent thread_id="ops" would
+        # share a label with a person who typed /yolo in a session named "ops"
+        # and inherit their bypass. The prefix makes that string collision
+        # impossible instead of merely unlikely, so co-hosting the adapter with
+        # a normal session stays safe without anyone remembering a rule.
+        session_tokens = set_session_vars(session_key=f"agui:{run_input.thread_id}",
                                           async_delivery=False)
     try:
         result = agent.run_conversation(prep.user_message, conversation_history=prep.conversation_history)
@@ -257,7 +265,8 @@ async def _drain(queue):
         yield item
 
 
-async def _consume_queue(queue, encoder: EventEncoder, run_input: RunAgentInput):
+async def _consume_queue(queue, encoder: EventEncoder, run_input: RunAgentInput,
+                         *, overflow: Optional[Dict[str, bool]] = None):
     """Drain a run's event queue and yield encoded SSE frames, including the one
     terminal frame. Shared by the fresh-run and resume drain paths:
 
@@ -282,11 +291,54 @@ async def _consume_queue(queue, encoder: EventEncoder, run_input: RunAgentInput)
             yield encoder.encode(RunErrorEvent(message=item[1]))
             return
         yield encoder.encode(item)
+    if overflow is not None and overflow["hit"]:
+        # Events were dropped, so the transcript the client holds is incomplete.
+        # Reporting success here would hand it a partial record it believes is
+        # whole, which is the one thing this service must not do.
+        logger.error("AG-UI run ended with a truncated event stream (thread=%s run=%s)",
+                     run_input.thread_id, run_input.run_id)
+        yield encoder.encode(RunErrorEvent(
+            message="The event stream was truncated because the reader fell behind. "
+                    "This run is incomplete; start it again."))
+        return
     logger.info("AG-UI run finished (thread=%s run=%s)",
                 run_input.thread_id, run_input.run_id)
     yield encoder.encode(RunFinishedEvent(
         thread_id=run_input.thread_id, run_id=run_input.run_id,
         outcome=RunFinishedSuccessOutcome()))
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back on anything odd."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("%s=%d must be >= 1; using %d", name, value, default)
+        return default
+    return value
+
+
+# An SSE reader that goes away leaves the worker thread producing into a queue
+# nobody drains. Unbounded, that grows until the process dies with no log line
+# explaining why, in a service whose product is audit evidence. 1000 events is
+# far above any real run and far below memory pressure.
+def _max_queue_events() -> int:
+    return _positive_int_env("HERMES_AGUI_MAX_QUEUE_EVENTS", 1000)
+
+
+# One OS thread per POST, previously uncapped. A retry storm was enough to
+# exhaust the process.
+def _max_concurrent_runs() -> int:
+    return _positive_int_env("HERMES_AGUI_MAX_CONCURRENT_RUNS", 8)
+
+
+_run_slots = threading.BoundedSemaphore(_max_concurrent_runs())
 
 
 def _approval_timeout() -> float:
@@ -422,12 +474,35 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
             message="A pending approval must be resolved before starting a new run on this thread."))
         return
 
+    if not _run_slots.acquire(blocking=False):
+        logger.warning("AG-UI run refused; at capacity (thread=%s run=%s)",
+                       run_input.thread_id, run_input.run_id)
+        yield encoder.encode(RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))
+        yield encoder.encode(RunErrorEvent(
+            message="The adapter is at capacity. Retry this run shortly."))
+        return
+
     logger.info("AG-UI run start (thread=%s run=%s)", run_input.thread_id, run_input.run_id)
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_max_queue_events())
+    # A dropped event makes the transcript wrong, so overflow ends the run with
+    # an error rather than a success the client would trust.
+    overflow: Dict[str, bool] = {"hit": False}
 
     def emit(event) -> None:
+        def _put() -> None:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                if not overflow["hit"]:
+                    overflow["hit"] = True
+                    logger.error(
+                        "AG-UI event queue full at %d; the reader is not keeping up. "
+                        "Ending run (thread=%s run=%s)",
+                        _max_queue_events(), run_input.thread_id, run_input.run_id)
+                    _interrupt_run(run_input.thread_id, run_input.run_id)
+
         try:
-            loop.call_soon_threadsafe(queue.put_nowait, event)
+            loop.call_soon_threadsafe(_put)
         except RuntimeError:
             logger.debug("AG-UI emit after loop close; dropping event", exc_info=True)
             return
@@ -572,16 +647,26 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
             # Same guarded emit() path as every other worker->loop enqueue.
             emit(approvals.DONE)
             _unregister_run_agent(run_input.thread_id, worker_agent["agent"])
+            # Held from before the thread started until the worker is genuinely
+            # done, which includes the whole park -> resume -> finish arc: a
+            # parked run still owns its thread.
+            _run_slots.release()
 
-    threading.Thread(
-        target=lambda: worker_context.run(worker),
-        name="hermes-agui-run",
-        daemon=True,
-    ).start()
+    try:
+        threading.Thread(
+            target=lambda: worker_context.run(worker),
+            name="hermes-agui-run",
+            daemon=True,
+        ).start()
+    except BaseException:
+        # The worker's finally never runs if the thread never started, so the
+        # slot would leak and the adapter would refuse runs forever.
+        _run_slots.release()
+        raise
 
     yield encoder.encode(RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))
     try:
-        async for frame in _consume_queue(queue, encoder, run_input):
+        async for frame in _consume_queue(queue, encoder, run_input, overflow=overflow):
             yield frame
     except (asyncio.CancelledError, GeneratorExit):
         # Client disconnected (or the server is shutting down) mid-stream. Ask
