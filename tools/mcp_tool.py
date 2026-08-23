@@ -260,7 +260,27 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
-_MAX_RECONNECT_RETRIES = 5
+# Reconnect attempts are NOT capped. A capped budget means a long-lived agent
+# stops talking to a remote MCP server permanently the first time that server
+# is redeployed for longer than the budget, and only a process restart brings
+# it back. Backoff is capped instead, so a persistently dead server costs one
+# attempt per _MAX_BACKOFF_SECONDS and nothing else.
+#
+# The old `_MAX_RECONNECT_RETRIES = 5` was worse than it reads: `retries` was
+# initialised once before the loop and never reset, including on a SUCCESSFUL
+# connection, so it was a lifetime budget rather than a consecutive-failure
+# one. Five blips spread over weeks killed the server for good. Measured on a
+# production agent 2026-08-18: an MCP server went unreachable and stayed
+# unreachable for three days across 59 failures, recovering only on a
+# container restart.
+_RECONNECT_SUCCESS_SECONDS = 60.0
+# Log every attempt while it is plausibly transient, then throttle so a
+# long outage does not fill the log with one line per minute.
+_RECONNECT_LOG_EVERY = 10
+# Keepalive interval in seconds. Must be shorter than typical LB / NAT
+# idle-timeout (commonly 300-600s). Module-level so tests can shorten it;
+# as a function local it made the no-session path a six-minute test.
+_KEEPALIVE_INTERVAL = 180  # 3 minutes
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
 _MAX_BACKGROUND_CONNECT_BACKOFF_SECONDS = 300
@@ -1396,10 +1416,7 @@ class MCPServerTask:
         prevent TCP connections from going stale during long idle
         periods (#17003).  If the keepalive fails, triggers a reconnect.
         """
-        # Keepalive interval in seconds.  Must be shorter than typical
-        # LB / NAT idle-timeout (commonly 300-600s).
-        _KEEPALIVE_INTERVAL = 180  # 3 minutes
-
+        missing_intervals = 0
         shutdown_task = asyncio.create_task(self._shutdown_event.wait())
         reconnect_task = asyncio.create_task(self._reconnect_event.wait())
         try:
@@ -1414,6 +1431,29 @@ class MCPServerTask:
 
                 # Timeout — no lifecycle event fired.  Send a keepalive
                 # to exercise the connection and detect stale sockets.
+                #
+                # A MISSING session is checked first. The old code ran the
+                # keepalive only `if self.session:`, so the one state it could
+                # never detect was the session being gone -- which is exactly
+                # the state a failed reconnect leaves behind. The health probe
+                # covered "present and broken" and skipped "absent".
+                #
+                # One interval of grace: `self.session` is legitimately None
+                # for a moment during startup and during a reconnect, and
+                # firing on that would fight the run loop instead of helping.
+                if self.session is None:
+                    missing_intervals += 1
+                    if missing_intervals >= 2:
+                        logger.warning(
+                            "MCP server '%s' has had no session for %ds, "
+                            "triggering reconnect",
+                            self.name,
+                            int(missing_intervals * _KEEPALIVE_INTERVAL),
+                        )
+                        self._reconnect_event.set()
+                        break
+                    continue
+                missing_intervals = 0
                 if self.session:
                     try:
                         # Hold _rpc_lock with NO templated headers so this
@@ -1852,6 +1892,7 @@ class MCPServerTask:
         backoff = 1.0
 
         while True:
+            attempt_started = time.monotonic()
             try:
                 if self._is_http():
                     await self._run_http(config)
@@ -1941,21 +1982,21 @@ class MCPServerTask:
                     )
                     return
 
-                retries += 1
-                if retries > _MAX_RECONNECT_RETRIES:
-                    logger.warning(
-                        "MCP server '%s' failed after %d reconnection attempts, "
-                        "giving up: %s",
-                        self.name, _MAX_RECONNECT_RETRIES, exc,
-                    )
-                    return
+                # An attempt that stayed up long enough to be a real session
+                # is a success, not a retry. Without this the counter measures
+                # "failures ever" instead of "failures in a row".
+                uptime = time.monotonic() - attempt_started
+                if uptime >= _RECONNECT_SUCCESS_SECONDS:
+                    retries = 0
+                    backoff = 1.0
 
-                logger.warning(
-                    "MCP server '%s' connection lost (attempt %d/%d), "
-                    "reconnecting in %.0fs: %s",
-                    self.name, retries, _MAX_RECONNECT_RETRIES,
-                    backoff, exc,
-                )
+                retries += 1
+                if retries == 1 or retries % _RECONNECT_LOG_EVERY == 0:
+                    logger.warning(
+                        "MCP server '%s' connection lost (attempt %d, up %.0fs), "
+                        "reconnecting in %.0fs: %s",
+                        self.name, retries, uptime, backoff, exc,
+                    )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
 
