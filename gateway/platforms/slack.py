@@ -2170,10 +2170,15 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return SendResult(
-                success=False,
-                error=f"Slack document upload failed ({type(e).__name__}).",
+            error_detail = str(e)
+            safe_verification_errors = (
+                "Slack upload response did not include a file ID",
+                "Slack confirmed the wrong file type",
+                "Slack accepted the upload but its file metadata could not be verified",
             )
+            if not error_detail.startswith(safe_verification_errors):
+                error_detail = f"Slack document upload failed ({type(e).__name__})."
+            return SendResult(success=False, error=error_detail)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""
