@@ -331,6 +331,39 @@ class TestBasePlatformTopicSessions:
         assert "was not attached" in adapter.sent[1]["content"]
 
     @pytest.mark.asyncio
+    async def test_media_only_image_failure_records_visible_notice_delivery(self):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(
+                0,
+                result="![chart](https://example.com/chart.png)",
+            )
+        )
+        adapter._keep_typing = hold_typing
+        adapter.send_multiple_images = AsyncMock(
+            return_value=SendResult(success=False, error="upload failed")
+        )
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert event.delivery_state.reply_delivered is True
+        assert len(adapter.sent) == 1
+        assert "was not attached" in adapter.sent[0]["content"]
+        assert adapter.processing_hooks[-1] == (
+            "complete",
+            "1",
+            ProcessingOutcome.SUCCESS,
+        )
+
+    @pytest.mark.asyncio
     async def test_queued_reply_events_receive_the_final_delivery_outcome(self):
         adapter = DummyTelegramAdapter()
 
