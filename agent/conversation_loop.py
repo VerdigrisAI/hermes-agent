@@ -290,6 +290,10 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    _open_steering = getattr(agent, "_open_steering", None)
+    if callable(_open_steering):
+        _open_steering()
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     # Installed once, transparent when streams are healthy, prevents crash on write.
     _install_safe_stdio()
@@ -4104,7 +4108,12 @@ def run_conversation(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    _close_steering = getattr(agent, "_close_steering", None)
+    _leftover_steer = (
+        _close_steering()
+        if callable(_close_steering)
+        else agent._drain_pending_steer()
+    )
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

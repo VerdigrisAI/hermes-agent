@@ -245,6 +245,64 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_expected_media_only_reply_records_document_delivery(
+        self,
+        tmp_path,
+    ):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        artifact = tmp_path / "report.txt"
+        artifact.write_text("report", encoding="utf-8")
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(0, result=f"MEDIA:{artifact}")
+        )
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert event.delivery_state.reply_delivered is True
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_expected_media_only_reply_records_image_delivery(
+        self,
+        tmp_path,
+    ):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        image = tmp_path / "chart.png"
+        image.write_bytes(b"image")
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(0, result=f"MEDIA:{image}")
+        )
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert event.delivery_state.reply_delivered is True
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
     async def test_queued_reply_events_receive_the_final_delivery_outcome(self):
         adapter = DummyTelegramAdapter()
 

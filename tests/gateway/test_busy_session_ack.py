@@ -515,7 +515,7 @@ class TestBusySessionAck:
         assert event.delivery_state.reply_delivered is False
 
     @pytest.mark.asyncio
-    async def test_queued_during_drain_waits_for_the_later_reply(self):
+    async def test_queue_mode_during_drain_returns_a_terminal_rejection(self):
         runner, _sentinel = _make_runner()
         runner._draining = True
         adapter = _make_adapter()
@@ -524,15 +524,17 @@ class TestBusySessionAck:
         sk = build_session_key(event.source)
         runner.adapters[event.source.platform] = adapter
         runner._queue_during_drain_enabled = lambda: True
-        runner._queue_or_replace_pending_event = MagicMock()
         runner._status_action_gerund = lambda: "restarting"
 
         await runner._handle_active_session_busy_message(event, sk)
 
-        runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
-        adapter._run_processing_hook.assert_not_awaited()
-        assert event.delivery_state.reply_attempted is False
-        assert event.delivery_state.reply_delivered is False
+        assert "resend" in adapter._send_with_retry.await_args.kwargs["content"]
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_delivered is True
 
     @pytest.mark.asyncio
     async def test_pending_sentinel_no_interrupt(self):

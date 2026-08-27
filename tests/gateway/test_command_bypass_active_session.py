@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,6 +28,8 @@ from gateway.platforms.base import (
 )
 from gateway.session import SessionSource, build_session_key
 from gateway.run import _queued_reply_event
+from gateway.run import GatewayRunner
+from run_agent import AIAgent
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +305,62 @@ class TestCommandBypassActiveSession:
         assert queued.expects_reply is True
         assert queued.delivery_state is event.delivery_state
         assert event.delivery_state.completion_deferred is True
+
+    def test_busy_queue_merges_rapid_text_and_reply_owners(self):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        adapter = _make_adapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        sk = _session_key()
+        first = _make_event("first")
+        second = _make_event("second")
+        first.expects_reply = True
+        second.expects_reply = True
+
+        runner._queue_or_replace_pending_event(sk, first)
+        runner._queue_or_replace_pending_event(sk, second)
+
+        pending = adapter._pending_messages[sk]
+        assert pending is first
+        assert pending.text == "first\nsecond"
+        assert any(item is second for item in pending.delivery_state.merged_events)
+
+    def test_leftover_steer_moves_its_reply_owner_to_the_queued_turn(self):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._steer_reply_events = {}
+        original = _make_event("original")
+        steer = _make_event("/steer check logs")
+        original.delivery_state.final_response_events.extend([original, steer])
+        original.delivery_state.completion_events.append(steer)
+        runner._remember_steer_event(_session_key(), "check logs", steer)
+
+        queued = runner._take_leftover_steer_event(
+            _session_key(),
+            "check logs",
+            original,
+        )
+
+        assert queued is not None
+        assert queued.text == "check logs"
+        assert queued.delivery_state is steer.delivery_state
+        assert all(
+            item is not steer
+            for item in original.delivery_state.final_response_events
+        )
+        assert all(
+            item is not steer
+            for item in original.delivery_state.completion_events
+        )
+
+    def test_agent_rejects_steer_after_atomic_final_drain(self):
+        agent = object.__new__(AIAgent)
+        agent._pending_steer = None
+        agent._pending_steer_lock = threading.Lock()
+        agent._open_steering()
+
+        assert agent.steer("check logs") is True
+        assert agent._close_steering() == "check logs"
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
 
     @pytest.mark.asyncio
     async def test_failed_bypass_reply_completes_as_failure(self):

@@ -48,7 +48,7 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
 
 
 @pytest.mark.asyncio
-async def test_drain_queue_mode_queues_follow_up_without_interrupt():
+async def test_drain_queue_mode_rejects_follow_up_without_interrupt():
     runner, adapter = make_restart_runner()
     runner._draining = True
     runner._restart_requested = True
@@ -59,16 +59,17 @@ async def test_drain_queue_mode_queues_follow_up_without_interrupt():
         message_type=MessageType.TEXT,
         source=make_restart_source(),
         message_id="m2",
+        expects_reply=True,
     )
     session_key = build_session_key(event.source)
     adapter._active_sessions[session_key] = asyncio.Event()
 
     await adapter.handle_message(event)
 
-    assert session_key in adapter._pending_messages
-    assert adapter._pending_messages[session_key].text == "follow up"
+    assert session_key not in adapter._pending_messages
     assert not adapter._active_sessions[session_key].is_set()
-    assert any("queued for the next turn" in message for message in adapter.sent)
+    assert event.delivery_state.reply_delivered is True
+    assert any("resend" in message for message in adapter.sent)
 
 
 @pytest.mark.asyncio

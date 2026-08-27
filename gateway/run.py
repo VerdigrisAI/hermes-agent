@@ -2399,6 +2399,59 @@ class GatewayRunner:
         else:
             pending_slot[session_key] = queued_event
 
+    def _remember_steer_event(
+        self,
+        session_key: str,
+        text: str,
+        event: MessageEvent,
+    ) -> None:
+        events = getattr(self, "_steer_reply_events", None)
+        if events is None:
+            events = {}
+            self._steer_reply_events = events
+        events.setdefault(session_key, []).append((text.strip(), event))
+
+    def _take_leftover_steer_event(
+        self,
+        session_key: str,
+        text: str,
+        reply_event: MessageEvent | None,
+    ) -> MessageEvent | None:
+        """Move unconsumed steer owners from the current reply to a queued turn."""
+        entries = getattr(self, "_steer_reply_events", {}).pop(session_key, [])
+        if not entries:
+            return None
+        selected: list[tuple[str, MessageEvent]] = []
+        for entry in reversed(entries):
+            selected.insert(0, entry)
+            if "\n".join(item[0] for item in selected) == text:
+                break
+        else:
+            selected = entries
+
+        selected_events = [item[1] for item in selected]
+        if reply_event is not None:
+            state = reply_event.delivery_state
+            state.final_response_events[:] = [
+                candidate
+                for candidate in state.final_response_events
+                if all(candidate is not event for event in selected_events)
+            ]
+            state.completion_events[:] = [
+                candidate
+                for candidate in state.completion_events
+                if all(candidate is not event for event in selected_events)
+            ]
+
+        queued = _queued_reply_event(selected_events[0], text)
+        for event in selected_events[1:]:
+            if all(
+                candidate is not event
+                for candidate in queued.delivery_state.merged_events
+            ):
+                queued.delivery_state.merged_events.append(event)
+        return queued
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -2907,7 +2960,12 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            event,
+            merge_text=True,
+        )
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -2934,12 +2992,10 @@ class GatewayRunner:
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            queued_during_drain = self._queue_during_drain_enabled()
-            if queued_during_drain:
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-            else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+            message = (
+                f"⏳ Gateway is {self._status_action_gerund()} and cannot accept "
+                "another turn. Please resend after it comes back."
+            )
 
             notice_delivered = False
             try:
@@ -2955,18 +3011,16 @@ class GatewayRunner:
                     ),
                     metadata=thread_meta,
                 )
-                if not queued_during_drain:
-                    notice_delivered = _record_send_result_delivery(event, send_result)
+                notice_delivered = _record_send_result_delivery(event, send_result)
             except Exception as exc:
                 logger.debug("Failed to send draining notice: %s", exc)
-            if not queued_during_drain:
-                await adapter._run_processing_hook(
-                    "on_processing_complete",
-                    event,
-                    ProcessingOutcome.SUCCESS
-                    if notice_delivered
-                    else ProcessingOutcome.FAILURE,
-                )
+            await adapter._run_processing_hook(
+                "on_processing_complete",
+                event,
+                ProcessingOutcome.SUCCESS
+                if notice_delivered
+                else ProcessingOutcome.FAILURE,
+            )
             return True
 
         # Normal busy case (agent actively running a task)
@@ -3005,13 +3059,20 @@ class GatewayRunner:
                     session_key,
                     event,
                 )
+                if steer_completion_deferred:
+                    self._remember_steer_event(session_key, steer_text, event)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
-            merge_pending_message_event(adapter._pending_messages, session_key, event)
+            merge_pending_message_event(
+                adapter._pending_messages,
+                session_key,
+                event,
+                merge_text=True,
+            )
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -6950,15 +7011,33 @@ class GatewayRunner:
                     if accepted:
                         adapter = self.adapters.get(source.platform)
                         if adapter:
-                            adapter.defer_event_to_active_response(_quick_key, event)
+                            if adapter.defer_event_to_active_response(
+                                _quick_key,
+                                event,
+                            ):
+                                self._remember_steer_event(
+                                    _quick_key,
+                                    steer_text,
+                                    event,
+                                )
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-                    return "Steer rejected (empty payload)."
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        self._enqueue_fifo(
+                            _quick_key,
+                            _queued_reply_event(event, steer_text),
+                            adapter,
+                        )
+                    return "Agent is finishing — /steer queued for the next turn."
                 # Running agent is missing or lacks steer() — fall back to queue.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    queued_event = _queued_reply_event(event, steer_text)
-                    adapter._pending_messages[_quick_key] = queued_event
+                    self._enqueue_fifo(
+                        _quick_key,
+                        _queued_reply_event(event, steer_text),
+                        adapter,
+                    )
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -7112,12 +7191,9 @@ class GatewayRunner:
                     )
                 return None
             if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    f"⏳ Gateway is {self._status_action_gerund()} and cannot accept "
+                    "another turn. Please resend after it comes back."
                 )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -16898,6 +16974,9 @@ class GatewayRunner:
 
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
             finally:
+                _close_steering = getattr(agent, "_close_steering", None)
+                if callable(_close_steering):
+                    _close_steering()
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
@@ -17493,11 +17572,27 @@ class GatewayRunner:
             # (e.g. during the final API call), the agent couldn't inject it
             # and returned it in result["pending_steer"]. Deliver it as the
             # next user turn so it isn't silently dropped.
-            if result and not pending and not pending_event:
+            if result:
                 _leftover_steer = result.get("pending_steer")
                 if _leftover_steer:
-                    pending = _leftover_steer
-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+                    leftover_event = self._take_leftover_steer_event(
+                        session_key,
+                        _leftover_steer,
+                        reply_event,
+                    )
+                    if leftover_event is not None and pending_event is not None:
+                        self._enqueue_fifo(session_key, leftover_event, adapter)
+                    elif leftover_event is not None:
+                        pending_event = leftover_event
+                        pending = leftover_event.text
+                    elif not pending and not pending_event:
+                        pending = _leftover_steer
+                    logger.debug(
+                        "Delivering leftover /steer as a later turn: '%s...'",
+                        _leftover_steer[:40],
+                    )
+                else:
+                    getattr(self, "_steer_reply_events", {}).pop(session_key, None)
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
@@ -17522,11 +17617,32 @@ class GatewayRunner:
                         pass
 
             if self._draining and (pending_event or pending):
-                logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
-                    session_key or "?",
-                    self._status_action_label(),
-                )
+                if pending_event is not None and adapter is not None:
+                    rejection = (
+                        f"⏳ Gateway is {self._status_action_gerund()} and cannot "
+                        "accept the queued turn. Please resend after it comes back."
+                    )
+                    try:
+                        rejection_result = await adapter._send_with_retry(
+                            chat_id=pending_event.source.chat_id,
+                            content=rejection,
+                            reply_to=self._reply_anchor_for_event(pending_event),
+                            metadata=self._thread_metadata_for_source(
+                                pending_event.source,
+                                self._reply_anchor_for_event(pending_event),
+                            ),
+                        )
+                        _record_send_result_delivery(pending_event, rejection_result)
+                    except Exception as exc:
+                        logger.warning("Failed to reject queued turn during drain: %s", exc)
+                        _record_reply_attempt(pending_event)
+                    reply_events = _merge_followup_reply_events(
+                        pending_event,
+                        result,
+                    )
+                    result["_reply_events"] = reply_events
+                    if isinstance(response, dict):
+                        response["_reply_events"] = reply_events
                 pending_event = None
                 pending = None
 
@@ -17760,6 +17876,7 @@ class GatewayRunner:
                 self._release_running_agent_state(
                     session_key, run_generation=run_generation
                 )
+                getattr(self, "_steer_reply_events", {}).pop(session_key, None)
             if self._draining:
                 self._update_runtime_status("draining")
             

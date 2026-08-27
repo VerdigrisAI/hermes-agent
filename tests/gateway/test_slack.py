@@ -22,7 +22,9 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
+    SessionSource,
     SUPPORTED_DOCUMENT_TYPES,
     is_host_excluded_by_no_proxy,
 )
@@ -2446,6 +2448,58 @@ class TestReactions:
 
         adapter._app.client.reactions_add.assert_not_called()
         adapter._app.client.reactions_remove.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_required_failure_uses_text_when_reactions_are_disabled(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback"))
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000006",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["reply_to"] == event.message_id
+
+    @pytest.mark.asyncio
+    async def test_required_failure_uses_text_when_reaction_fails(self, adapter):
+        adapter._add_reaction = AsyncMock(return_value=False)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback"))
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000007",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter._add_reaction.assert_awaited_once_with(
+            "C123", event.message_id, "x"
+        )
+        adapter.send.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reactions_enabled_by_default(self, adapter):

@@ -1722,14 +1722,41 @@ class AIAgent:
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
+            if not getattr(self, "_accepting_steers", True):
+                return False
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if not getattr(self, "_accepting_steers", True):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
+
+    def _open_steering(self) -> None:
+        """Accept steer input for the active conversation turn."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._accepting_steers = True
+            return
+        with _lock:
+            self._accepting_steers = True
+
+    def _close_steering(self) -> Optional[str]:
+        """Atomically stop accepting steers and return any unconsumed text."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._accepting_steers = False
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            return text
+        with _lock:
+            self._accepting_steers = False
+            text = self._pending_steer
+            self._pending_steer = None
+        return text
 
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.

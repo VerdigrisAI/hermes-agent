@@ -689,6 +689,7 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     reply_event=None,
     pending_event=None,
+    draining=False,
 ):
     if config_data:
         import yaml
@@ -705,6 +706,7 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    runner._draining = draining
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -1010,6 +1012,37 @@ async def test_queued_turn_does_not_rewrite_first_response_targets(monkeypatch, 
     assert deferred.delivery_state.reply_delivered is True
     assert original.delivery_state.final_response_events == []
     assert result["_final_reply_events"] == [queued]
+
+
+@pytest.mark.asyncio
+async def test_queue_accepted_before_drain_gets_a_terminal_reply(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = MessageEvent(
+        text="queued before restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-before-drain",
+        expects_reply=True,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queue-before-drain",
+        pending_event=queued,
+        draining=True,
+    )
+
+    assert any("resend" in call["content"] for call in adapter.sent)
+    assert queued.delivery_state.reply_delivered is True
+    assert any(item is queued for item in result["_reply_events"])
 
 
 @pytest.mark.asyncio

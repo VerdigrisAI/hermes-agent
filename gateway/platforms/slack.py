@@ -1415,7 +1415,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -1426,23 +1426,29 @@ class SlackAdapter(BasePlatformAdapter):
         The batch limit is 10 file uploads per call (Slack server-side cap).
         """
         if not self._app:
-            return
+            return SendResult(success=False, error="Slack app is not connected")
         if not images:
-            return
+            return SendResult(success=False, error="no images to deliver")
 
         try:
             import httpx as _httpx
             from urllib.parse import unquote as _unquote
             from tools.url_safety import is_safe_url as _is_safe_url
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id,
+                images,
+                metadata,
+                human_delay,
+            )
 
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        delivered = False
+        last_error: Optional[str] = None
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -1497,11 +1503,17 @@ class SlackAdapter(BasePlatformAdapter):
 
                 if not file_uploads:
                     if initial_comment_parts:
-                        await self.send(
+                        comment_result = await self.send(
                             chat_id,
                             "\n".join(initial_comment_parts),
                             metadata=metadata,
                         )
+                        if comment_result.success:
+                            delivered = True
+                        else:
+                            last_error = str(
+                                comment_result.error or "image caption send failed"
+                            )
                     continue
 
                 initial_comment = "\n".join(initial_comment_parts) if initial_comment_parts else ""
@@ -1518,13 +1530,29 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 self._record_uploaded_file_thread(chat_id, thread_ts)
                 _ = result
+                delivered = True
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
                     chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback_result = await super().send_multiple_images(
+                    chat_id,
+                    chunk,
+                    metadata,
+                    human_delay=human_delay,
+                )
+                if fallback_result.success:
+                    delivered = True
+                else:
+                    last_error = str(
+                        fallback_result.error or "image upload fallback failed"
+                    )
+        return SendResult(
+            success=delivered,
+            error=None if delivered else (last_error or "no images were delivered"),
+        )
 
     def _record_uploaded_file_thread(self, chat_id: str, thread_ts: Optional[str]) -> None:
         """Treat successful file uploads as bot participation in a thread."""
@@ -1719,8 +1747,6 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
-        if not self._reactions_enabled():
-            return
         ts = getattr(event, "message_id", None)
         if not ts:
             return
@@ -1733,12 +1759,25 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        if was_reacting:
+        reactions_enabled = self._reactions_enabled()
+        if reactions_enabled and was_reacting:
             await self._remove_reaction(channel_id, ts, "eyes")
-        if outcome == ProcessingOutcome.SUCCESS and was_reacting:
+        failure_signaled = False
+        if reactions_enabled and outcome == ProcessingOutcome.SUCCESS and was_reacting:
             await self._add_reaction(channel_id, ts, "white_check_mark")
-        elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(channel_id, ts, "x")
+        elif reactions_enabled and outcome == ProcessingOutcome.FAILURE:
+            failure_signaled = await self._add_reaction(channel_id, ts, "x")
+        if (
+            outcome == ProcessingOutcome.FAILURE
+            and required_reply
+            and not failure_signaled
+        ):
+            await self.send(
+                channel_id,
+                "⚠️ I could not complete this request. Please try again.",
+                reply_to=ts,
+                metadata={"thread_id": event.source.thread_id or ts},
+            )
 
     # ----- User identity resolution -----
 
