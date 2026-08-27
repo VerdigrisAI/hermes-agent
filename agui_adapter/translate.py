@@ -9,12 +9,12 @@ Three directions matter for a run:
   agent's advertised tool list. These are the *frontend* (client-executed)
   tools; their names are added to ``agent.valid_tool_names`` (see
   ``session._merge_frontend_tools``).
-* ``RunAgentInput.context[]`` -> a read-only system message injected into the
-  history so the model can consult it.
+* ``RunAgentInput.context[]`` -> read-only, per-run system context that the
+  server appends to Hermes' ephemeral system prompt.
 
-Design note — determinism with aimock: frontend context is injected as a
-*separate system message*, never merged into the user message. aimock matches
-fixtures on the user message text, so mutating it would break fixture lookup.
+Design note — determinism with aimock: frontend context is never merged into
+the user message. aimock matches fixtures on the user message text, so
+mutating it would break fixture lookup.
 """
 
 from __future__ import annotations
@@ -173,6 +173,7 @@ class PreparedRun:
 
     user_message: Any
     conversation_history: List[dict]
+    system_context: str
     is_resume: bool
 
 
@@ -202,13 +203,19 @@ def prepare_run(
       matcher) require. See ``agui_adapter/resume_shim.py``.
     """
     hermes = agui_messages_to_hermes(messages)
-    # Leading read-only system messages: frontend context, then any extra
-    # injected system texts (forwarded props, inbound shared state). Each is a
-    # separate system message, never merged into the user turn — so aimock
-    # user-message fixture matching stays deterministic.
-    leading = [{"role": "system", "content": t} for t in ([context_text] + list(system_texts or [])) if t]
-    if leading:
-        hermes = leading + hermes
+
+    # Providers do not agree on multiple system-message semantics. Anthropic
+    # keeps the last one, while Responses transports keep the first one. Pull
+    # every run-specific system message out of history and combine it for the
+    # server to append to Hermes' single ephemeral system prompt.
+    system_parts = [t for t in ([context_text] + list(system_texts or [])) if t]
+    system_parts.extend(
+        str(m.get("content", ""))
+        for m in hermes
+        if m.get("role") == "system" and m.get("content")
+    )
+    hermes = [m for m in hermes if m.get("role") != "system"]
+    system_context = "\n\n".join(system_parts)
 
     if not messages:
         # No tool result and no user turn: arming the resume shim here would
@@ -216,6 +223,7 @@ def prepare_run(
         return PreparedRun(
             user_message="",
             conversation_history=hermes,
+            system_context=system_context,
             is_resume=False,
         )
 
@@ -224,11 +232,13 @@ def prepare_run(
         return PreparedRun(
             user_message=_content_to_parts(messages[-1].content),
             conversation_history=hermes[:-1],
+            system_context=system_context,
             is_resume=False,
         )
     return PreparedRun(
         user_message=_last_user_text(messages),
         conversation_history=hermes,
+        system_context=system_context,
         is_resume=True,
     )
 

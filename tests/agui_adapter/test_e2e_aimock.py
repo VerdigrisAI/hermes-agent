@@ -604,6 +604,55 @@ def test_run_turn_sets_and_restores_interactive_context(monkeypatch):
     assert _hermes_interactive_ctx.get() in (None, "")
 
 
+def test_run_turn_appends_frontend_context_to_ephemeral_system_prompt(monkeypatch):
+    """The model must receive frontend context through the one system prompt
+    path that every supported provider preserves."""
+    import agui_adapter.server as server
+
+    seen = {}
+
+    class _FakeAgent:
+        def __init__(self):
+            self.ephemeral_system_prompt = "Existing agent instruction."
+            for attr in (
+                "stream_delta_callback",
+                "reasoning_callback",
+                "tool_progress_callback",
+                "step_callback",
+                "thinking_callback",
+            ):
+                setattr(self, attr, None)
+
+        def run_conversation(self, user_message, conversation_history=None):
+            seen["user_message"] = user_message
+            seen["history"] = conversation_history
+            seen["system"] = self.ephemeral_system_prompt
+            return {"final_response": "", "messages": []}
+
+    monkeypatch.setattr(server, "build_run_agent", lambda *a, **k: _FakeAgent())
+
+    run_input = RunAgentInput.model_validate(
+        {
+            "threadId": "t-context",
+            "runId": "r-context",
+            "state": {},
+            "messages": [{"id": "m1", "role": "user", "content": "compare"}],
+            "tools": [],
+            "context": [{"description": "Base ending cash", "value": "$660.8K"}],
+            "forwardedProps": {},
+        }
+    )
+    bridge = server.AGUIEventBridge(lambda event: None)
+
+    server._run_turn(run_input, server.AgentConfig(), bridge, {})
+
+    assert seen["user_message"] == "compare"
+    assert seen["history"] == []
+    assert seen["system"].startswith("Existing agent instruction.\n\n")
+    assert "Base ending cash" in seen["system"]
+    assert "$660.8K" in seen["system"]
+
+
 def _first_interrupt_id(sse_text: str) -> str:
     import json
     for line in sse_text.splitlines():
