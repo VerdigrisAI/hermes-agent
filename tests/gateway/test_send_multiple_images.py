@@ -616,7 +616,10 @@ class TestEmailMultiImage:
             return_value=SendResult(success=True, message_id="fallback")
         )
 
-        with patch("builtins.open", side_effect=OSError("read failed")):
+        with (
+            patch("builtins.open", side_effect=OSError("read failed")),
+            patch("gateway.platforms.email.smtplib.SMTP"),
+        ):
             result = _run(
                 adapter.send_multiple_images(
                     "user@example.com",
@@ -626,6 +629,28 @@ class TestEmailMultiImage:
 
         assert result.success is True
         adapter.send_image_file.assert_awaited_once()
+
+    def test_local_image_fallback_uses_attachment_sender(self, adapter):
+        adapter.send_document = AsyncMock(
+            return_value=SendResult(success=True, message_id="attachment")
+        )
+
+        result = _run(
+            adapter.send_image_file(
+                "user@example.com",
+                "/tmp/chart.png",
+                caption="chart",
+            )
+        )
+
+        assert result.success is True
+        adapter.send_document.assert_awaited_once_with(
+            chat_id="user@example.com",
+            file_path="/tmp/chart.png",
+            caption="chart",
+            reply_to=None,
+            metadata=None,
+        )
 
     def test_empty_noop(self, adapter):
         with patch.object(
