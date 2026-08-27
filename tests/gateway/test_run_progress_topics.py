@@ -1942,6 +1942,84 @@ async def test_real_handler_propagates_queued_owners_and_streamed_delivery(
 
 
 @pytest.mark.asyncio
+async def test_streamed_media_and_notice_failure_marks_reply_failed(monkeypatch):
+    """A streamed text fragment cannot hide a failed attachment outcome."""
+    from gateway.run import GatewayRunner
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="group",
+        thread_id="thread-1",
+    )
+    event = MessageEvent(
+        text="original",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    session_key = build_session_key(source)
+    created = datetime.now()
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-streamed-media-failure",
+        created_at=created,
+        updated_at=created + timedelta(seconds=1),
+        platform=Platform.SLACK,
+        chat_type="group",
+    )
+
+    adapter = ProgressCaptureAdapter(platform=Platform.SLACK)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.adapters = {Platform.SLACK: adapter}
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._show_reasoning = False
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._cache_session_source = MagicMock()
+    runner._is_telegram_topic_lane = MagicMock(return_value=False)
+    runner._set_session_env = MagicMock(return_value=())
+    runner._clear_session_env = MagicMock()
+    runner._prepare_inbound_message_text = AsyncMock(return_value=event.text)
+    runner._bind_adapter_run_generation = MagicMock()
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._clear_restart_failure_count = MagicMock()
+    runner._should_send_voice_reply = MagicMock(return_value=False)
+    runner._deliver_media_from_response = AsyncMock(return_value=False)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Report attached.\nMEDIA:/tmp/report.pdf",
+            "messages": [],
+            "api_calls": 1,
+            "already_sent": True,
+            "failed": False,
+        }
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        run_generation=1,
+    )
+
+    assert response is None
+    assert event.delivery_state.reply_delivered is True
+    assert event.delivery_state.reply_failed is True
+
+
+@pytest.mark.asyncio
 async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,

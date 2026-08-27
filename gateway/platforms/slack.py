@@ -1855,10 +1855,7 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            text = f"🖼️ Image: {image_path}"
-            if caption:
-                text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            return SendResult(success=False, error=str(e))
 
     async def send_image(
         self,
@@ -2006,10 +2003,7 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            text = f"🎬 Video: {video_path}"
-            if caption:
-                text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            return SendResult(success=False, error=str(e))
 
     async def send_document(
         self,

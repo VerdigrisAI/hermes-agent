@@ -948,7 +948,7 @@ class TestSendVideo:
         assert "Not connected" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_video_api_error_falls_back(self, adapter, tmp_path):
+    async def test_send_video_api_error_returns_failure(self, adapter, tmp_path):
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"fake video")
 
@@ -956,13 +956,14 @@ class TestSendVideo:
             side_effect=RuntimeError("Slack API error")
         )
 
-        # Should fall back to base class (text message)
         result = await adapter.send_video(
             chat_id="C123",
             video_path=str(video),
         )
 
-        adapter._app.client.chat_postMessage.assert_called_once()
+        assert not result.success
+        assert "Slack API error" in result.error
+        adapter._app.client.chat_postMessage.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -3282,13 +3283,11 @@ class TestReplyBroadcast:
 # TestFallbackPreservesThreadContext
 # ---------------------------------------------------------------------------
 
-class TestFallbackPreservesThreadContext:
-    """Bug fix: file upload fallbacks lost thread context (metadata) when
-    calling super() without metadata, causing replies to appear outside
-    the thread."""
+class TestFailedLocalUploadReporting:
+    """Local upload failures must not expose inaccessible local paths."""
 
     @pytest.mark.asyncio
-    async def test_send_image_file_fallback_preserves_thread(self, adapter, tmp_path):
+    async def test_send_image_file_failure_does_not_post_path(self, adapter, tmp_path):
         test_file = tmp_path / "photo.jpg"
         test_file.write_bytes(b"\xff\xd8\xff\xe0")
 
@@ -3300,18 +3299,19 @@ class TestFallbackPreservesThreadContext:
         )
 
         metadata = {"thread_id": "parent_ts_123"}
-        await adapter.send_image_file(
+        result = await adapter.send_image_file(
             chat_id="C123",
             image_path=str(test_file),
             caption="test image",
             metadata=metadata,
         )
 
-        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
-        assert call_kwargs.get("thread_ts") == "parent_ts_123"
+        assert not result.success
+        assert "upload failed" in result.error
+        adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_send_video_fallback_preserves_thread(self, adapter, tmp_path):
+    async def test_send_video_failure_does_not_post_path(self, adapter, tmp_path):
         test_file = tmp_path / "clip.mp4"
         test_file.write_bytes(b"\x00\x00\x00\x1c")
 
@@ -3323,14 +3323,15 @@ class TestFallbackPreservesThreadContext:
         )
 
         metadata = {"thread_id": "parent_ts_456"}
-        await adapter.send_video(
+        result = await adapter.send_video(
             chat_id="C123",
             video_path=str(test_file),
             metadata=metadata,
         )
 
-        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
-        assert call_kwargs.get("thread_ts") == "parent_ts_456"
+        assert not result.success
+        assert "upload failed" in result.error
+        adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_document_failure_does_not_post_path_fallback(
@@ -3359,7 +3360,7 @@ class TestFallbackPreservesThreadContext:
         adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_send_image_file_fallback_includes_caption(self, adapter, tmp_path):
+    async def test_send_image_file_failure_does_not_post_caption(self, adapter, tmp_path):
         test_file = tmp_path / "photo.jpg"
         test_file.write_bytes(b"\xff\xd8\xff\xe0")
 
@@ -3370,14 +3371,14 @@ class TestFallbackPreservesThreadContext:
             return_value={"ts": "msg_ts"}
         )
 
-        await adapter.send_image_file(
+        result = await adapter.send_image_file(
             chat_id="C123",
             image_path=str(test_file),
             caption="important screenshot",
         )
 
-        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
-        assert "important screenshot" in call_kwargs["text"]
+        assert not result.success
+        adapter._app.client.chat_postMessage.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

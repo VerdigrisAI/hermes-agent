@@ -9103,9 +9103,11 @@ class GatewayRunner:
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
-                        await self._deliver_media_from_response(
+                        media_delivery = await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                        if media_delivery is False:
+                            _record_reply_failure(event)
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
@@ -11467,7 +11469,7 @@ class GatewayRunner:
         response: str,
         event: MessageEvent,
         adapter,
-    ) -> bool:
+    ) -> Optional[bool]:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
         Called after streaming has already sent the text to the user, so the
@@ -11648,7 +11650,7 @@ class GatewayRunner:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
                     delivery_results.append(await _report_failure(file_path, str(e)))
 
-            return bool(delivery_results) and all(delivery_results)
+            return all(delivery_results) if delivery_results else None
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
