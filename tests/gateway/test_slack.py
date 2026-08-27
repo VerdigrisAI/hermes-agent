@@ -2642,7 +2642,7 @@ class TestReactions:
 
     @pytest.mark.asyncio
     async def test_expected_cancellation_clears_reply_state_without_failure_signal(
-        self, adapter
+        self, adapter, caplog
     ):
         event = MessageEvent(
             text="cancelled",
@@ -2663,6 +2663,7 @@ class TestReactions:
 
         assert event.message_id not in adapter._required_reply_message_ids
         adapter.send.assert_not_awaited()
+        assert "Exhausted terminal reply delivery" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_reactions_enabled_by_default(self, adapter):
