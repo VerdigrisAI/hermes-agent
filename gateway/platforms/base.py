@@ -2879,7 +2879,7 @@ class BasePlatformAdapter(ABC):
         event: MessageEvent,
         session_key: str,
         cmd: str,
-    ) -> None:
+    ) -> bool:
         """Dispatch a reset-like bypass command while preserving guard ordering.
 
         /stop, /new, and /reset must:
@@ -2903,6 +2903,7 @@ class BasePlatformAdapter(ABC):
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        delivered = not event.expects_reply
 
         try:
             response = await self._message_handler(event)
@@ -2913,6 +2914,7 @@ class BasePlatformAdapter(ABC):
             # after cancel_session_processing, which could silently drop the
             # "/new" confirmation when an agent was actively running.
             if _text:
+                event.delivery_state.reply_attempted = True
                 logger.info(
                     "[%s] Sending command '/%s' response (%d chars) to %s",
                     self.name,
@@ -2926,6 +2928,9 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=thread_meta,
                 )
+                delivered = bool(_r and _r.success)
+                if delivered:
+                    event.delivery_state.reply_delivered = True
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -2950,6 +2955,7 @@ class BasePlatformAdapter(ABC):
             raise
 
         await self._drain_pending_after_session_command(session_key, command_guard)
+        return delivered
 
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -3000,12 +3006,24 @@ class BasePlatformAdapter(ABC):
                 # cancellation + runner response + pending drain.
                 if cmd in {"stop", "new", "reset"}:
                     try:
-                        await self._dispatch_active_session_command(event, session_key, cmd)
+                        _delivered = await self._dispatch_active_session_command(
+                            event,
+                            session_key,
+                            cmd,
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
+                        _delivered = False
+                    await self._run_processing_hook(
+                        "on_processing_complete",
+                        event,
+                        ProcessingOutcome.SUCCESS
+                        if _delivered
+                        else ProcessingOutcome.FAILURE,
+                    )
                     return
 
                 # Other bypass commands (/approve, /deny, /status,
@@ -3079,13 +3097,20 @@ class BasePlatformAdapter(ABC):
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        if not _text and event.expects_reply:
+                            _text = "Thanks — I’ll continue with that."
+                        _delivered = not event.expects_reply and not bool(_text)
                         if _text:
+                            event.delivery_state.reply_attempted = True
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_thread_meta,
                             )
+                            _delivered = bool(_r and _r.success)
+                            if _delivered:
+                                event.delivery_state.reply_delivered = True
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
@@ -3097,6 +3122,14 @@ class BasePlatformAdapter(ABC):
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
                         )
+                        _delivered = False
+                    await self._run_processing_hook(
+                        "on_processing_complete",
+                        event,
+                        ProcessingOutcome.SUCCESS
+                        if _delivered
+                        else ProcessingOutcome.FAILURE,
+                    )
                     return
 
             if self._busy_session_handler is not None:

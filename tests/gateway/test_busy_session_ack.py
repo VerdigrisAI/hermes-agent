@@ -5,6 +5,7 @@ when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
 import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,6 +30,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SessionSource,
     build_session_key,
 )
@@ -80,7 +82,10 @@ def _make_adapter(platform_val="telegram"):
     """Build a minimal adapter mock."""
     adapter = MagicMock()
     adapter._pending_messages = {}
-    adapter._send_with_retry = AsyncMock()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="ack-1")
+    )
+    adapter._run_processing_hook = AsyncMock()
     adapter.config = MagicMock()
     adapter.config.extra = {}
     adapter.platform = MagicMock(value=platform_val)
@@ -217,6 +222,62 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Steered" in content or "steer" in content.lower()
         assert "Interrupting" not in content
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_required_steer_ack_bypasses_disabled_ack_setting(self, monkeypatch):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        event = _make_event(text="also check the tests")
+        event.expects_reply = True
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        adapter._send_with_retry.assert_awaited_once()
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_failed_required_steer_ack_completes_as_failure(self):
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        adapter._send_with_retry.return_value = SimpleNamespace(
+            success=False,
+            message_id=None,
+        )
+        event = _make_event(text="also check the tests")
+        event.expects_reply = True
+        sk = build_session_key(event.source)
+        agent = MagicMock()
+        agent.steer.return_value = True
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.FAILURE,
+        )
+        assert event.delivery_state.reply_delivered is False
 
     @pytest.mark.asyncio
     async def test_steer_mode_falls_back_to_queue_when_agent_rejects(self):

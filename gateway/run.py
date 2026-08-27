@@ -817,6 +817,7 @@ from gateway.platforms.base import (
     MEDIA_DIRECTIVE_EXTENSION_PATTERN,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     _reply_anchor_for_event,
     media_delivery_correlation_id,
     merge_pending_message_event,
@@ -2993,7 +2994,8 @@ class GatewayRunner:
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
+        required_steer_ack = steered and event.expects_reply
+        if not busy_ack_enabled and not required_steer_ack:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
@@ -3002,7 +3004,7 @@ class GatewayRunner:
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
+        if now - last_ack < _BUSY_ACK_COOLDOWN and not required_steer_ack:
             return True  # interrupt sent (if not queue), ack already delivered recently
 
         self._busy_ack_ts[session_key] = now
@@ -3073,8 +3075,9 @@ class GatewayRunner:
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        steer_ack_delivered = False
         try:
-            await adapter._send_with_retry(
+            send_result = await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
                 reply_to=(
@@ -3086,8 +3089,22 @@ class GatewayRunner:
                 ),
                 metadata=thread_meta,
             )
+            if steered:
+                steer_ack_delivered = _record_send_result_delivery(
+                    event,
+                    send_result,
+                )
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
+
+        if steered:
+            await adapter._run_processing_hook(
+                "on_processing_complete",
+                event,
+                ProcessingOutcome.SUCCESS
+                if steer_ack_delivered
+                else ProcessingOutcome.FAILURE,
+            )
 
         return True
 
@@ -17554,11 +17571,11 @@ class GatewayRunner:
                                 content=first_response,
                                 metadata=_status_thread_metadata,
                             )
-                            if reply_event is not None:
-                                _record_send_result_delivery(
+                            if reply_event is not None and _record_send_result_delivery(
                                     reply_event,
                                     first_send_result,
-                                )
+                            ):
+                                result["already_sent"] = True
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
@@ -17575,7 +17592,13 @@ class GatewayRunner:
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
                     # base.py's finally block) and call it.
-                    if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
+                    first_reply_delivered = bool(
+                        reply_event is not None
+                        and reply_event.delivery_state.reply_delivered
+                    )
+                    if first_reply_delivered and getattr(
+                        type(adapter), "pop_post_delivery_callback", None
+                    ) is not None:
                         _bg_cb = adapter.pop_post_delivery_callback(
                             session_key,
                             generation=run_generation,
@@ -17587,7 +17610,9 @@ class GatewayRunner:
                                     await _bg_result
                             except Exception:
                                 pass
-                    elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
+                    elif first_reply_delivered and adapter and hasattr(
+                        adapter, "_post_delivery_callbacks"
+                    ):
                         _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
                         if callable(_bg_cb):
                             try:
@@ -17619,6 +17644,10 @@ class GatewayRunner:
                         history=updated_history,
                     )
                     if next_message is None:
+                        result["_reply_events"] = _merge_followup_reply_events(
+                            pending_event,
+                            result,
+                        )
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -17647,7 +17676,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
-                    reply_event=pending_event,
+                    reply_event=pending_event or reply_event,
                 )
                 if pending_event is not None and not followup_result.get(
                     "_final_reply_events"

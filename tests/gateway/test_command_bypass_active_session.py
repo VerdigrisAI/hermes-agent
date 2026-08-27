@@ -316,6 +316,50 @@ class TestCommandBypassActiveSession:
         )
         assert event.delivery_state.reply_delivered is True
 
+    @pytest.mark.asyncio
+    async def test_failed_reset_like_reply_completes_as_failure(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None)
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/stop")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.FAILURE,
+        )
+        assert event.delivery_state.reply_attempted is True
+        assert event.delivery_state.reply_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_successful_reset_like_reply_records_delivery(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="reply-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/new")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_attempted is True
+        assert event.delivery_state.reply_delivered is True
+
 
 # ---------------------------------------------------------------------------
 # Tests: non-bypass-set commands (no dedicated Level-2 handler) also bypass
@@ -439,6 +483,34 @@ class TestNonBypassStillQueued:
 
         assert sk in adapter._pending_messages
         assert len(adapter.sent_responses) == 0
+
+    @pytest.mark.asyncio
+    async def test_clarify_text_gets_confirmed_ack_and_completion(self, monkeypatch):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._message_handler = AsyncMock(return_value="")
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="ack-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        sent_text = adapter._send_with_retry.await_args.kwargs["content"]
+        assert "continue" in sent_text
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_delivered is True
 
 
 # ---------------------------------------------------------------------------
