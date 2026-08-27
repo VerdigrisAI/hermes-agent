@@ -2399,6 +2399,22 @@ class GatewayRunner:
         else:
             pending_slot[session_key] = queued_event
 
+    def _prepend_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+        """Put an event before every currently queued event for a session."""
+        if adapter is None:
+            return
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return
+        existing = pending_slot.get(session_key)
+        if existing is not None:
+            queued_events = getattr(self, "_queued_events", None)
+            if queued_events is None:
+                queued_events = {}
+                self._queued_events = queued_events
+            queued_events.setdefault(session_key, []).insert(0, existing)
+        pending_slot[session_key] = queued_event
+
     def _remember_steer_event(
         self,
         session_key: str,
@@ -11424,13 +11440,15 @@ class GatewayRunner:
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    await _check_result(image_paths[0], result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    await _report_failure(image_paths[0], str(e))
 
             for media_path, is_voice in non_image_media:
                 try:
@@ -17015,28 +17033,6 @@ class GatewayRunner:
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
-            if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
-                return {
-                    "final_response": error_msg,
-                    "messages": result.get("messages", []),
-                    "api_calls": result.get("api_calls", 0),
-                    "failed": result.get("failed", False),
-                    "partial": result.get("partial", False),
-                    "completed": result.get("completed"),
-                    "interrupted": result.get("interrupted", False),
-                    "interrupt_message": result.get("interrupt_message"),
-                    "error": result.get("error"),
-                    "compression_exhausted": result.get("compression_exhausted", False),
-                    "tools": tools_holder[0] or [],
-                    "history_offset": len(agent_history),
-                    "last_prompt_tokens": _last_prompt_toks,
-                    "input_tokens": _input_toks,
-                    "output_tokens": _output_toks,
-                    "model": _resolved_model,
-                    "context_length": _context_length,
-                }
-            
             # Scan tool results for MEDIA:<path> tags that need to be delivered
             # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
             # in its JSON response, but the model's final text reply usually
@@ -17047,7 +17043,7 @@ class GatewayRunner:
             # Uses path-based deduplication against _history_media_paths (collected
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
-            if "MEDIA:" not in final_response:
+            if "MEDIA:" not in (final_response or ""):
                 media_tags = []
                 has_voice_directive = False
                 for msg in result.get("messages", []):
@@ -17070,7 +17066,31 @@ class GatewayRunner:
                             unique_tags.append(tag)
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+                    prefix = f"{final_response}\n" if final_response else ""
+                    final_response = prefix + "\n".join(unique_tags)
+
+            if not final_response:
+                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                return {
+                    "final_response": error_msg,
+                    "messages": result.get("messages", []),
+                    "api_calls": result.get("api_calls", 0),
+                    "failed": result.get("failed", False),
+                    "partial": result.get("partial", False),
+                    "completed": result.get("completed"),
+                    "interrupted": result.get("interrupted", False),
+                    "interrupt_message": result.get("interrupt_message"),
+                    "pending_steer": result.get("pending_steer"),
+                    "error": result.get("error"),
+                    "compression_exhausted": result.get("compression_exhausted", False),
+                    "tools": tools_holder[0] or [],
+                    "history_offset": len(agent_history),
+                    "last_prompt_tokens": _last_prompt_toks,
+                    "input_tokens": _input_toks,
+                    "output_tokens": _output_toks,
+                    "model": _resolved_model,
+                    "context_length": _context_length,
+                }
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
@@ -17587,7 +17607,11 @@ class GatewayRunner:
                         reply_event,
                     )
                     if leftover_event is not None and pending_event is not None:
-                        self._enqueue_fifo(session_key, leftover_event, adapter)
+                        # The steer arrived during the run, before any later
+                        # /queue messages. Keep that temporal FIFO order.
+                        self._prepend_fifo(session_key, pending_event, adapter)
+                        pending_event = leftover_event
+                        pending = leftover_event.text
                     elif leftover_event is not None:
                         pending_event = leftover_event
                         pending = leftover_event.text
@@ -17623,27 +17647,38 @@ class GatewayRunner:
                         pass
 
             if self._draining and (pending_event or pending):
-                if pending_event is not None and adapter is not None:
+                drain_events = [pending_event] if pending_event is not None else []
+                if adapter is not None and session_key:
+                    queued_slot = _dequeue_pending_event(adapter, session_key)
+                    if queued_slot is not None:
+                        drain_events.append(queued_slot)
+                    queued_overflow = getattr(self, "_queued_events", {}).pop(
+                        session_key,
+                        [],
+                    )
+                    drain_events.extend(queued_overflow)
+
+                for drain_event in drain_events:
                     rejection = (
                         f"⏳ Gateway is {self._status_action_gerund()} and cannot "
                         "accept the queued turn. Please resend after it comes back."
                     )
                     try:
                         rejection_result = await adapter._send_with_retry(
-                            chat_id=pending_event.source.chat_id,
+                            chat_id=drain_event.source.chat_id,
                             content=rejection,
-                            reply_to=self._reply_anchor_for_event(pending_event),
+                            reply_to=self._reply_anchor_for_event(drain_event),
                             metadata=self._thread_metadata_for_source(
-                                pending_event.source,
-                                self._reply_anchor_for_event(pending_event),
+                                drain_event.source,
+                                self._reply_anchor_for_event(drain_event),
                             ),
                         )
-                        _record_send_result_delivery(pending_event, rejection_result)
+                        _record_send_result_delivery(drain_event, rejection_result)
                     except Exception as exc:
                         logger.warning("Failed to reject queued turn during drain: %s", exc)
-                        _record_reply_attempt(pending_event)
+                        _record_reply_attempt(drain_event)
                     reply_events = _merge_followup_reply_events(
-                        pending_event,
+                        drain_event,
                         result,
                     )
                     result["_reply_events"] = reply_events

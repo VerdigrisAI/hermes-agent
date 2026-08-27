@@ -1755,7 +1755,6 @@ class SlackAdapter(BasePlatformAdapter):
         if not was_reacting and not required_reply:
             return
         self._reacting_message_ids.discard(ts)
-        self._required_reply_message_ids.discard(ts)
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
@@ -1767,17 +1766,21 @@ class SlackAdapter(BasePlatformAdapter):
             await self._add_reaction(channel_id, ts, "white_check_mark")
         elif reactions_enabled and outcome == ProcessingOutcome.FAILURE:
             failure_signaled = await self._add_reaction(channel_id, ts, "x")
+        terminal_signal_delivered = outcome == ProcessingOutcome.SUCCESS or failure_signaled
         if (
             outcome == ProcessingOutcome.FAILURE
             and required_reply
             and not failure_signaled
         ):
-            await self.send(
-                channel_id,
-                "⚠️ I could not complete this request. Please try again.",
+            fallback_result = await self._send_with_retry(
+                chat_id=channel_id,
+                content="⚠️ I could not complete this request. Please try again.",
                 reply_to=ts,
                 metadata={"thread_id": event.source.thread_id or ts},
             )
+            terminal_signal_delivered = bool(fallback_result.success)
+        if terminal_signal_delivered:
+            self._required_reply_message_ids.discard(ts)
 
     # ----- User identity resolution -----
 

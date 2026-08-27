@@ -644,12 +644,14 @@ class EarlyReturnSteerAgent:
     """Simulate a runtime branch that returns before the loop-level drain."""
 
     calls = 0
+    messages = []
 
     def __init__(self, **kwargs):
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         type(self).calls += 1
+        type(self).messages.append(message)
         return {
             "final_response": f"final response {type(self).calls}",
             "messages": [],
@@ -660,6 +662,36 @@ class EarlyReturnSteerAgent:
         if type(self).calls == 1:
             return "late steer"
         return None
+
+
+class EmptyEarlyReturnSteerAgent(EarlyReturnSteerAgent):
+    """Return no text before a late steer becomes a second turn."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        type(self).messages.append(message)
+        return {
+            "final_response": "" if type(self).calls == 1 else "steer response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class MediaOnlyAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "",
+            "messages": [
+                {
+                    "role": "tool",
+                    "content": '{"artifact": "MEDIA:/tmp/report.pdf"}',
+                }
+            ],
+            "api_calls": 1,
+        }
 
 
 class BackgroundReviewAgent:
@@ -713,6 +745,8 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     reply_event=None,
     pending_event=None,
+    overflow_events=None,
+    steer_events=None,
     draining=False,
 ):
     if config_data:
@@ -754,6 +788,10 @@ async def _run_with_agent(
             source=source,
             message_id="queued-1",
         )
+    if overflow_events:
+        runner._queued_events = {session_key: list(overflow_events)}
+    if steer_events:
+        runner._steer_reply_events = {session_key: list(steer_events)}
 
     result = await runner._run_agent(
         message="hello",
@@ -1070,6 +1108,42 @@ async def test_queue_accepted_before_drain_gets_a_terminal_reply(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_drain_rejects_every_accepted_queued_turn(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"queued-{index}",
+            expects_reply=True,
+        )
+        for index in range(3)
+    ]
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-all-queue-before-drain",
+        pending_event=queued[0],
+        overflow_events=queued[1:],
+        draining=True,
+    )
+
+    rejections = [call for call in adapter.sent if "resend" in call["content"]]
+    assert len(rejections) == 3
+    assert all(event.delivery_state.reply_delivered for event in queued)
+    assert all(any(item is event for item in result["_reply_events"]) for event in queued)
+
+
+@pytest.mark.asyncio
 async def test_early_return_preserves_a_late_steer_as_the_next_turn(
     monkeypatch,
     tmp_path,
@@ -1085,6 +1159,72 @@ async def test_early_return_preserves_a_late_steer_as_the_next_turn(
 
     assert EarlyReturnSteerAgent.calls == 2
     assert result["final_response"] == "final response 2"
+
+
+@pytest.mark.asyncio
+async def test_empty_early_return_preserves_a_late_steer(monkeypatch, tmp_path):
+    EmptyEarlyReturnSteerAgent.calls = 0
+    EmptyEarlyReturnSteerAgent.messages = []
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EmptyEarlyReturnSteerAgent,
+        session_id="sess-empty-early-return-steer",
+    )
+
+    assert EmptyEarlyReturnSteerAgent.messages == ["hello", "late steer"]
+    assert result["final_response"] == "steer response"
+
+
+@pytest.mark.asyncio
+async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
+    EarlyReturnSteerAgent.calls = 0
+    EarlyReturnSteerAgent.messages = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = MessageEvent(
+        text="queued follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-after-steer",
+        expects_reply=True,
+    )
+    steer = MessageEvent(
+        text="/steer late steer",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="late-steer",
+        expects_reply=True,
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-steer-before-queue",
+        pending_event=queued,
+        steer_events=[("late steer", steer)],
+    )
+
+    assert EarlyReturnSteerAgent.messages == ["hello", "late steer", "queued follow-up"]
+    assert result["final_response"] == "final response 3"
+
+
+@pytest.mark.asyncio
+async def test_media_only_result_is_not_replaced_by_empty_response(monkeypatch, tmp_path):
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MediaOnlyAgent,
+        session_id="sess-media-only",
+    )
+
+    assert result["final_response"] == "MEDIA:/tmp/report.pdf"
 
 
 @pytest.mark.asyncio

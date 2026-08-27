@@ -2504,6 +2504,38 @@ class TestReactions:
         adapter.send.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_required_failure_retries_text_before_clearing_state(
+        self, adapter, monkeypatch
+    ):
+        adapter._add_reaction = AsyncMock(return_value=False)
+        adapter.send = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="temporary", retryable=True),
+                SendResult(success=True, message_id="fallback"),
+            ]
+        )
+        monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", AsyncMock())
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000008",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        assert adapter.send.await_count == 2
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
     async def test_reactions_enabled_by_default(self, adapter):
         """SLACK_REACTIONS defaults to true (matches existing behavior)."""
         assert adapter._reactions_enabled() is True

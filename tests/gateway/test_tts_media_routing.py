@@ -273,6 +273,39 @@ async def test_streaming_delivery_surfaces_html_upload_rejection_in_same_thread(
 
 
 @pytest.mark.asyncio
+async def test_streaming_delivery_surfaces_image_batch_failure_in_same_thread():
+    thread_ts = "1785782926.578209"
+    event = _slack_event(thread_id=thread_ts)
+    adapter = SimpleNamespace(
+        name="slack",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True)),
+        send_document=AsyncMock(return_value=SendResult(success=True)),
+        send_multiple_images=AsyncMock(
+            return_value=SendResult(success=False, error="Slack image upload failed")
+        ),
+        send_video=AsyncMock(return_value=SendResult(success=True)),
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
+    )
+    image = "/opt/data/artifacts/slack/chart.png"
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_ts": thread_ts}),
+        f"MEDIA:{image}",
+        event,
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once()
+    adapter.send.assert_awaited_once()
+    notice = adapter.send.await_args.kwargs
+    assert notice["metadata"] == {"thread_ts": thread_ts}
+    assert "Slack image upload failed" in notice["content"]
+
+
+@pytest.mark.asyncio
 async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_document_sender():
     event = _event(thread_id="topic-1")
     adapter = SimpleNamespace(

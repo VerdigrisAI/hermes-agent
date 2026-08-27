@@ -271,9 +271,17 @@ class TestDiscordMultiImage:
 # ---------------------------------------------------------------------------
 
 
+_slack_mocked_modules = []
+
+
 def _ensure_slack_mock():
-    if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
+    try:
+        __import__("slack_bolt")
+        __import__("slack_sdk")
         return
+    except ImportError:
+        pass
+
     slack_mod = MagicMock()
     for name in (
         "slack_bolt", "slack_bolt.app", "slack_bolt.app.async_app",
@@ -282,12 +290,21 @@ def _ensure_slack_mock():
         "slack_sdk", "slack_sdk.web", "slack_sdk.web.async_client",
         "slack_sdk.errors",
     ):
-        sys.modules.setdefault(name, slack_mod)
+        if name not in sys.modules:
+            sys.modules[name] = slack_mod
+            _slack_mocked_modules.append(name)
 
 
 _ensure_slack_mock()
 
 from gateway.platforms.slack import SlackAdapter  # noqa: E402
+
+# Keep the class reference for these tests, but do not leak fake dependencies
+# or the resulting adapter module into tests collected later in the process.
+if _slack_mocked_modules:
+    for _module_name in _slack_mocked_modules:
+        sys.modules.pop(_module_name, None)
+    sys.modules.pop("gateway.platforms.slack", None)
 
 
 class TestSlackMultiImage:
