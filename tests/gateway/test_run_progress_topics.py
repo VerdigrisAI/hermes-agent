@@ -726,6 +726,59 @@ class QueuedMediaAgent:
         }
 
 
+class QueuedMarkdownImageAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "![chart](https://example.com/chart.png)"
+                if type(self).calls == 1
+                else "queued response"
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class SecondCallRaisingAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 2:
+            raise RuntimeError("queued agent failed")
+        return {
+            "final_response": "first response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class ImageCaptureAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.image_batches = []
+
+    async def send_multiple_images(
+        self,
+        chat_id,
+        images,
+        reply_to=None,
+        metadata=None,
+        human_delay=0.0,
+    ):
+        self.image_batches.append(images)
+        return SendResult(success=True, message_id="image-1")
+
+
 class RaisingAgent:
     def __init__(self, **kwargs):
         self.tools = []
@@ -1580,6 +1633,77 @@ async def test_queued_followup_delivers_first_turn_tool_media(monkeypatch, tmp_p
     assert all("MEDIA:" not in call["content"] for call in adapter.sent)
     assert owner.delivery_state.reply_attempted is True
     assert owner.delivery_state.reply_delivered is True
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_delivers_first_turn_markdown_image(monkeypatch, tmp_path):
+    QueuedMarkdownImageAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="image-owner",
+        expects_reply=True,
+    )
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedMarkdownImageAgent,
+        session_id="sess-queued-markdown-image",
+        pending_text="queued follow-up",
+        reply_event=owner,
+        adapter_cls=ImageCaptureAdapter,
+    )
+
+    assert result["final_response"] == "queued response"
+    assert adapter.image_batches == [
+        [("https://example.com/chart.png", "chart")]
+    ]
+    assert owner.delivery_state.reply_delivered is True
+    assert owner.delivery_state.reply_failed is False
+
+
+@pytest.mark.asyncio
+async def test_recursive_queued_failure_preserves_each_reply_owner(monkeypatch, tmp_path):
+    SecondCallRaisingAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    original = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-owner",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-owner",
+        expects_reply=True,
+    )
+
+    with pytest.raises(RuntimeError, match="queued agent failed"):
+        await _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            SecondCallRaisingAgent,
+            session_id="sess-recursive-failure-owner",
+            pending_event=queued,
+            reply_event=original,
+        )
+
+    assert queued in original.delivery_state.completion_events
 
 
 @pytest.mark.asyncio

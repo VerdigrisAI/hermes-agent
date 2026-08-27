@@ -1020,6 +1020,7 @@ class MessageDeliveryState:
 
     reply_delivered: bool = False
     reply_attempted: bool = False
+    reply_failed: bool = False
     merged_events: List[Any] = field(default_factory=list)
     completion_events: List[Any] = field(default_factory=list)
     final_response_events: List[Any] = field(default_factory=list)
@@ -3287,6 +3288,9 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 for delivery_event in delivery_targets:
                     delivery_event.delivery_state.reply_delivered = True
+            else:
+                for delivery_event in delivery_targets:
+                    delivery_event.delivery_state.reply_failed = True
 
         async def _complete_delivery_events(
             default_outcome: ProcessingOutcome,
@@ -3305,13 +3309,19 @@ class BasePlatformAdapter(ABC):
                 pending_completion_events.extend(
                     completion_event.delivery_state.merged_events
                 )
+                pending_completion_events.extend(
+                    completion_event.delivery_state.completion_events
+                )
                 delivery_state = completion_event.delivery_state
                 if default_outcome != ProcessingOutcome.SUCCESS:
                     outcome = default_outcome
                 elif delivery_state.reply_attempted or completion_event.expects_reply:
                     outcome = (
                         ProcessingOutcome.SUCCESS
-                        if delivery_state.reply_delivered
+                        if (
+                            delivery_state.reply_delivered
+                            and not delivery_state.reply_failed
+                        )
                         else ProcessingOutcome.FAILURE
                     )
                 else:
@@ -3521,8 +3531,9 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
-                        _record_delivery(image_result)
-                        if not image_result.success:
+                        if image_result.success:
+                            _record_delivery(image_result)
+                        else:
                             notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
@@ -3531,8 +3542,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(image_result.error or "upload returned no success confirmation"),
                             )
-                            if notice_delivered:
-                                _record_delivery(SendResult(success=True))
+                            _record_delivery(SendResult(success=notice_delivered))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
                         notice_delivered = await report_media_delivery_failure(
@@ -3543,8 +3553,7 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(batch_err),
                         )
-                        if notice_delivered:
-                            _record_delivery(SendResult(success=True))
+                        _record_delivery(SendResult(success=notice_delivered))
 
 
                 # Send extracted media files — route by file type
@@ -3634,10 +3643,11 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
 
-                        _record_delivery(media_result)
-                        if not media_result.success:
+                        if media_result.success:
+                            _record_delivery(media_result)
+                        else:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await report_media_delivery_failure(
+                            notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
                                 thread_id=getattr(event.source, "thread_id", None),
@@ -3645,9 +3655,10 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(media_result.error or "upload returned no success confirmation"),
                             )
+                            _record_delivery(SendResult(success=notice_delivered))
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
-                        await report_media_delivery_failure(
+                        notice_delivered = await report_media_delivery_failure(
                             self,
                             chat_id=event.source.chat_id,
                             thread_id=getattr(event.source, "thread_id", None),
@@ -3655,6 +3666,7 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(media_err),
                         )
+                        _record_delivery(SendResult(success=notice_delivered))
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -3674,9 +3686,10 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
-                        _record_delivery(file_result)
-                        if not file_result.success:
-                            await report_media_delivery_failure(
+                        if file_result.success:
+                            _record_delivery(file_result)
+                        else:
+                            notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
                                 thread_id=getattr(event.source, "thread_id", None),
@@ -3684,9 +3697,10 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(file_result.error or "upload returned no success confirmation"),
                             )
+                            _record_delivery(SendResult(success=notice_delivered))
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
-                        await report_media_delivery_failure(
+                        notice_delivered = await report_media_delivery_failure(
                             self,
                             chat_id=event.source.chat_id,
                             thread_id=getattr(event.source, "thread_id", None),
@@ -3694,6 +3708,7 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(file_err),
                         )
+                        _record_delivery(SendResult(success=notice_delivered))
 
             # Determine overall success for the processing hook
             await _complete_delivery_events(ProcessingOutcome.SUCCESS)

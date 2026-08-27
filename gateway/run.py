@@ -865,12 +865,20 @@ def _record_confirmed_reply_delivery(event: MessageEvent, agent_result: dict) ->
     return True
 
 
+def _record_reply_failure(event: MessageEvent) -> None:
+    """Record a terminal reply-delivery failure for every served event."""
+    for target in _record_reply_attempt(event):
+        target.delivery_state.reply_failed = True
+
+
 def _record_send_result_delivery(event: MessageEvent, send_result: Any) -> bool:
     """Record a direct adapter send only when the adapter confirms success."""
     delivered = bool(send_result is not None and getattr(send_result, "success", False))
     for target in _record_reply_attempt(event):
         if delivered:
             target.delivery_state.reply_delivered = True
+        else:
+            target.delivery_state.reply_failed = True
     return delivered
 
 
@@ -17482,6 +17490,7 @@ class GatewayRunner:
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
+        pending_event: Optional[MessageEvent] = None
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -17696,7 +17705,6 @@ class GatewayRunner:
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
-            pending_event = None
             pending = None
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
@@ -17918,6 +17926,8 @@ class GatewayRunner:
                                 reply_event,
                                 {"already_sent": True, "failed": False},
                             )
+                        elif reply_event is not None:
+                            _record_reply_failure(reply_event)
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
@@ -18025,6 +18035,10 @@ class GatewayRunner:
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         except Exception:
+            if pending_event is not None and reply_event is not None:
+                completion_events = reply_event.delivery_state.completion_events
+                if all(existing is not pending_event for existing in completion_events):
+                    completion_events.append(pending_event)
             if self._draining and session_key:
                 await self._reject_queued_events_after_failed_drain(
                     session_key,
