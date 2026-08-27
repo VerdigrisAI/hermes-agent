@@ -610,14 +610,23 @@ class TestEmailMultiImage:
         assert result.success is False
 
     def test_attachment_read_failure_uses_per_image_fallback(self, adapter, tmp_path):
+        import builtins
+
         image = tmp_path / "unreadable.png"
         image.write_bytes(b"image")
         adapter.send_image_file = AsyncMock(
             return_value=SendResult(success=True, message_id="fallback")
         )
 
+        real_open = builtins.open
+
+        def fail_image_read(path, *args, **kwargs):
+            if os.fspath(path) == os.fspath(image):
+                raise OSError("read failed")
+            return real_open(path, *args, **kwargs)
+
         with (
-            patch("builtins.open", side_effect=OSError("read failed")),
+            patch("builtins.open", side_effect=fail_image_read),
             patch("gateway.platforms.email.smtplib.SMTP"),
         ):
             result = _run(
