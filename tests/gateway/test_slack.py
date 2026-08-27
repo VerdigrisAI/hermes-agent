@@ -2493,6 +2493,7 @@ class TestThreadReplyHandling:
         # Verify the text is passed through unchanged (no mention stripping needed)
         msg_event = adapter_with_session_store.handle_message.call_args[0][0]
         assert msg_event.text == "Follow-up question"
+        assert msg_event.expects_reply is True
 
     @pytest.mark.asyncio
     async def test_thread_reply_with_mention_strips_bot_id(

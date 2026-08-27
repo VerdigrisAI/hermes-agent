@@ -844,6 +844,14 @@ _TOOL_MEDIA_RE = re.compile(
 )
 
 
+def _record_confirmed_reply_delivery(event: MessageEvent, agent_result: dict) -> bool:
+    """Record confirmed out-of-band delivery and return whether it occurred."""
+    if not agent_result.get("already_sent") or agent_result.get("failed"):
+        return False
+    event.delivery_state.reply_delivered = True
+    return True
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -8787,7 +8795,7 @@ class GatewayRunner:
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if _record_confirmed_reply_delivery(event, agent_result):
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:

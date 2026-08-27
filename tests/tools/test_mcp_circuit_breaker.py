@@ -201,12 +201,17 @@ def test_tool_errors_do_not_trip_server_circuit_breaker(monkeypatch, tmp_path):
     mcp_tool._ensure_mcp_loop()
 
     try:
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+        if hasattr(mcp_tool, "_server_breaker_opened_at"):
+            mcp_tool._server_breaker_opened_at["srv"] = 123.0
+
         handler = _make_tool_handler("srv", "tool1", 10.0)
         for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
             assert "error" in json.loads(handler({}))
 
         assert calls["n"] == mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1
         assert mcp_tool._server_error_counts.get("srv", 0) == 0
+        assert "srv" not in mcp_tool._server_breaker_opened_at
     finally:
         _cleanup(mcp_tool, "srv")
 

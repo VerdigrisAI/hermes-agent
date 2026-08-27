@@ -214,6 +214,7 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
         source=source,
         media_urls=["/tmp/test.png"],
         media_types=["image/png"],
+        expects_reply=True,
     )
 
     merge_pending_message_event(pending, session_key, text_event, merge_text=True)
@@ -224,6 +225,7 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.text == "first follow-up\n\nsee screenshot"
     assert merged.media_urls == ["/tmp/test.png"]
     assert merged.media_types == ["image/png"]
+    assert merged.expects_reply is True
 
 
 def test_merge_pending_message_event_promotes_document_followups_over_text():

@@ -2730,7 +2730,10 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
-            expects_reply=is_dm or is_mentioned,
+            # Every Slack message that passes the admission rules represents
+            # a user turn that requires a visible answer. This includes
+            # unmentioned follow-ups in an active or previously mentioned thread.
+            expects_reply=True,
         )
 
         # Only react when bot is directly addressed (DM or @mention).

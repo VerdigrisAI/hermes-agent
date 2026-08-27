@@ -999,6 +999,13 @@ class ProcessingOutcome(Enum):
 
 
 @dataclass
+class MessageDeliveryState:
+    """Delivery evidence shared across copies of one inbound event."""
+
+    reply_delivered: bool = False
+
+
+@dataclass
 class MessageEvent:
     """
     Incoming message from a platform.
@@ -1056,6 +1063,11 @@ class MessageEvent:
     # An empty handler result is a failure for these events, even though it can
     # be normal when streaming or queue handling owns delivery elsewhere.
     expects_reply: bool = False
+
+    # Streaming and preview delivery happen inside the gateway handler, outside
+    # this adapter's normal send path.  Keep explicit evidence on a shared
+    # object so dataclasses.replace() preserves it across rewritten events.
+    delivery_state: MessageDeliveryState = field(default_factory=MessageDeliveryState)
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -1200,6 +1212,9 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        # A merged event must retain the strongest reply contract. Otherwise,
+        # a later optional fragment can hide an earlier direct mention or DM.
+        existing.expects_reply = existing.expects_reply or event.expects_reply
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -3483,7 +3498,8 @@ class BasePlatformAdapter(ABC):
             processing_ok = (
                 delivery_succeeded
                 if delivery_attempted
-                else not bool(response) and not event.expects_reply
+                else event.delivery_state.reply_delivered
+                or (not bool(response) and not event.expects_reply)
             )
             await self._run_processing_hook(
                 "on_processing_complete",

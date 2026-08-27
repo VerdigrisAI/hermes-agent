@@ -27,6 +27,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import SessionSource, build_session_key
+from gateway.run import _record_confirmed_reply_delivery
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,18 @@ def _make_event(text="hello", chat_id="c1", user_id="u1"):
         ),
         message_id="m1",
     )
+
+
+def test_failed_stream_does_not_record_reply_delivery():
+    event = _make_event()
+
+    delivered = _record_confirmed_reply_delivery(
+        event,
+        {"already_sent": True, "failed": True},
+    )
+
+    assert delivered is False
+    assert event.delivery_state.reply_delivered is False
 
 
 # ===================================================================
