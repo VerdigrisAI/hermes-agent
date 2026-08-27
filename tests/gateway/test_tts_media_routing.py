@@ -181,6 +181,33 @@ async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sen
 
 
 @pytest.mark.asyncio
+async def test_streaming_media_tag_is_not_rediscovered_as_a_bare_path(tmp_path):
+    event = _event(thread_id="topic-1")
+    artifact = tmp_path / "report.pdf"
+    artifact.write_bytes(b"report")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True)),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_multiple_images=AsyncMock(return_value=SendResult(success=True)),
+        send_video=AsyncMock(return_value=SendResult(success=True)),
+    )
+
+    delivered = await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"MEDIA:{artifact}",
+        event,
+        adapter,
+    )
+
+    assert delivered is True
+    adapter.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("event", "thread_meta"),
     [
