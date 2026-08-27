@@ -212,7 +212,9 @@ class TestRunBackgroundTask:
         """When provider credentials are missing, an error is sent."""
         runner = _make_runner()
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
+        mock_adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="failure-1")
+        )
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -226,8 +228,8 @@ class TestRunBackgroundTask:
             await runner._run_background_task("test prompt", source, "bg_test")
 
         # Should have sent an error message
-        mock_adapter.send.assert_called_once()
-        call_args = mock_adapter.send.call_args
+        mock_adapter._send_with_retry.assert_awaited_once()
+        call_args = mock_adapter._send_with_retry.call_args
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
 
     @pytest.mark.asyncio
@@ -235,9 +237,12 @@ class TestRunBackgroundTask:
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
+        mock_adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="completion-1")
+        )
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
+        mock_adapter.extract_local_files = MagicMock(return_value=([], "Hello from background!"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -260,13 +265,112 @@ class TestRunBackgroundTask:
             await runner._run_background_task("say hello", source, "bg_test")
 
         # Should have sent the result
-        mock_adapter.send.assert_called_once()
-        call_args = mock_adapter.send.call_args
+        mock_adapter._send_with_retry.assert_awaited_once()
+        call_args = mock_adapter._send_with_retry.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Background task complete" in content
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_text_completion_uses_retrying_delivery(self):
+        """A retryable completion failure reaches the user on retry."""
+        runner = _make_runner()
+
+        class RetryAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(MagicMock(), Platform.TELEGRAM)
+                self.results = [
+                    SendResult(success=False, error="connection reset", retryable=True),
+                    SendResult(success=True, message_id="completion-2"),
+                ]
+                self.calls = []
+
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.calls.append((chat_id, content, metadata))
+                return self.results.pop(0)
+
+            async def get_chat_info(self, chat_id):
+                return {"name": chat_id, "type": "dm"}
+
+        adapter = RetryAdapter()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "done", "messages": []}
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        assert len(adapter.calls) == 2
+        assert "Background task complete" in adapter.calls[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_bare_local_artifact_is_uploaded_without_exposing_path(self, tmp_path):
+        runner = _make_runner()
+        artifact = tmp_path / "report.pdf"
+        artifact.write_bytes(b"report")
+        adapter = MagicMock()
+        adapter.name = "Slack"
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": f"Finished: {artifact}", "messages": []}
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._deliver_media_from_response = AsyncMock(return_value=True)
+        source = SessionSource(
+            platform=Platform.SLACK,
+            user_id="U1",
+            chat_id="C1",
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task("make report", source, "bg_test")
+
+        runner._deliver_media_from_response.assert_awaited_once()
+        sent_text = adapter._send_with_retry.await_args.kwargs["content"]
+        assert str(artifact) not in sent_text
+        assert "Finished:" in sent_text
 
     @pytest.mark.asyncio
     async def test_media_only_upload_failure_sends_visible_notice(self):
@@ -351,9 +455,12 @@ class TestRunBackgroundTask:
         monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
 
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
+        mock_adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="completion-1")
+        )
         mock_adapter.extract_media = MagicMock(return_value=([], "done"))
         mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_local_files = MagicMock(return_value=([], "done"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -371,8 +478,8 @@ class TestRunBackgroundTask:
             event_message_id="463",
         )
 
-        mock_adapter.send.assert_called_once()
-        assert mock_adapter.send.call_args.kwargs["metadata"] == {
+        mock_adapter._send_with_retry.assert_awaited_once()
+        assert mock_adapter._send_with_retry.call_args.kwargs["metadata"] == {
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,
             "direct_messages_topic_id": "20197",
@@ -384,7 +491,9 @@ class TestRunBackgroundTask:
         """Temporary background agents must be cleaned up on error paths too."""
         runner = _make_runner()
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
+        mock_adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="failure-1")
+        )
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -404,7 +513,7 @@ class TestRunBackgroundTask:
 
             await runner._run_background_task("say hello", source, "bg_test")
 
-        mock_adapter.send.assert_called_once()
+        mock_adapter._send_with_retry.assert_awaited_once()
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
@@ -413,7 +522,9 @@ class TestRunBackgroundTask:
         """When the agent raises an exception, an error message is sent."""
         runner = _make_runner()
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
+        mock_adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="failure-1")
+        )
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -426,8 +537,8 @@ class TestRunBackgroundTask:
         with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=RuntimeError("boom")):
             await runner._run_background_task("test prompt", source, "bg_test")
 
-        mock_adapter.send.assert_called_once()
-        call_args = mock_adapter.send.call_args
+        mock_adapter._send_with_retry.assert_awaited_once()
+        call_args = mock_adapter._send_with_retry.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "failed" in content.lower()
 

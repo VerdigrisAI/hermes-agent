@@ -1802,7 +1802,8 @@ async def test_queued_image_batch_failure_uses_generic_batch_name(monkeypatch, t
     notice = next(item["content"] for item in adapter.sent if "was not attached" in item["content"])
     assert "2-image batch" in notice
     assert "first.png" not in notice
-    assert owner.delivery_state.reply_failed is False
+    assert owner.delivery_state.reply_failed is True
+    assert owner.delivery_state.failure_notice_delivered is True
 
 
 @pytest.mark.asyncio

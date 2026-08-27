@@ -875,6 +875,8 @@ def _record_send_result_delivery(event: MessageEvent, send_result: Any) -> bool:
     """Record a direct adapter send only when the adapter confirms success."""
     delivered = bool(send_result is not None and getattr(send_result, "success", False))
     for target in _record_reply_attempt(event):
+        if getattr(send_result, "failure_notice_delivered", False):
+            target.delivery_state.failure_notice_delivered = True
         if delivered:
             target.delivery_state.reply_delivered = True
         else:
@@ -11485,7 +11487,7 @@ class GatewayRunner:
             *,
             display_name: str | None = None,
         ) -> bool:
-            return await report_media_delivery_failure(
+            notice_delivered = await report_media_delivery_failure(
                 adapter,
                 chat_id=event.source.chat_id,
                 thread_id=getattr(event.source, "thread_id", None),
@@ -11494,6 +11496,10 @@ class GatewayRunner:
                 detail=detail,
                 display_name=display_name,
             )
+            if notice_delivered:
+                for target in _record_reply_attempt(event):
+                    target.delivery_state.failure_notice_delivered = True
+            return False
 
         async def _check_result(
             file_path: str,
@@ -11774,6 +11780,13 @@ class GatewayRunner:
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        async def _send_completion(content: str):
+            return await adapter._send_with_retry(
+                chat_id=source.chat_id,
+                content=content,
+                metadata=_thread_metadata,
+            )
+
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -11781,10 +11794,8 @@ class GatewayRunner:
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                await _send_completion(
+                    f"❌ Background task {task_id} failed: no provider credentials configured."
                 )
                 return
 
@@ -11867,24 +11878,17 @@ class GatewayRunner:
                 original_response = response
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
+                local_files, text_content = adapter.extract_local_files(text_content)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
+                    await _send_completion(header + text_content)
+                elif not images and not media_files and not local_files:
+                    await _send_completion(header + "(No response generated)")
 
-                if images or media_files:
+                if images or media_files or local_files:
                     background_event = MessageEvent(
                         text=prompt,
                         source=source,
@@ -11897,20 +11901,14 @@ class GatewayRunner:
                     )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                await _send_completion(
+                    f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)'
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
+                await _send_completion(f"❌ Background task {task_id} failed: {e}")
             except Exception:
                 pass
 

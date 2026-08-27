@@ -220,8 +220,9 @@ class TestSendWithRetryExhausted:
         adapter._send_results = [network_err, network_err, network_err, SendResult(success=True)]
         with patch("asyncio.sleep", new_callable=AsyncMock):
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
-        # A delivered failure notice is the terminal user-visible result.
-        assert result.success
+        # The requested payload still failed, even though its notice arrived.
+        assert not result.success
+        assert result.failure_notice_delivered
         # 4 total calls: 1 initial + 2 retries + 1 notice
         assert len(adapter._send_calls) == 4
         # The notice content should mention delivery failure

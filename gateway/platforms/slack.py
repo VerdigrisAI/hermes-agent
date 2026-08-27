@@ -649,10 +649,8 @@ class SlackAdapter(BasePlatformAdapter):
     # we use a much shorter TTL to avoid routing unrelated messages
     # as ephemeral if the command handler was slow or dropped.
 
-    def _pop_slash_context(
-        self, chat_id: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Return and remove the slash-command context for *chat_id*, if fresh.
+    def _slash_context_key(self, chat_id: str) -> Optional[Tuple[str, str]]:
+        """Return the matching fresh slash-command context key.
 
         Contexts older than ``_SLASH_CTX_TTL`` seconds are silently discarded.
 
@@ -675,7 +673,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Precise match: (channel_id, user_id) from ContextVar.
         uid = _slash_user_id.get()
         if uid:
-            return self._slash_command_contexts.pop((chat_id, uid), None)
+            key = (chat_id, uid)
+            return key if key in self._slash_command_contexts else None
 
         # Fallback: channel-only scan (only reachable when ContextVar is
         # unset, i.e. send() called outside a slash-command async context).
@@ -684,9 +683,28 @@ class SlackAdapter(BasePlatformAdapter):
             if key[0] == chat_id:
                 match_key = key
                 break
-        if match_key is None:
-            return None
-        return self._slash_command_contexts.pop(match_key)
+        return match_key
+
+    def _pop_slash_context(
+        self, chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return and remove the slash-command context for *chat_id*, if fresh."""
+        key = self._slash_context_key(chat_id)
+        return self._slash_command_contexts.pop(key, None) if key else None
+
+    def _peek_slash_context(
+        self, chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a fresh slash context without consuming it."""
+        key = self._slash_context_key(chat_id)
+        return self._slash_command_contexts.get(key) if key else None
+
+    def _discard_slash_context(self, ctx: Dict[str, Any]) -> None:
+        """Consume *ctx* after confirmed private delivery."""
+        for key, candidate in list(self._slash_command_contexts.items()):
+            if candidate is ctx:
+                self._slash_command_contexts.pop(key, None)
+                return
 
     async def _send_slash_ephemeral(
         self,
@@ -733,11 +751,16 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning(
                 "[Slack] response_url POST failed: %s", e,
             )
-        return await self.send_private_notice(
+        result = await self.send_private_notice(
             chat_id=str(ctx.get("channel_id") or ""),
             user_id=str(ctx.get("user_id") or ""),
             content=content,
         )
+        if not result.success:
+            # Retrying an ephemeral replacement cannot leak private command
+            # output or create a public duplicate.
+            result.retryable = True
+        return result
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -1008,11 +1031,14 @@ class SlackAdapter(BasePlatformAdapter):
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id)
+            slash_ctx = self._peek_slash_context(chat_id)
             if slash_ctx:
-                return await self._send_slash_ephemeral(
+                result = await self._send_slash_ephemeral(
                     slash_ctx, content,
                 )
+                if result.success:
+                    self._discard_slash_context(slash_ctx)
+                return result
 
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
@@ -1469,7 +1495,12 @@ class SlackAdapter(BasePlatformAdapter):
                             local_path = _unquote(image_url[7:])
                             try:
                                 local_path, local_bytes = self._prepare_local_upload(local_path)
-                            except (FileNotFoundError, _SlackUploadPolicyError) as exc:
+                            except FileNotFoundError as exc:
+                                logger.warning("[Slack] Skipping missing local image: %s", exc)
+                                all_delivered = False
+                                last_error = f"File not found: {os.path.basename(local_path)}"
+                                continue
+                            except _SlackUploadPolicyError as exc:
                                 logger.warning("[Slack] Skipping disallowed local image: %s", exc)
                                 all_delivered = False
                                 last_error = str(exc)
@@ -1779,12 +1810,14 @@ class SlackAdapter(BasePlatformAdapter):
             outcome in {ProcessingOutcome.SUCCESS, ProcessingOutcome.CANCELLED}
             or failure_signaled
             or reply_terminally_delivered
+            or event.delivery_state.failure_notice_delivered
         )
         if (
             outcome == ProcessingOutcome.FAILURE
             and required_reply
             and not failure_signaled
             and not reply_terminally_delivered
+            and not event.delivery_state.failure_notice_delivered
         ):
             fallback_result = await self._send_with_retry(
                 chat_id=channel_id,

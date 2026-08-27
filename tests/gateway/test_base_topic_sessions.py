@@ -268,6 +268,7 @@ class TestBasePlatformTopicSessions:
         )
 
         assert event.delivery_state.reply_delivered is True
+        assert event.delivery_state.reply_failed is False
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.SUCCESS),
@@ -297,6 +298,7 @@ class TestBasePlatformTopicSessions:
         )
 
         assert event.delivery_state.reply_delivered is True
+        assert event.delivery_state.reply_failed is False
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.SUCCESS),
@@ -360,14 +362,16 @@ class TestBasePlatformTopicSessions:
             build_session_key(event.source),
         )
 
-        assert event.delivery_state.reply_delivered is True
+        assert event.delivery_state.reply_delivered is False
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
         assert len(adapter.sent) == 1
         assert "was not attached" in adapter.sent[0]["content"]
         assert "1-image batch" in adapter.sent[0]["content"]
         assert adapter.processing_hooks[-1] == (
             "complete",
             "1",
-            ProcessingOutcome.SUCCESS,
+            ProcessingOutcome.FAILURE,
         )
 
     @pytest.mark.asyncio
@@ -393,14 +397,15 @@ class TestBasePlatformTopicSessions:
             build_session_key(event.source),
         )
 
-        assert event.delivery_state.reply_delivered is True
-        assert event.delivery_state.reply_failed is False
+        assert event.delivery_state.reply_delivered is False
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
         assert len(adapter.sent) == 1
         assert "was not attached" in adapter.sent[0]["content"]
         assert adapter.processing_hooks[-1] == (
             "complete",
             "1",
-            ProcessingOutcome.SUCCESS,
+            ProcessingOutcome.FAILURE,
         )
 
     @pytest.mark.asyncio
@@ -472,15 +477,16 @@ class TestBasePlatformTopicSessions:
             build_session_key(event.source),
         )
 
-        assert event.delivery_state.reply_delivered is True
-        assert event.delivery_state.reply_failed is False
+        assert event.delivery_state.reply_delivered is False
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
         assert len(adapter.sent) == 1
         assert "was not attached" in adapter.sent[0]["content"]
         assert "1-image batch" in adapter.sent[0]["content"]
         assert adapter.processing_hooks[-1] == (
             "complete",
             "1",
-            ProcessingOutcome.SUCCESS,
+            ProcessingOutcome.FAILURE,
         )
 
     @pytest.mark.asyncio
