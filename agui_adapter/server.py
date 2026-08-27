@@ -182,6 +182,11 @@ def _run_turn(run_input: RunAgentInput, config: AgentConfig, bridge: AGUIEventBr
     )
     if on_agent is not None:
         on_agent(agent)
+    if prep.system_context:
+        existing_system_context = getattr(agent, "ephemeral_system_prompt", "") or ""
+        agent.ephemeral_system_prompt = "\n\n".join(
+            part for part in (existing_system_context, prep.system_context) if part
+        )
     # Text, reasoning, AND server-tool calls stream live. Classify the tools so
     # the bridge emits live TOOL_CALL_* only for server tools: frontend tools
     # are emitted post-run (real ids), state-writer tools via a snapshot.

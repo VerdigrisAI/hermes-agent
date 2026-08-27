@@ -83,15 +83,15 @@ def test_prepare_run_resume_after_tool():
     }
 
 
-def test_context_injected_as_leading_system_not_in_user():
+def test_context_prepared_as_ephemeral_system_context_not_in_user():
     msgs = [_user("who am i")]
     ctx = context_to_text([Context(description="display name", value="Ada")])
     prep = prepare_run(msgs, context_text=ctx)
-    # Context lands as a system message in history, user message is untouched
-    # (critical for aimock user-message fixture matching).
+    # Context is kept out of both history and the user message. The server adds
+    # it to Hermes' single ephemeral system prompt for provider compatibility.
     assert prep.user_message == "who am i"
-    assert prep.conversation_history[0]["role"] == "system"
-    assert "Ada" in prep.conversation_history[0]["content"]
+    assert prep.conversation_history == []
+    assert "Ada" in prep.system_context
 
 
 def test_tools_conversion_and_names():
@@ -130,13 +130,13 @@ def test_forwarded_props_empty_is_blank():
     assert forwarded_props_to_text(None) == ""
 
 
-def test_forwarded_props_injected_as_system_not_in_user():
+def test_forwarded_props_prepared_as_ephemeral_system_context_not_in_user():
     msgs = [_user("hi")]
     props = forwarded_props_to_text({"tone": "formal"})
     prep = prepare_run(msgs, system_texts=[props])
     assert prep.user_message == "hi"
-    sys_contents = [m["content"] for m in prep.conversation_history if m["role"] == "system"]
-    assert any("tone: formal" in c for c in sys_contents)
+    assert prep.conversation_history == []
+    assert "tone: formal" in prep.system_context
 
 
 # --- feature 2: inbound state -> injected context --------------------------
@@ -153,12 +153,23 @@ def test_state_to_text_empty_is_blank():
     assert state_to_text(None) == ""
 
 
-def test_state_injected_as_system_not_in_user():
+def test_state_prepared_as_ephemeral_system_context_not_in_user():
     msgs = [_user("what am i cooking")]
     prep = prepare_run(msgs, system_texts=[state_to_text({"recipe": "Pie"})])
     assert prep.user_message == "what am i cooking"
-    sys_contents = [m["content"] for m in prep.conversation_history if m["role"] == "system"]
-    assert any("Current shared state" in c and "Pie" in c for c in sys_contents)
+    assert prep.conversation_history == []
+    assert "Current shared state" in prep.system_context
+    assert "Pie" in prep.system_context
+
+
+def test_inbound_system_messages_join_ephemeral_context():
+    msgs = [
+        SystemMessage(id="s1", role="system", content="Use concise answers."),
+        _user("hi"),
+    ]
+    prep = prepare_run(msgs, context_text="Reference data")
+    assert prep.conversation_history == []
+    assert prep.system_context == "Reference data\n\nUse concise answers."
 
 
 # --- feature 4: state-writer tool declaration + run-scoped state store ------
