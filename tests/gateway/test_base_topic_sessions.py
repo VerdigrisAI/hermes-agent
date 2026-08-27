@@ -312,7 +312,11 @@ class TestBasePlatformTopicSessions:
         adapter.set_message_handler(
             lambda _event: asyncio.sleep(
                 0,
-                result="Chart attached.\n![chart](https://example.com/chart.png)",
+                result=(
+                    "Charts attached.\n"
+                    "![first](https://example.com/first.png)\n"
+                    "![second](https://example.com/second.png)"
+                ),
             )
         )
         adapter._keep_typing = hold_typing
@@ -327,8 +331,10 @@ class TestBasePlatformTopicSessions:
         )
 
         assert len(adapter.sent) == 2
-        assert adapter.sent[0]["content"] == "Chart attached."
+        assert adapter.sent[0]["content"] == "Charts attached."
         assert "was not attached" in adapter.sent[1]["content"]
+        assert "2-image batch" in adapter.sent[1]["content"]
+        assert "first.png" not in adapter.sent[1]["content"]
 
     @pytest.mark.asyncio
     async def test_media_only_image_failure_records_visible_notice_delivery(self):
@@ -357,6 +363,7 @@ class TestBasePlatformTopicSessions:
         assert event.delivery_state.reply_delivered is True
         assert len(adapter.sent) == 1
         assert "was not attached" in adapter.sent[0]["content"]
+        assert "1-image batch" in adapter.sent[0]["content"]
         assert adapter.processing_hooks[-1] == (
             "complete",
             "1",
@@ -785,6 +792,12 @@ class TestTelegramAutoTtsCaptionDelivery:
                 "metadata": {"thread_id": "17585", "notify": True},
             }
         ]
+        assert event.delivery_state.reply_failed is False
+        assert adapter.processing_hooks[-1] == (
+            "complete",
+            "voice-1",
+            ProcessingOutcome.SUCCESS,
+        )
 
     @pytest.mark.asyncio
     async def test_telegram_auto_tts_send_failure_keeps_followup_text(self, tmp_path):
@@ -814,3 +827,9 @@ class TestTelegramAutoTtsCaptionDelivery:
                 "metadata": {"thread_id": "17585", "notify": True},
             }
         ]
+        assert event.delivery_state.reply_failed is False
+        assert adapter.processing_hooks[-1] == (
+            "complete",
+            "voice-1",
+            ProcessingOutcome.SUCCESS,
+        )

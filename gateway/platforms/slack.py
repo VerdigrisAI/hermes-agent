@@ -472,7 +472,7 @@ class SlackAdapter(BasePlatformAdapter):
             return f"Slack attachment access failed for {file_label} because the bot does not have permission ({error}). Check workspace permissions/scopes and reinstall if needed."
         return None
 
-    def _describe_slack_download_failure(self, exc: Exception, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    def _describe_slack_download_failure(self, exc: Exception, *, file_obj: Optional[Dict[str, Any]] = None) -> str:
         """Translate Slack download exceptions into user-facing attachment diagnostics."""
         file_label = str((file_obj or {}).get("name") or (file_obj or {}).get("id") or "this attachment")
 
@@ -501,7 +501,10 @@ class SlackAdapter(BasePlatformAdapter):
                 f"Slack attachment access failed for {file_label}: Slack returned an HTML/login or non-media response. "
                 "This usually means a scope, auth, or file-permission problem."
             )
-        return None
+        return (
+            f"Slack attachment {file_label} could not be downloaded after retries "
+            f"({type(exc).__name__})."
+        )
 
     async def _resolve_slack_file_object(
         self,
@@ -1767,16 +1770,20 @@ class SlackAdapter(BasePlatformAdapter):
             await self._add_reaction(channel_id, ts, "white_check_mark")
         elif reactions_enabled and outcome == ProcessingOutcome.FAILURE:
             failure_signaled = await self._add_reaction(channel_id, ts, "x")
+        reply_terminally_delivered = (
+            event.delivery_state.reply_delivered
+            and not event.delivery_state.reply_failed
+        )
         terminal_signal_delivered = (
             outcome in {ProcessingOutcome.SUCCESS, ProcessingOutcome.CANCELLED}
             or failure_signaled
-            or event.delivery_state.reply_delivered
+            or reply_terminally_delivered
         )
         if (
             outcome == ProcessingOutcome.FAILURE
             and required_reply
             and not failure_signaled
-            and not event.delivery_state.reply_delivered
+            and not reply_terminally_delivered
         ):
             fallback_result = await self._send_with_retry(
                 chat_id=channel_id,
@@ -2629,6 +2636,11 @@ class SlackAdapter(BasePlatformAdapter):
                         logger.warning("[Slack] %s", detail)
                     else:
                         logger.warning("[Slack] Failed to cache audio from %s: %s", url, e, exc_info=True)
+            elif mimetype.startswith("video/"):
+                attachment_notices.append(
+                    "Slack video attachment "
+                    f"{f.get('name') or f.get('id') or 'unknown'} is not supported."
+                )
             elif (
                 (url and not mimetype.startswith(("image/", "audio/", "video/")))
                 or mimetype in SUPPORTED_DOCUMENT_TYPES.values()

@@ -59,12 +59,13 @@ async def report_media_delivery_failure(
     file_path: str,
     metadata: dict | None,
     detail: str,
+    display_name: str | None = None,
 ) -> bool:
     """Log a structured artifact failure and make it visible to the user."""
     from agent.redact import redact_sensitive_text
 
     correlation_id = media_delivery_correlation_id(file_path)
-    filename = Path(file_path).name or "generated artifact"
+    filename = display_name or Path(file_path).name or "generated artifact"
     safe_detail = redact_sensitive_text(str(detail or "upload failed"), force=True)
     safe_detail = " ".join(safe_detail.split())[:300]
     logger.error(
@@ -3472,7 +3473,8 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
-                        _record_delivery(tts_result)
+                        if getattr(tts_result, "success", False):
+                            _record_delivery(tts_result)
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -3541,6 +3543,7 @@ class BasePlatformAdapter(ABC):
                                 file_path=images[0][0],
                                 metadata=_thread_metadata,
                                 detail=str(image_result.error or "upload returned no success confirmation"),
+                                display_name=f"{len(images)}-image batch",
                             )
                             _record_delivery(SendResult(success=notice_delivered))
                     except Exception as batch_err:
@@ -3552,6 +3555,7 @@ class BasePlatformAdapter(ABC):
                             file_path=images[0][0],
                             metadata=_thread_metadata,
                             detail=str(batch_err),
+                            display_name=f"{len(images)}-image batch",
                         )
                         _record_delivery(SendResult(success=notice_delivered))
 
@@ -3604,6 +3608,7 @@ class BasePlatformAdapter(ABC):
                                 file_path=_image_paths[0],
                                 metadata=_thread_metadata,
                                 detail=str(image_result.error or "upload returned no success confirmation"),
+                                display_name=f"{len(_image_paths)}-image batch",
                             )
                             _record_delivery(SendResult(success=notice_delivered))
                     except Exception as batch_err:
@@ -3615,6 +3620,7 @@ class BasePlatformAdapter(ABC):
                             file_path=_image_paths[0],
                             metadata=_thread_metadata,
                             detail=str(batch_err),
+                            display_name=f"{len(_image_paths)}-image batch",
                         )
                         _record_delivery(SendResult(success=notice_delivered))
 

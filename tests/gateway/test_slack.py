@@ -1105,7 +1105,7 @@ class TestIncomingDocumentHandling:
         assert msg_event.media_types == ["application/pdf"]
 
     @pytest.mark.asyncio
-    async def test_video_url_does_not_emit_unsupported_document_notice(self, adapter):
+    async def test_video_url_emits_explicit_unsupported_notice(self, adapter):
         with patch.object(
             adapter, "_download_slack_file_bytes", new_callable=AsyncMock
         ) as download:
@@ -1118,7 +1118,8 @@ class TestIncomingDocumentHandling:
             await adapter._handle_slack_message(event)
 
         msg_event = adapter.handle_message.call_args[0][0]
-        assert "unsupported file type" not in msg_event.text
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "clip.mp4 is not supported" in msg_event.text
         download.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1445,6 +1446,46 @@ class TestIncomingDocumentHandling:
         assert "[Slack attachment notice]" in msg_event.text
         assert "403" in msg_event.text
         assert "what's in this?" in msg_event.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_kind", ["timeout", "429", "500"])
+    async def test_retry_exhaustion_is_surfaced_in_message_text(
+        self,
+        adapter,
+        failure_kind,
+    ):
+        import httpx
+
+        req = httpx.Request("GET", "https://files.slack.com/photo.jpg")
+        if failure_kind == "timeout":
+            failure = httpx.ConnectTimeout("timed out", request=req)
+        else:
+            response = httpx.Response(int(failure_kind), request=req)
+            failure = httpx.HTTPStatusError(
+                failure_kind,
+                request=req,
+                response=response,
+            )
+
+        with patch.object(
+            adapter,
+            "_download_slack_file",
+            new_callable=AsyncMock,
+        ) as download:
+            download.side_effect = failure
+            event = self._make_event(text="what is in this?", files=[{
+                "id": "F123",
+                "mimetype": "image/jpeg",
+                "name": "photo.jpg",
+                "url_private_download": "https://files.slack.com/photo.jpg",
+                "size": 1024,
+            }])
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "photo.jpg could not be downloaded after retries" in msg_event.text
+        assert "what is in this?" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_rich_text_blocks_do_not_duplicate_plain_text(self, adapter):
@@ -2502,6 +2543,39 @@ class TestReactions:
         await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
         adapter.send.assert_not_awaited()
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_partial_delivery_failure_uses_text_when_reactions_are_disabled(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000011",
+            expects_reply=True,
+        )
+        event.delivery_state.reply_attempted = True
+        event.delivery_state.reply_delivered = True
+        event.delivery_state.reply_failed = True
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["reply_to"] == event.message_id
         assert event.message_id not in adapter._required_reply_message_ids
 
     @pytest.mark.asyncio
