@@ -26,6 +26,7 @@ from gateway.platforms.base import (
     ProcessingOutcome,
 )
 from gateway.session import SessionSource, build_session_key
+from gateway.run import _queued_reply_event
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +274,18 @@ class TestCommandBypassActiveSession:
             "/queue response was not sent back to the user"
         )
 
+    def test_queued_turn_preserves_the_original_reply_contract(self):
+        event = _make_event("/queue follow up")
+        event.expects_reply = True
+
+        queued = _queued_reply_event(event, "follow up")
+
+        assert queued.text == "follow up"
+        assert queued.message_id == event.message_id
+        assert queued.expects_reply is True
+        assert queued.delivery_state is event.delivery_state
+        assert event.delivery_state.completion_deferred is True
+
     @pytest.mark.asyncio
     async def test_failed_bypass_reply_completes_as_failure(self):
         """A failed direct command send must clear Slack lifecycle state."""
@@ -511,6 +524,68 @@ class TestNonBypassStillQueued:
             ProcessingOutcome.SUCCESS,
         )
         assert event.delivery_state.reply_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_clarify_text_defers_to_active_turn_when_owner_exists(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        active_event = _make_event("original question")
+        active_event.expects_reply = True
+        adapter._active_message_events[sk] = active_event
+        adapter._message_handler = AsyncMock(return_value="")
+        adapter._send_with_retry = AsyncMock()
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._send_with_retry.assert_not_awaited()
+        adapter._run_processing_hook.assert_not_awaited()
+        assert event.delivery_state.completion_deferred is True
+        assert any(
+            candidate is event
+            for candidate in active_event.delivery_state.completion_events
+        )
+        assert any(
+            candidate is event
+            for candidate in active_event.delivery_state.final_response_events
+        )
+
+    @pytest.mark.asyncio
+    async def test_clarify_ack_is_not_the_deferred_final_reply(self, monkeypatch):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        active_event = _make_event("original question")
+        active_event.expects_reply = True
+        adapter._active_message_events[sk] = active_event
+        adapter._message_handler = AsyncMock(return_value="Clarification received.")
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="ack-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._send_with_retry.assert_awaited_once()
+        adapter._run_processing_hook.assert_not_awaited()
+        assert event.delivery_state.reply_attempted is False
+        assert event.delivery_state.reply_delivered is False
 
 
 # ---------------------------------------------------------------------------

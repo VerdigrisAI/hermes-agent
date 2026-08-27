@@ -687,6 +687,8 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    reply_event=None,
+    pending_event=None,
 ):
     if config_data:
         import yaml
@@ -717,7 +719,9 @@ async def _run_with_agent(
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
-    if pending_text is not None:
+    if pending_event is not None:
+        adapter._pending_messages[session_key] = pending_event
+    elif pending_text is not None:
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
@@ -732,6 +736,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        reply_event=reply_event,
     )
     return adapter, result
 
@@ -958,6 +963,53 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
     assert "final response 1" in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_queued_turn_does_not_rewrite_first_response_targets(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    original = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    deferred = MessageEvent(
+        text="clarification",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="clarify-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+    )
+    original.delivery_state.final_response_events.extend([original, deferred])
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queued-reply-targets",
+        reply_event=original,
+        pending_event=queued,
+    )
+
+    assert original.delivery_state.reply_delivered is True
+    assert deferred.delivery_state.reply_delivered is True
+    assert original.delivery_state.final_response_events == []
+    assert result["_final_reply_events"] == [queued]
 
 
 @pytest.mark.asyncio

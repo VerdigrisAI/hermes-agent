@@ -874,6 +874,20 @@ def _record_send_result_delivery(event: MessageEvent, send_result: Any) -> bool:
     return delivered
 
 
+def _queued_reply_event(event: MessageEvent, text: str) -> MessageEvent:
+    """Create a queued turn that preserves the original reply contract."""
+    event.delivery_state.completion_deferred = True
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=event.source,
+        message_id=event.message_id,
+        channel_prompt=event.channel_prompt,
+        expects_reply=event.expects_reply,
+        delivery_state=event.delivery_state,
+    )
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -2920,24 +2934,39 @@ class GatewayRunner:
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
+            queued_during_drain = self._queue_during_drain_enabled()
+            if queued_during_drain:
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
-                ),
-                metadata=thread_meta,
-            )
+            notice_delivered = False
+            try:
+                send_result = await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=message,
+                    reply_to=(
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    metadata=thread_meta,
+                )
+                if not queued_during_drain:
+                    notice_delivered = _record_send_result_delivery(event, send_result)
+            except Exception as exc:
+                logger.debug("Failed to send draining notice: %s", exc)
+            if not queued_during_drain:
+                await adapter._run_processing_hook(
+                    "on_processing_complete",
+                    event,
+                    ProcessingOutcome.SUCCESS
+                    if notice_delivered
+                    else ProcessingOutcome.FAILURE,
+                )
             return True
 
         # Normal busy case (agent actively running a task)
@@ -2953,6 +2982,7 @@ class GatewayRunner:
         # to queue semantics so nothing is lost.
         effective_mode = self._busy_input_mode
         steered = False
+        steer_completion_deferred = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
             can_steer = (
@@ -2970,6 +3000,11 @@ class GatewayRunner:
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
+            else:
+                steer_completion_deferred = adapter.defer_event_to_active_response(
+                    session_key,
+                    event,
+                )
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -3089,7 +3124,7 @@ class GatewayRunner:
                 ),
                 metadata=thread_meta,
             )
-            if steered:
+            if steered and not steer_completion_deferred:
                 steer_ack_delivered = _record_send_result_delivery(
                     event,
                     send_result,
@@ -3097,7 +3132,7 @@ class GatewayRunner:
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
-        if steered:
+        if steered and not steer_completion_deferred:
             await adapter._run_processing_hook(
                 "on_processing_complete",
                 event,
@@ -6882,13 +6917,7 @@ class GatewayRunner:
                     return "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    queued_event = MessageEvent(
-                        text=queued_text,
-                        message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        channel_prompt=event.channel_prompt,
-                    )
+                    queued_event = _queued_reply_event(event, queued_text)
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
@@ -6909,13 +6938,7 @@ class GatewayRunner:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        queued_event = MessageEvent(
-                            text=steer_text,
-                            message_type=MessageType.TEXT,
-                            source=event.source,
-                            message_id=event.message_id,
-                            channel_prompt=event.channel_prompt,
-                        )
+                        queued_event = _queued_reply_event(event, steer_text)
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
@@ -6925,19 +6948,16 @@ class GatewayRunner:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
                         return f"⚠️ Steer failed: {exc}"
                     if accepted:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            adapter.defer_event_to_active_response(_quick_key, event)
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
                     return "Steer rejected (empty payload)."
                 # Running agent is missing or lacks steer() — fall back to queue.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    queued_event = MessageEvent(
-                        text=steer_text,
-                        message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        channel_prompt=event.channel_prompt,
-                    )
+                    queued_event = _queued_reply_event(event, steer_text)
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
@@ -17621,6 +17641,10 @@ class GatewayRunner:
                                     await _bg_result
                             except Exception:
                                 pass
+                    if reply_event is not None:
+                        # The current response has reached a terminal delivery
+                        # outcome. A later queued turn must not rewrite it.
+                        reply_event.delivery_state.final_response_events.clear()
                 # else: interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).

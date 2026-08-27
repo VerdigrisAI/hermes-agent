@@ -1007,6 +1007,7 @@ class MessageDeliveryState:
     merged_events: List[Any] = field(default_factory=list)
     completion_events: List[Any] = field(default_factory=list)
     final_response_events: List[Any] = field(default_factory=list)
+    completion_deferred: bool = False
 
 
 @dataclass
@@ -1405,6 +1406,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._active_message_events: Dict[str, MessageEvent] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -2731,6 +2733,7 @@ class BasePlatformAdapter(ABC):
         if guard is not None and current_guard is not guard:
             return
         del self._active_sessions[session_key]
+        self._active_message_events.pop(session_key, None)
 
     def _session_task_is_stale(self, session_key: str) -> bool:
         """Return True if the owner task for ``session_key`` is done/cancelled.
@@ -2791,6 +2794,7 @@ class BasePlatformAdapter(ABC):
         """
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
+        self._active_message_events[session_key] = event
 
         task = asyncio.create_task(self._process_message_background(event, session_key))
         self._session_tasks[session_key] = task
@@ -2800,11 +2804,34 @@ class BasePlatformAdapter(ABC):
             # Tests stub create_task() with lightweight sentinels that are not
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
+            self._active_message_events.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+        return True
+
+    def defer_event_to_active_response(
+        self,
+        session_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        """Attach an accepted input to the active turn's final reply."""
+        active_event = getattr(self, "_active_message_events", {}).get(session_key)
+        if active_event is None:
+            return False
+        state = active_event.delivery_state
+        if not state.final_response_events:
+            state.final_response_events.extend(
+                [active_event, *active_event.delivery_state.merged_events]
+            )
+        for deferred_event in [event, *event.delivery_state.merged_events]:
+            if all(existing is not deferred_event for existing in state.completion_events):
+                state.completion_events.append(deferred_event)
+            if all(existing is not deferred_event for existing in state.final_response_events):
+                state.final_response_events.append(deferred_event)
+        event.delivery_state.completion_deferred = True
         return True
 
     async def cancel_session_processing(
@@ -3039,7 +3066,8 @@ class BasePlatformAdapter(ABC):
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     _delivered = not event.expects_reply and not bool(_text)
                     if _text:
-                        event.delivery_state.reply_attempted = True
+                        if not event.delivery_state.completion_deferred:
+                            event.delivery_state.reply_attempted = True
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
@@ -3047,7 +3075,7 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_meta,
                         )
                         _delivered = bool(_r and _r.success)
-                        if _delivered:
+                        if _delivered and not event.delivery_state.completion_deferred:
                             event.delivery_state.reply_delivered = True
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -3058,11 +3086,14 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                     _delivered = False
-                await self._run_processing_hook(
-                    "on_processing_complete",
-                    event,
-                    ProcessingOutcome.SUCCESS if _delivered else ProcessingOutcome.FAILURE,
-                )
+                if not event.delivery_state.completion_deferred:
+                    await self._run_processing_hook(
+                        "on_processing_complete",
+                        event,
+                        ProcessingOutcome.SUCCESS
+                        if _delivered
+                        else ProcessingOutcome.FAILURE,
+                    )
                 return
 
             # Clarify text-capture bypass: if the agent is blocked on a
@@ -3097,11 +3128,16 @@ class BasePlatformAdapter(ABC):
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
-                        if not _text and event.expects_reply:
+                        deferred = self.defer_event_to_active_response(
+                            session_key,
+                            event,
+                        )
+                        if not _text and event.expects_reply and not deferred:
                             _text = "Thanks — I’ll continue with that."
                         _delivered = not event.expects_reply and not bool(_text)
                         if _text:
-                            event.delivery_state.reply_attempted = True
+                            if not deferred:
+                                event.delivery_state.reply_attempted = True
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
@@ -3109,7 +3145,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_meta,
                             )
                             _delivered = bool(_r and _r.success)
-                            if _delivered:
+                            if _delivered and not deferred:
                                 event.delivery_state.reply_delivered = True
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
@@ -3123,13 +3159,14 @@ class BasePlatformAdapter(ABC):
                             self.name, e, exc_info=True,
                         )
                         _delivered = False
-                    await self._run_processing_hook(
-                        "on_processing_complete",
-                        event,
-                        ProcessingOutcome.SUCCESS
-                        if _delivered
-                        else ProcessingOutcome.FAILURE,
-                    )
+                    if not event.delivery_state.completion_deferred:
+                        await self._run_processing_hook(
+                            "on_processing_complete",
+                            event,
+                            ProcessingOutcome.SUCCESS
+                            if _delivered
+                            else ProcessingOutcome.FAILURE,
+                        )
                     return
 
             if self._busy_session_handler is not None:
@@ -3256,6 +3293,8 @@ class BasePlatformAdapter(ABC):
                     completion_event,
                     outcome,
                 )
+
+        self._active_message_events[session_key] = event
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -3612,6 +3651,7 @@ class BasePlatformAdapter(ABC):
                 drain_task = asyncio.create_task(
                     self._process_message_background(pending_event, session_key)
                 )
+                self._active_message_events[session_key] = pending_event
                 # Hand ownership of the session to the drain task so
                 # stale-lock detection keeps working while it runs.
                 self._session_tasks[session_key] = drain_task
@@ -3724,6 +3764,7 @@ class BasePlatformAdapter(ABC):
                     drain_task = asyncio.create_task(
                         self._process_message_background(late_pending, session_key)
                     )
+                    self._active_message_events[session_key] = late_pending
                     # Hand ownership of the session to the drain task so stale-lock
                     # detection keeps working while it runs.
                     self._session_tasks[session_key] = drain_task
@@ -3756,6 +3797,8 @@ class BasePlatformAdapter(ABC):
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     del self._session_tasks[session_key]
+                    if self._active_message_events.get(session_key) is event:
+                        del self._active_message_events[session_key]
                     self._release_session_guard(session_key, guard=interrupt_event)
     
     async def cancel_background_tasks(self) -> None:
