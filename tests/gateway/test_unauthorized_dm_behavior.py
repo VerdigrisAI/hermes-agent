@@ -386,6 +386,7 @@ async def test_handle_message_drops_anonymous_sender_outside_allowlist(monkeypat
     event = MessageEvent(
         text="hi",
         message_id="m1",
+        expects_reply=True,
         source=SessionSource(
             platform=Platform.TELEGRAM,
             user_id=None,
@@ -398,6 +399,7 @@ async def test_handle_message_drops_anonymous_sender_outside_allowlist(monkeypat
     result = await runner._handle_message(event)
 
     assert result is None
+    assert event.expects_reply is False
     must_not_run.assert_not_called()
     runner.pairing_store.generate_code.assert_not_called()
     adapter.send.assert_not_awaited()
@@ -627,11 +629,16 @@ async def test_signal_with_allowlist_ignores_unauthorized_dm(monkeypatch):
     )
     runner, adapter = _make_runner(Platform.SIGNAL, config)
 
-    result = await runner._handle_message(
-        _make_event(Platform.SIGNAL, "+15559999999", "+15559999999")  # not in allowlist
+    event = _make_event(
+        Platform.SIGNAL,
+        "+15559999999",
+        "+15559999999",
     )
+    event.expects_reply = True
+    result = await runner._handle_message(event)  # not in allowlist
 
     assert result is None
+    assert event.expects_reply is False
     runner.pairing_store.generate_code.assert_not_called()
     adapter.send.assert_not_awaited()
 
