@@ -11494,8 +11494,8 @@ class GatewayRunner:
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            media_files, _ = adapter.extract_media(response)
-            extracted_images, cleaned = adapter.extract_images(response)
+            media_files, cleaned = adapter.extract_media(response)
+            extracted_images, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
 
             for file_path, _ in media_files:
