@@ -1003,8 +1003,10 @@ class MessageDeliveryState:
     """Delivery evidence shared across copies of one inbound event."""
 
     reply_delivered: bool = False
+    reply_attempted: bool = False
     merged_events: List[Any] = field(default_factory=list)
     completion_events: List[Any] = field(default_factory=list)
+    final_response_events: List[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -3017,13 +3019,18 @@ class BasePlatformAdapter(ABC):
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
+                    _delivered = not event.expects_reply and not bool(_text)
                     if _text:
+                        event.delivery_state.reply_attempted = True
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_thread_meta,
                         )
+                        _delivered = bool(_r and _r.success)
+                        if _delivered:
+                            event.delivery_state.reply_delivered = True
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -3032,6 +3039,12 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                    _delivered = False
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    event,
+                    ProcessingOutcome.SUCCESS if _delivered else ProcessingOutcome.FAILURE,
+                )
                 return
 
             # Clarify text-capture bypass: if the agent is blocked on a
@@ -3162,17 +3175,54 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
-        # Track delivery outcomes for the processing-complete hook
-        delivery_attempted = False
-        delivery_succeeded = False
-
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
             if result is None:
                 return
-            delivery_attempted = True
+            delivery_targets = (
+                event.delivery_state.final_response_events
+                or [event, *event.delivery_state.merged_events]
+            )
+            for delivery_event in delivery_targets:
+                delivery_event.delivery_state.reply_attempted = True
             if getattr(result, "success", False):
-                delivery_succeeded = True
+                for delivery_event in delivery_targets:
+                    delivery_event.delivery_state.reply_delivered = True
+
+        async def _complete_delivery_events(
+            default_outcome: ProcessingOutcome,
+        ) -> None:
+            pending_completion_events = [
+                event,
+                *event.delivery_state.merged_events,
+                *event.delivery_state.completion_events,
+            ]
+            seen_event_ids: set[int] = set()
+            while pending_completion_events:
+                completion_event = pending_completion_events.pop(0)
+                if id(completion_event) in seen_event_ids:
+                    continue
+                seen_event_ids.add(id(completion_event))
+                pending_completion_events.extend(
+                    completion_event.delivery_state.merged_events
+                )
+                delivery_state = completion_event.delivery_state
+                if delivery_state.reply_attempted or completion_event.expects_reply:
+                    outcome = (
+                        ProcessingOutcome.SUCCESS
+                        if delivery_state.reply_delivered
+                        else (
+                            ProcessingOutcome.FAILURE
+                            if default_outcome == ProcessingOutcome.SUCCESS
+                            else default_outcome
+                        )
+                    )
+                else:
+                    outcome = default_outcome
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    completion_event,
+                    outcome,
+                )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -3499,28 +3549,7 @@ class BasePlatformAdapter(ABC):
                         )
 
             # Determine overall success for the processing hook
-            processing_ok = (
-                delivery_succeeded
-                if delivery_attempted
-                else event.delivery_state.reply_delivered
-                or (not bool(response) and not event.expects_reply)
-            )
-            await self._run_processing_hook(
-                "on_processing_complete",
-                event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
-            )
-            completion_outcome = (
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE
-            )
-            for completion_event in event.delivery_state.completion_events:
-                if processing_ok:
-                    completion_event.delivery_state.reply_delivered = True
-                await self._run_processing_hook(
-                    "on_processing_complete",
-                    completion_event,
-                    completion_outcome,
-                )
+            await _complete_delivery_events(ProcessingOutcome.SUCCESS)
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
@@ -3566,10 +3595,10 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
-            await self._run_processing_hook("on_processing_complete", event, outcome)
+            await _complete_delivery_events(outcome)
             raise
         except Exception as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            await _complete_delivery_events(ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:

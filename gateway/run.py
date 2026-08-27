@@ -844,19 +844,32 @@ _TOOL_MEDIA_RE = re.compile(
 )
 
 
+def _record_reply_attempt(event: MessageEvent) -> list[MessageEvent]:
+    """Record an attempted reply and return the events that reply serves."""
+    targets = (
+        event.delivery_state.final_response_events
+        or [event, *event.delivery_state.merged_events]
+    )
+    for target in targets:
+        target.delivery_state.reply_attempted = True
+    return targets
+
+
 def _record_confirmed_reply_delivery(event: MessageEvent, agent_result: dict) -> bool:
     """Record confirmed out-of-band delivery and return whether it occurred."""
     if not agent_result.get("already_sent") or agent_result.get("failed"):
         return False
-    event.delivery_state.reply_delivered = True
+    for target in _record_reply_attempt(event):
+        target.delivery_state.reply_delivered = True
     return True
 
 
 def _record_send_result_delivery(event: MessageEvent, send_result: Any) -> bool:
     """Record a direct adapter send only when the adapter confirms success."""
     delivered = bool(send_result is not None and getattr(send_result, "success", False))
-    if delivered:
-        event.delivery_state.reply_delivered = True
+    for target in _record_reply_attempt(event):
+        if delivered:
+            target.delivery_state.reply_delivered = True
     return delivered
 
 
@@ -8481,9 +8494,13 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                reply_event=event,
             )
             event.delivery_state.completion_events.extend(
                 agent_result.pop("_reply_events", [])
+            )
+            event.delivery_state.final_response_events.extend(
+                agent_result.pop("_final_reply_events", [])
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -15502,6 +15519,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        reply_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17529,14 +17547,26 @@ class GatewayRunner:
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
+                            if reply_event is not None:
+                                _record_reply_attempt(reply_event)
+                            first_send_result = await adapter._send_with_retry(
+                                chat_id=source.chat_id,
+                                content=first_response,
                                 metadata=_status_thread_metadata,
                             )
+                            if reply_event is not None:
+                                _record_send_result_delivery(
+                                    reply_event,
+                                    first_send_result,
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
+                        if reply_event is not None:
+                            _record_confirmed_reply_delivery(
+                                reply_event,
+                                {"already_sent": True, "failed": False},
+                            )
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
@@ -17617,7 +17647,15 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    reply_event=pending_event,
                 )
+                if pending_event is not None and not followup_result.get(
+                    "_final_reply_events"
+                ):
+                    followup_result["_final_reply_events"] = [
+                        pending_event,
+                        *pending_event.delivery_state.merged_events,
+                    ]
                 followup_result["_reply_events"] = _merge_followup_reply_events(
                     pending_event,
                     followup_result,

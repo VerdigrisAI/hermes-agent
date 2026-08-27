@@ -13,12 +13,18 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+)
 from gateway.session import SessionSource, build_session_key
 
 
@@ -266,6 +272,49 @@ class TestCommandBypassActiveSession:
         assert any("handled:queue" in r for r in adapter.sent_responses), (
             "/queue response was not sent back to the user"
         )
+
+    @pytest.mark.asyncio
+    async def test_failed_bypass_reply_completes_as_failure(self):
+        """A failed direct command send must clear Slack lifecycle state."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None)
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/status")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.FAILURE,
+        )
+        assert event.delivery_state.reply_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_successful_bypass_reply_records_delivery(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="reply-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/status")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_delivered is True
 
 
 # ---------------------------------------------------------------------------

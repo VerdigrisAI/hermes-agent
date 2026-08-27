@@ -99,6 +99,60 @@ def test_direct_send_records_only_confirmed_delivery_across_rewrite():
     assert event.delivery_state.reply_delivered is True
 
 
+def test_final_send_records_only_the_queued_response_target():
+    original = _make_event()
+    queued = _make_event(text="follow up")
+    original.delivery_state.final_response_events.append(queued)
+
+    delivered = _record_send_result_delivery(
+        original,
+        SendResult(success=True, message_id="reply-2"),
+    )
+
+    assert delivered is True
+    assert original.delivery_state.reply_delivered is False
+    assert queued.delivery_state.reply_delivered is True
+
+
+def test_failed_first_send_is_not_hidden_by_queued_success():
+    original = _make_event()
+    queued = _make_event(text="follow up")
+
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=False, error="network down"),
+    ) is False
+    original.delivery_state.final_response_events.append(queued)
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=True, message_id="reply-2"),
+    ) is True
+
+    assert original.delivery_state.reply_attempted is True
+    assert original.delivery_state.reply_delivered is False
+    assert queued.delivery_state.reply_attempted is True
+    assert queued.delivery_state.reply_delivered is True
+
+
+def test_failed_queued_send_is_not_hidden_by_first_success():
+    original = _make_event()
+    queued = _make_event(text="follow up")
+
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=True, message_id="reply-1"),
+    ) is True
+    original.delivery_state.final_response_events.append(queued)
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=False, error="network down"),
+    ) is False
+
+    assert original.delivery_state.reply_delivered is True
+    assert queued.delivery_state.reply_attempted is True
+    assert queued.delivery_state.reply_delivered is False
+
+
 # ===================================================================
 # Test 1: base.py — stale response suppressed on interrupt (#8221)
 # ===================================================================

@@ -257,6 +257,7 @@ class TestBasePlatformTopicSessions:
 
         async def handler(event):
             event.delivery_state.completion_events.append(queued)
+            event.delivery_state.final_response_events.append(queued)
             return "queued answer"
 
         adapter.set_message_handler(handler)
@@ -268,8 +269,66 @@ class TestBasePlatformTopicSessions:
         assert queued.delivery_state.reply_delivered is True
         assert adapter.processing_hooks == [
             ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+            ("complete", "2", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_merged_reply_events_complete_once_with_their_own_outcome(self):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        merged = _make_event("-1001", "17585", message_id="2", expects_reply=True)
+
+        async def handler(event):
+            event.delivery_state.merged_events.extend([merged, merged])
+            return "combined answer"
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert event.delivery_state.reply_delivered is True
+        assert merged.delivery_state.reply_delivered is True
+        assert adapter.processing_hooks == [
+            ("start", "1"),
             ("complete", "1", ProcessingOutcome.SUCCESS),
             ("complete", "2", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_queued_turns_keep_distinct_delivery_outcomes(self):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        second = _make_event("-1001", "17585", message_id="2", expects_reply=True)
+        third = _make_event("-1001", "17585", message_id="3", expects_reply=True)
+
+        async def handler(event):
+            event.delivery_state.reply_attempted = True
+            event.delivery_state.reply_delivered = True
+            second.delivery_state.reply_attempted = True
+            event.delivery_state.completion_events.extend([second, third])
+            event.delivery_state.final_response_events.append(third)
+            return "third answer"
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.SUCCESS),
+            ("complete", "2", ProcessingOutcome.FAILURE),
+            ("complete", "3", ProcessingOutcome.SUCCESS),
         ]
 
     @pytest.mark.asyncio
