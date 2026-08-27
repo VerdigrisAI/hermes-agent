@@ -765,6 +765,7 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    adapter._test_runner = runner
     runner._draining = draining
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
@@ -1254,6 +1255,7 @@ async def test_recursion_limit_preserves_current_turn_before_staged_queue(
 
     session_key = "agent:main:telegram:group:-1001:17585"
     assert adapter._pending_messages[session_key] is first
+    assert adapter._test_runner._queued_events[session_key] == [second]
 
 
 @pytest.mark.asyncio
