@@ -5,7 +5,7 @@ import importlib
 import sys
 import time
 import types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1260,6 +1260,14 @@ async def test_failed_drain_completes_each_queued_delivery_outcome():
         )
         for index in range(3)
     ]
+    merged = MessageEvent(
+        text="merged",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="outcome-merged",
+        expects_reply=True,
+    )
+    queued[0].delivery_state.merged_events.append(merged)
     adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
     adapter._send_with_retry = AsyncMock(
         side_effect=[
@@ -1281,12 +1289,96 @@ async def test_failed_drain_completes_each_queued_delivery_outcome():
     outcomes = [call.args[1] for call in adapter.on_processing_complete.await_args_list]
     assert outcomes == [
         ProcessingOutcome.SUCCESS,
+        ProcessingOutcome.SUCCESS,
         ProcessingOutcome.FAILURE,
         ProcessingOutcome.FAILURE,
     ]
     assert queued[0].delivery_state.reply_delivered is True
+    assert merged.delivery_state.reply_delivered is True
     assert queued[1].delivery_state.reply_delivered is False
     assert queued[2].delivery_state.reply_delivered is False
+
+
+def test_pending_event_order_accepts_mixed_timezone_timestamps():
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    aware = MessageEvent(
+        text="aware first",
+        message_type=MessageType.TEXT,
+        source=source,
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    naive = MessageEvent(
+        text="naive second",
+        message_type=MessageType.TEXT,
+        source=source,
+        timestamp=datetime(2026, 1, 1, 0, 0, 1),
+    )
+
+    first = runner._merge_pending_events_by_arrival(
+        "session",
+        adapter,
+        naive,
+        aware,
+    )
+
+    assert first is aware
+    assert adapter._pending_messages["session"] is naive
+
+
+@pytest.mark.asyncio
+async def test_repeated_run_failures_promote_every_overflow_turn(monkeypatch, tmp_path):
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"failure-chain-{index}",
+            expects_reply=True,
+        )
+        for index in range(2)
+    ]
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._pending_messages[session_key] = queued[0]
+    runner._queued_events = {session_key: [queued[1]]}
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RaisingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    for expected in queued:
+        with pytest.raises(RuntimeError, match="agent failed"):
+            await runner._run_agent(
+                message="hello",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="sess-repeated-failure",
+                session_key=session_key,
+            )
+        assert adapter._pending_messages.pop(session_key) is expected
+
+    assert session_key not in runner._queued_events
 
 
 @pytest.mark.asyncio

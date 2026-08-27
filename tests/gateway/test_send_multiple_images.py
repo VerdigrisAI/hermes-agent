@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
@@ -458,9 +458,7 @@ class TestSlackMultiImage:
 
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_not_called()
-        adapter.send.assert_awaited_once()
-        notice = adapter.send.await_args.args[1]
-        assert "failed the Slack artifact policy" in notice
+        adapter.send.assert_not_awaited()
         assert result.success is False
 
 
@@ -555,6 +553,7 @@ class TestEmailMultiImage:
         a._smtp_host = "smtp.example.com"
         a._smtp_port = 587
         a._thread_context = {}
+        a.platform = Platform.EMAIL
         return a
 
     def test_local_files_attached_in_single_email(self, adapter, tmp_path):
@@ -609,6 +608,24 @@ class TestEmailMultiImage:
             result = _run(adapter.send_multiple_images("user@example.com", images))
 
         assert result.success is False
+
+    def test_attachment_read_failure_uses_per_image_fallback(self, adapter, tmp_path):
+        image = tmp_path / "unreadable.png"
+        image.write_bytes(b"image")
+        adapter.send_image_file = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
+
+        with patch("builtins.open", side_effect=OSError("read failed")):
+            result = _run(
+                adapter.send_multiple_images(
+                    "user@example.com",
+                    [(f"file://{image}", "image")],
+                )
+            )
+
+        assert result.success is True
+        adapter.send_image_file.assert_awaited_once()
 
     def test_empty_noop(self, adapter):
         with patch.object(

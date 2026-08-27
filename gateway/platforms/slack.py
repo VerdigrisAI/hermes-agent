@@ -1467,9 +1467,6 @@ class SlackAdapter(BasePlatformAdapter):
                                 local_path, local_bytes = self._prepare_local_upload(local_path)
                             except (FileNotFoundError, _SlackUploadPolicyError) as exc:
                                 logger.warning("[Slack] Skipping disallowed local image: %s", exc)
-                                initial_comment_parts.append(
-                                    "⚠️ One local image was not attached because it failed the Slack artifact policy."
-                                )
                                 all_delivered = False
                                 last_error = str(exc)
                                 continue
@@ -1508,17 +1505,6 @@ class SlackAdapter(BasePlatformAdapter):
                                 continue
 
                 if not file_uploads:
-                    if initial_comment_parts:
-                        comment_result = await self.send(
-                            chat_id,
-                            "\n".join(initial_comment_parts),
-                            metadata=metadata,
-                        )
-                        if not comment_result.success:
-                            all_delivered = False
-                            last_error = str(
-                                comment_result.error or "image caption send failed"
-                            )
                     continue
 
                 initial_comment = "\n".join(initial_comment_parts) if initial_comment_parts else ""
@@ -1799,8 +1785,13 @@ class SlackAdapter(BasePlatformAdapter):
                 metadata={"thread_id": event.source.thread_id or ts},
             )
             terminal_signal_delivered = bool(fallback_result.success)
-        if terminal_signal_delivered:
-            self._required_reply_message_ids.discard(ts)
+        if not terminal_signal_delivered:
+            logger.error(
+                "[Slack] Exhausted terminal reply delivery for message %s in channel %s",
+                ts,
+                channel_id,
+            )
+        self._required_reply_message_ids.discard(ts)
 
     # ----- User identity resolution -----
 

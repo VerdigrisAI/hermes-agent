@@ -2563,6 +2563,34 @@ class TestReactions:
         assert event.message_id not in adapter._required_reply_message_ids
 
     @pytest.mark.asyncio
+    async def test_required_failure_clears_state_after_delivery_exhaustion(
+        self, adapter, monkeypatch
+    ):
+        adapter._add_reaction = AsyncMock(return_value=False)
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="Slack unavailable")
+        )
+        monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", AsyncMock())
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000011",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        assert adapter.send.await_count > 1
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
     async def test_discard_reply_requirement_clears_slack_lifecycle_state(self, adapter):
         event = MessageEvent(
             text="ignored",

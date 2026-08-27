@@ -2438,7 +2438,7 @@ class GatewayRunner:
         if staged is not None:
             ordered.append(staged)
         ordered.extend(queued_events.pop(session_key, []))
-        ordered.sort(key=lambda event: event.timestamp)
+        ordered.sort(key=lambda event: event.timestamp.timestamp())
         if not ordered:
             return None
 
@@ -2562,7 +2562,6 @@ class GatewayRunner:
             getattr(self, "_queued_events", {}).pop(session_key, [])
         )
         for queued_event in queued_events:
-            delivered = False
             try:
                 rejection_result = await adapter._send_with_retry(
                     chat_id=queued_event.source.chat_id,
@@ -2576,7 +2575,7 @@ class GatewayRunner:
                         self._reply_anchor_for_event(queued_event),
                     ),
                 )
-                delivered = _record_send_result_delivery(
+                _record_send_result_delivery(
                     queued_event,
                     rejection_result,
                 )
@@ -2586,11 +2585,25 @@ class GatewayRunner:
                     exc,
                 )
                 _record_reply_attempt(queued_event)
-            await adapter._run_processing_hook(
-                "on_processing_complete",
+            completion_events = [
                 queued_event,
-                ProcessingOutcome.SUCCESS if delivered else ProcessingOutcome.FAILURE,
-            )
+                *queued_event.delivery_state.merged_events,
+                *queued_event.delivery_state.completion_events,
+            ]
+            seen_event_ids: set[int] = set()
+            for completion_event in completion_events:
+                if id(completion_event) in seen_event_ids:
+                    continue
+                seen_event_ids.add(id(completion_event))
+                await adapter._run_processing_hook(
+                    "on_processing_complete",
+                    completion_event,
+                    (
+                        ProcessingOutcome.SUCCESS
+                        if completion_event.delivery_state.reply_delivered
+                        else ProcessingOutcome.FAILURE
+                    ),
+                )
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
@@ -18017,6 +18030,17 @@ class GatewayRunner:
                     session_key,
                     source,
                 )
+            elif session_key:
+                adapter = self.adapters.get(source.platform)
+                if adapter is not None:
+                    pending_event = _dequeue_pending_event(adapter, session_key)
+                    pending_event = self._promote_queued_event(
+                        session_key,
+                        adapter,
+                        pending_event,
+                    )
+                    if pending_event is not None:
+                        self._prepend_fifo(session_key, pending_event, adapter)
             raise
         finally:
             # Stop progress sender, interrupt monitor, and notification task
