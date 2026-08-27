@@ -3364,6 +3364,23 @@ class TestFailedLocalUploadReporting:
         adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_send_voice_failure_does_not_expose_path(self, adapter, tmp_path):
+        test_file = tmp_path / "voice.mp3"
+        test_file.write_bytes(b"ID3")
+        adapter._app.client.files_upload_v2 = AsyncMock(
+            side_effect=Exception(f"upload failed at {test_file}")
+        )
+
+        result = await adapter.send_voice(
+            chat_id="C123",
+            audio_path=str(test_file),
+        )
+
+        assert not result.success
+        assert "Slack audio upload failed" in result.error
+        assert str(tmp_path) not in result.error
+
+    @pytest.mark.asyncio
     async def test_send_document_failure_does_not_post_path_fallback(
         self, adapter, tmp_path
     ):
