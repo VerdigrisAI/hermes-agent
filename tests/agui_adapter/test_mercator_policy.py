@@ -16,7 +16,8 @@ from agui_adapter.server import MERCATOR_ACCEPTANCE_POLICY_API
 
 
 class _Contract:
-    policy_api_version = 1
+    policy_api_version = MERCATOR_ACCEPTANCE_POLICY_API
+    chat_only = False
     allow_core_tools = False
     use_hermes_approvals = False
     allow_inherited_approval_state = False
@@ -181,6 +182,25 @@ def test_policy_bound_factory_injects_exact_frontend_surface(monkeypatch) -> Non
     assert contract.started == ["arn_123"]
 
 
+def test_policy_bound_factory_advertises_no_tools_for_chat_only_contract(monkeypatch) -> None:
+    contract = _Contract()
+    contract.chat_only = True
+    captured = {}
+
+    async def fake_stream(run_input, encoder, config, headers, policy_contract=None):
+        captured["names"] = {tool.name for tool in run_input.tools}
+        captured["contract"] = policy_contract
+        yield "data: {}\n\n"
+
+    monkeypatch.setattr(server, "_event_stream", fake_stream)
+    client = TestClient(server.create_mercator_acceptance_app(contract=contract))
+    response = client.post("/", json=_body())
+
+    assert response.status_code == 200
+    assert captured == {"names": set(), "contract": contract}
+    assert contract.started == ["arn_123"]
+
+
 @pytest.mark.parametrize(
     "attr, value, fragment",
     [
@@ -190,6 +210,7 @@ def test_policy_bound_factory_injects_exact_frontend_surface(monkeypatch) -> Non
         ("policy_api_version", float(MERCATOR_ACCEPTANCE_POLICY_API), "policy API"),
         ("policy_api_version", None, "policy API"),
         ("allow_core_tools", True, "core tools"),
+        ("chat_only", "yes", "chat-only"),
         ("server_toolsets", ("hermes-acp",), "zero server tools"),
         ("server_tool_names", ("terminal",), "zero server tools"),
         ("use_hermes_approvals", True, "approval state"),

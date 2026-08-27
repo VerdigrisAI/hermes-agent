@@ -82,7 +82,7 @@ resume_shim.install()
 
 _FORWARD_HEADERS = ("x-aimock-context", "x-test-id", "x-aimock-strict")
 
-MERCATOR_ACCEPTANCE_POLICY_API = 1
+MERCATOR_ACCEPTANCE_POLICY_API = 2
 
 
 def _new_message_id(prefix: str = "msg") -> str:
@@ -765,7 +765,8 @@ def create_mercator_acceptance_app(*, contract) -> FastAPI:
     Authentication remains Mercator's outer ASGI responsibility. This inner
     app rejects client-selected tools, advertises only the exact registry
     supplied by Mercator, copies its verified principal context into the worker
-    thread, and authorizes every frontend handoff before emitting it.
+    thread, and authorizes every frontend handoff before emitting it. A
+    server-selected chat-only contract advertises no tools to the model.
     """
     # `type(...) is not int` rather than `isinstance`: bool subclasses int, so
     # isinstance would admit True, and `True != 1` is False. A loosely typed
@@ -784,6 +785,9 @@ def create_mercator_acceptance_app(*, contract) -> FastAPI:
         raise ValueError("Mercator acceptance must disable Hermes approval state")
     if getattr(contract, "allow_inherited_approval_state", True):
         raise ValueError("Mercator acceptance must reject inherited approval state")
+    chat_only = getattr(contract, "chat_only", None)
+    if type(chat_only) is not bool:
+        raise ValueError("Mercator acceptance chat-only mode must be explicit")
     schemas = contract.frontend_tool_schemas()
     if not isinstance(schemas, list) or not schemas:
         raise ValueError("Mercator acceptance frontend schemas are required")
@@ -812,7 +816,7 @@ def create_mercator_acceptance_app(*, contract) -> FastAPI:
             principal = contract.current_principal()
             if principal is None:
                 raise ValueError("verified Mercator principal is required")
-            body["tools"] = schemas
+            body["tools"] = [] if chat_only else schemas
             run_input = RunAgentInput.model_validate(body)
             if run_input.thread_id != principal.run_id:
                 raise ValueError("AG-UI thread must equal the verified acceptance run")
