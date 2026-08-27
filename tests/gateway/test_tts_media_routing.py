@@ -208,6 +208,26 @@ def _fake_runner(thread_meta):
 
 
 @pytest.mark.asyncio
+async def test_streaming_plain_text_has_no_media_delivery_outcome():
+    event = _event(thread_id="topic-1")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+    )
+
+    delivered = await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        "plain streamed response",
+        event,
+        adapter,
+    )
+
+    assert delivered is None
+
+
+@pytest.mark.asyncio
 async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sender():
     event = _event(thread_id="topic-1")
     adapter = SimpleNamespace(
