@@ -13,7 +13,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    report_media_delivery_failure,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -63,6 +69,56 @@ def _slack_event(*, chat_id="C123", chat_type="channel", thread_id=None):
         source=source,
         message_id="1785782926.578209",
     )
+
+
+@pytest.mark.asyncio
+async def test_media_failure_notice_retries_and_reports_delivery():
+    adapter = SimpleNamespace(
+        name="slack",
+        _send_with_retry=AsyncMock(
+            return_value=SendResult(success=True, message_id="notice")
+        ),
+    )
+
+    delivered = await report_media_delivery_failure(
+        adapter,
+        chat_id="C123",
+        thread_id="thread-1",
+        file_path="/tmp/report.pdf",
+        metadata={"thread_ts": "thread-1"},
+        detail="upload failed",
+    )
+
+    assert delivered is True
+    adapter._send_with_retry.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        SendResult(success=False, error="notice rejected"),
+        RuntimeError("notice transport failed"),
+    ],
+)
+async def test_media_failure_notice_reports_failed_delivery(side_effect):
+    sender = AsyncMock()
+    if isinstance(side_effect, Exception):
+        sender.side_effect = side_effect
+    else:
+        sender.return_value = side_effect
+    adapter = SimpleNamespace(name="slack", _send_with_retry=sender)
+
+    delivered = await report_media_delivery_failure(
+        adapter,
+        chat_id="C123",
+        thread_id="thread-1",
+        file_path="/tmp/report.pdf",
+        metadata={"thread_ts": "thread-1"},
+        detail="upload failed",
+    )
+
+    assert delivered is False
 
 
 @pytest.mark.asyncio

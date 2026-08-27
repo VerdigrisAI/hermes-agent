@@ -12,7 +12,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -1237,6 +1243,53 @@ async def test_failed_agent_drain_rejects_every_accepted_queued_turn(
 
 
 @pytest.mark.asyncio
+async def test_failed_drain_completes_each_queued_delivery_outcome():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"outcome-{index}",
+            expects_reply=True,
+        )
+        for index in range(3)
+    ]
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    adapter._send_with_retry = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="ok"),
+            SendResult(success=False, error="rejected"),
+            RuntimeError("send failed"),
+        ]
+    )
+    adapter.on_processing_complete = AsyncMock()
+    runner = _make_runner(adapter)
+    runner._draining = True
+    runner._restart_requested = True
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._pending_messages[session_key] = queued[0]
+    runner._queued_events = {session_key: queued[1:]}
+
+    await runner._reject_queued_events_after_failed_drain(session_key, source)
+
+    outcomes = [call.args[1] for call in adapter.on_processing_complete.await_args_list]
+    assert outcomes == [
+        ProcessingOutcome.SUCCESS,
+        ProcessingOutcome.FAILURE,
+        ProcessingOutcome.FAILURE,
+    ]
+    assert queued[0].delivery_state.reply_delivered is True
+    assert queued[1].delivery_state.reply_delivered is False
+    assert queued[2].delivery_state.reply_delivered is False
+
+
+@pytest.mark.asyncio
 async def test_early_return_preserves_a_late_steer_as_the_next_turn(
     monkeypatch,
     tmp_path,
@@ -1286,7 +1339,7 @@ async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
         source=source,
         message_id="queued-after-steer",
         expects_reply=True,
-        timestamp=datetime.now() + timedelta(seconds=1),
+        timestamp=datetime(2026, 1, 1, 0, 0, 1),
     )
     steer = MessageEvent(
         text="/steer late steer",
@@ -1294,7 +1347,7 @@ async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
         source=source,
         message_id="late-steer",
         expects_reply=True,
-        timestamp=datetime.now(),
+        timestamp=datetime(2026, 1, 1, 0, 0, 0),
     )
 
     _adapter, result = await _run_with_agent(
@@ -1326,7 +1379,7 @@ async def test_late_steer_runs_after_earlier_queued_turn(monkeypatch, tmp_path):
         source=source,
         message_id="queued-before-steer",
         expects_reply=True,
-        timestamp=datetime.now(),
+        timestamp=datetime(2026, 1, 1, 0, 0, 0),
     )
     steer = MessageEvent(
         text="/steer late steer",
@@ -1334,7 +1387,7 @@ async def test_late_steer_runs_after_earlier_queued_turn(monkeypatch, tmp_path):
         source=source,
         message_id="late-steer",
         expects_reply=True,
-        timestamp=datetime.now() + timedelta(seconds=1),
+        timestamp=datetime(2026, 1, 1, 0, 0, 1),
     )
 
     _adapter, result = await _run_with_agent(
@@ -1405,12 +1458,26 @@ async def test_media_only_result_is_not_replaced_by_empty_response(monkeypatch, 
 @pytest.mark.asyncio
 async def test_queued_followup_delivers_first_turn_tool_media(monkeypatch, tmp_path):
     QueuedMediaAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="media-owner",
+        expects_reply=True,
+    )
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
         QueuedMediaAgent,
         session_id="sess-queued-media",
         pending_text="queued follow-up",
+        reply_event=owner,
     )
 
     assert result["final_response"] == "queued response"
@@ -1419,6 +1486,8 @@ async def test_queued_followup_delivers_first_turn_tool_media(monkeypatch, tmp_p
         for call in adapter.sent
     )
     assert all("MEDIA:" not in call["content"] for call in adapter.sent)
+    assert owner.delivery_state.reply_attempted is True
+    assert owner.delivery_state.reply_delivered is True
 
 
 @pytest.mark.asyncio

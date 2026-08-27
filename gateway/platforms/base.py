@@ -59,7 +59,7 @@ async def report_media_delivery_failure(
     file_path: str,
     metadata: dict | None,
     detail: str,
-) -> None:
+) -> bool:
     """Log a structured artifact failure and make it visible to the user."""
     from agent.redact import redact_sensitive_text
 
@@ -78,14 +78,29 @@ async def report_media_delivery_failure(
         safe_detail,
     )
     try:
-        await adapter.send(
-            chat_id=chat_id,
-            content=(
+        send_kwargs = {
+            "chat_id": chat_id,
+            "content": (
                 f"⚠️ I created `{filename}`, but it was not attached: "
                 f"{safe_detail} (reference `{correlation_id}`)."
             ),
-            metadata=metadata,
+            "metadata": metadata,
+        }
+        send_with_retry = getattr(adapter, "_send_with_retry", None)
+        result = (
+            await send_with_retry(**send_kwargs)
+            if callable(send_with_retry)
+            else await adapter.send(**send_kwargs)
         )
+        delivered = bool(getattr(result, "success", False))
+        if not delivered:
+            logger.error(
+                "artifact_delivery correlation_id=%s stage=user_notice "
+                "success=false detail=%s",
+                correlation_id,
+                getattr(result, "error", None) or "notice returned no success confirmation",
+            )
+        return delivered
     except Exception as notice_error:
         logger.error(
             "artifact_delivery correlation_id=%s stage=user_notice "
@@ -93,6 +108,7 @@ async def report_media_delivery_failure(
             correlation_id,
             notice_error,
         )
+        return False
 
 
 def _platform_name(platform) -> str:
@@ -3507,7 +3523,7 @@ class BasePlatformAdapter(ABC):
                         )
                         _record_delivery(image_result)
                         if not image_result.success:
-                            await report_media_delivery_failure(
+                            notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
                                 thread_id=getattr(event.source, "thread_id", None),
@@ -3515,9 +3531,11 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(image_result.error or "upload returned no success confirmation"),
                             )
+                            if notice_delivered:
+                                _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
-                        await report_media_delivery_failure(
+                        notice_delivered = await report_media_delivery_failure(
                             self,
                             chat_id=event.source.chat_id,
                             thread_id=getattr(event.source, "thread_id", None),
@@ -3525,6 +3543,8 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(batch_err),
                         )
+                        if notice_delivered:
+                            _record_delivery(SendResult(success=True))
 
 
                 # Send extracted media files — route by file type
@@ -3567,7 +3587,7 @@ class BasePlatformAdapter(ABC):
                         )
                         _record_delivery(image_result)
                         if not image_result.success:
-                            await report_media_delivery_failure(
+                            notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
                                 thread_id=getattr(event.source, "thread_id", None),
@@ -3575,9 +3595,11 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(image_result.error or "upload returned no success confirmation"),
                             )
+                            if notice_delivered:
+                                _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
-                        await report_media_delivery_failure(
+                        notice_delivered = await report_media_delivery_failure(
                             self,
                             chat_id=event.source.chat_id,
                             thread_id=getattr(event.source, "thread_id", None),
@@ -3585,6 +3607,8 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(batch_err),
                         )
+                        if notice_delivered:
+                            _record_delivery(SendResult(success=True))
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:

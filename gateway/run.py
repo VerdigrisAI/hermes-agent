@@ -885,6 +885,7 @@ def _queued_reply_event(event: MessageEvent, text: str) -> MessageEvent:
         channel_prompt=event.channel_prompt,
         expects_reply=event.expects_reply,
         delivery_state=event.delivery_state,
+        timestamp=event.timestamp,
     )
 
 
@@ -11455,8 +11456,8 @@ class GatewayRunner:
         from pathlib import Path
         from urllib.parse import quote as _quote
 
-        async def _report_failure(file_path: str, detail: str) -> None:
-            await report_media_delivery_failure(
+        async def _report_failure(file_path: str, detail: str) -> bool:
+            return await report_media_delivery_failure(
                 adapter,
                 chat_id=event.source.chat_id,
                 thread_id=getattr(event.source, "thread_id", None),
@@ -11468,11 +11469,10 @@ class GatewayRunner:
         async def _check_result(file_path: str, result) -> bool:
             correlation_id = media_delivery_correlation_id(file_path)
             if not getattr(result, "success", False):
-                await _report_failure(
+                return await _report_failure(
                     file_path,
                     str(getattr(result, "error", None) or "upload returned no success confirmation"),
                 )
-                return False
             logger.info(
                 "artifact_delivery correlation_id=%s stage=upload_result "
                 "platform=%s chat_id=%s thread_id=%s filename=%s "
@@ -11555,8 +11555,7 @@ class GatewayRunner:
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
                     first_image = image_paths[0] if image_paths else extracted_images[0][0]
-                    await _report_failure(first_image, str(e))
-                    delivery_results.append(False)
+                    delivery_results.append(await _report_failure(first_image, str(e)))
 
             for media_path, is_voice in non_image_media:
                 try:
@@ -11582,8 +11581,7 @@ class GatewayRunner:
                     delivery_results.append(await _check_result(media_path, result))
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
-                    await _report_failure(media_path, str(e))
-                    delivery_results.append(False)
+                    delivery_results.append(await _report_failure(media_path, str(e)))
 
             for file_path in non_image_local:
                 try:
@@ -11603,8 +11601,7 @@ class GatewayRunner:
                     delivery_results.append(await _check_result(file_path, result))
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
-                    await _report_failure(file_path, str(e))
-                    delivery_results.append(False)
+                    delivery_results.append(await _report_failure(file_path, str(e)))
 
             return bool(delivery_results) and all(delivery_results)
 

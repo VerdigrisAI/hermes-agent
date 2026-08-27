@@ -179,6 +179,25 @@ class TestTelegramMultiImage:
         sizes = [len(c.kwargs["media"]) for c in adapter._bot.send_media_group.await_args_list]
         assert sizes == [10, 5]
 
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        import telegram
+
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+
+        result = _run(
+            adapter.send_multiple_images(
+                "12345",
+                [(f"file://{valid}", "valid"), (f"file://{tmp_path}/missing.png", "missing")],
+            )
+        )
+
+        assert result.success is False
+        adapter._bot.send_media_group.assert_awaited_once()
+
     def test_animations_routed_to_send_animation(self, adapter):
         """GIFs are peeled off and sent individually via send_animation."""
         import telegram
@@ -286,6 +305,24 @@ class TestDiscordMultiImage:
         assert mock_channel.send.await_count == 2
         sizes = [len(c.kwargs["files"]) for c in mock_channel.send.await_args_list]
         assert sizes == [10, 5]
+
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        result = _run(
+            adapter.send_multiple_images(
+                "67890",
+                [(f"file://{valid}", "valid"), (f"file://{tmp_path}/missing.png", "missing")],
+            )
+        )
+
+        assert result.success is False
+        mock_channel.send.assert_awaited_once()
 
     def test_empty_noop(self, adapter):
         adapter._client = MagicMock()
@@ -482,6 +519,20 @@ class TestMattermostMultiImage:
         sizes = [len(c.args[1]["file_ids"]) for c in adapter._api_post.await_args_list]
         assert sizes == [5, 2]
 
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+
+        result = _run(
+            adapter.send_multiple_images(
+                "channel123",
+                [(f"file://{valid}", "valid"), (f"file://{tmp_path}/missing.png", "missing")],
+            )
+        )
+
+        assert result.success is False
+        adapter._api_post.assert_awaited_once()
+
     def test_empty_noop(self, adapter):
         _run(adapter.send_multiple_images("channel123", []))
         adapter._api_post.assert_not_called()
@@ -544,6 +595,20 @@ class TestEmailMultiImage:
         assert file_paths == []
         assert "https://x.com/a.png" in body
         assert "https://x.com/b.png" in body
+
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+        images = [
+            (f"file://{valid}", "valid"),
+            (f"file://{tmp_path}/missing.png", "missing"),
+        ]
+        with patch.object(
+            adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
+        ):
+            result = _run(adapter.send_multiple_images("user@example.com", images))
+
+        assert result.success is False
 
     def test_empty_noop(self, adapter):
         with patch.object(
