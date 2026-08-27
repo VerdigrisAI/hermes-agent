@@ -745,6 +745,25 @@ class QueuedMarkdownImageAgent:
         }
 
 
+class QueuedFailedMediaAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "Report attached.\nMEDIA:/tmp/report.pdf"
+                if type(self).calls == 1
+                else "queued response"
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class SecondCallRaisingAgent:
     calls = 0
 
@@ -777,6 +796,24 @@ class ImageCaptureAdapter(ProgressCaptureAdapter):
     ):
         self.image_batches.append(images)
         return SendResult(success=True, message_id="image-1")
+
+
+class FailedMediaNoticeAdapter(ProgressCaptureAdapter):
+    async def send_document(self, chat_id, file_path, reply_to=None, metadata=None):
+        return SendResult(success=False, error="upload failed")
+
+    async def _send_with_retry(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if content.startswith("⚠️"):
+            return SendResult(success=False, error="notice failed")
+        return SendResult(success=True, message_id="text-1")
 
 
 class RaisingAgent:
@@ -1667,6 +1704,38 @@ async def test_queued_followup_delivers_first_turn_markdown_image(monkeypatch, t
     ]
     assert owner.delivery_state.reply_delivered is True
     assert owner.delivery_state.reply_failed is False
+
+
+@pytest.mark.asyncio
+async def test_queued_media_and_notice_failure_mark_owner_failed(monkeypatch, tmp_path):
+    QueuedFailedMediaAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="failed-media-owner",
+        expects_reply=True,
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedFailedMediaAgent,
+        session_id="sess-queued-failed-media",
+        pending_text="queued follow-up",
+        reply_event=owner,
+        adapter_cls=FailedMediaNoticeAdapter,
+    )
+
+    assert result["final_response"] == "queued response"
+    assert owner.delivery_state.reply_delivered is True
+    assert owner.delivery_state.reply_failed is True
 
 
 @pytest.mark.asyncio

@@ -3594,8 +3594,9 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
-                        _record_delivery(image_result)
-                        if not image_result.success:
+                        if image_result.success:
+                            _record_delivery(image_result)
+                        else:
                             notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
@@ -3604,8 +3605,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(image_result.error or "upload returned no success confirmation"),
                             )
-                            if notice_delivered:
-                                _record_delivery(SendResult(success=True))
+                            _record_delivery(SendResult(success=notice_delivered))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
                         notice_delivered = await report_media_delivery_failure(
@@ -3616,8 +3616,7 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(batch_err),
                         )
-                        if notice_delivered:
-                            _record_delivery(SendResult(success=True))
+                        _record_delivery(SendResult(success=notice_delivered))
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
