@@ -676,14 +676,10 @@ class SlackAdapter(BasePlatformAdapter):
             key = (chat_id, uid)
             return key if key in self._slash_command_contexts else None
 
-        # Fallback: channel-only scan (only reachable when ContextVar is
-        # unset, i.e. send() called outside a slash-command async context).
-        match_key = None
-        for key in list(self._slash_command_contexts):
-            if key[0] == chat_id:
-                match_key = key
-                break
-        return match_key
+        # A send without the verified slash caller context must never claim a
+        # pending private reply. Another user's ordinary channel response may
+        # use the same chat_id.
+        return None
 
     def _pop_slash_context(
         self, chat_id: str,
@@ -722,9 +718,8 @@ class SlackAdapter(BasePlatformAdapter):
         """
         formatted = self.format_message(content)
         # Slack's response_url has the same ~40k char limit as chat_postMessage.
-        # Truncate to MAX_MESSAGE_LENGTH and use only the first chunk — the
-        # response_url replaces a single ephemeral ack, so multi-chunk isn't
-        # possible.  Long responses are rare for command replies.
+        # The response_url replaces one ephemeral ack. Deliver any remaining
+        # chunks as private follow-up messages to the same verified user.
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         text = chunks[0] if chunks else formatted
         payload = {
@@ -740,7 +735,17 @@ class SlackAdapter(BasePlatformAdapter):
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status == 200:
-                        return SendResult(success=True, message_id=None)
+                        last_result = SendResult(success=True, message_id=None)
+                        for chunk in chunks[1:]:
+                            last_result = await self.send_private_notice(
+                                chat_id=str(ctx.get("channel_id") or ""),
+                                user_id=str(ctx.get("user_id") or ""),
+                                content=chunk,
+                            )
+                            if not last_result.success:
+                                last_result.retryable = True
+                                return last_result
+                        return last_result
                     body = await resp.text()
                     logger.warning(
                         "[Slack] response_url POST returned %s: %s",
@@ -751,16 +756,19 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning(
                 "[Slack] response_url POST failed: %s", e,
             )
-        result = await self.send_private_notice(
-            chat_id=str(ctx.get("channel_id") or ""),
-            user_id=str(ctx.get("user_id") or ""),
-            content=content,
-        )
-        if not result.success:
-            # Retrying an ephemeral replacement cannot leak private command
-            # output or create a public duplicate.
-            result.retryable = True
-        return result
+        last_result = SendResult(success=False, error="private slash delivery failed")
+        for chunk in chunks or [formatted]:
+            last_result = await self.send_private_notice(
+                chat_id=str(ctx.get("channel_id") or ""),
+                user_id=str(ctx.get("user_id") or ""),
+                content=chunk,
+            )
+            if not last_result.success:
+                # Retrying an ephemeral replacement cannot leak private command
+                # output or create a public duplicate.
+                last_result.retryable = True
+                return last_result
+        return last_result
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""

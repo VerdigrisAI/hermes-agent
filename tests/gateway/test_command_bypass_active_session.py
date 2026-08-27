@@ -385,6 +385,27 @@ class TestCommandBypassActiveSession:
         assert event.delivery_state.reply_delivered is False
 
     @pytest.mark.asyncio
+    async def test_bypass_reply_preserves_delivered_failure_notice(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                failure_notice_delivered=True,
+            )
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/status")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
+
+    @pytest.mark.asyncio
     async def test_successful_bypass_reply_records_delivery(self):
         adapter = _make_adapter()
         sk = _session_key()
@@ -451,6 +472,27 @@ class TestCommandBypassActiveSession:
         )
         assert event.delivery_state.reply_attempted is True
         assert event.delivery_state.reply_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_reset_reply_preserves_delivered_failure_notice(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                failure_notice_delivered=True,
+            )
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/stop")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
 
     @pytest.mark.asyncio
     async def test_successful_reset_like_reply_records_delivery(self):
@@ -625,6 +667,32 @@ class TestNonBypassStillQueued:
             ProcessingOutcome.SUCCESS,
         )
         assert event.delivery_state.reply_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_clarify_reply_preserves_delivered_failure_notice(self, monkeypatch):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._message_handler = AsyncMock(return_value="Thanks.")
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                failure_notice_delivered=True,
+            )
+        )
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
 
     @pytest.mark.asyncio
     async def test_clarify_text_defers_to_active_turn_when_owner_exists(

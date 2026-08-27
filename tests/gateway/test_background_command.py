@@ -268,7 +268,7 @@ class TestRunBackgroundTask:
         mock_adapter._send_with_retry.assert_awaited_once()
         call_args = mock_adapter._send_with_retry.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
-        assert "Background task complete" in content
+        assert "Background task result" in content
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
@@ -328,7 +328,103 @@ class TestRunBackgroundTask:
             await runner._run_background_task("say hello", source, "bg_test")
 
         assert len(adapter.calls) == 2
-        assert "Background task complete" in adapter.calls[-1][1]
+        assert "Background task result" in adapter.calls[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_failed_completion_emits_terminal_delivery_evidence(self, caplog):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=False, error="delivery exhausted")
+        )
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "done", "messages": []}
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task("work", source, "bg_test")
+
+        assert "background_task task_id=bg_test" in caplog.text
+        assert "phase=text_result delivery_success=false" in caplog.text
+        assert "error=delivery exhausted" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_agent_error_is_not_labeled_successful(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "", "error": "provider failed"}
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task("work", source, "bg_test")
+
+        content = adapter._send_with_retry.await_args.kwargs["content"]
+        assert content.startswith("❌ Background task failed")
+        assert "✅" not in content
+
+    @pytest.mark.asyncio
+    async def test_empty_result_is_not_labeled_successful(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_in_executor_with_context = AsyncMock(return_value={})
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task("work", source, "bg_test")
+
+        content = adapter._send_with_retry.await_args.kwargs["content"]
+        assert content.startswith("⚠️ Background task finished without a response")
+        assert "✅" not in content
 
     @pytest.mark.asyncio
     async def test_bare_local_artifact_is_uploaded_without_exposing_path(self, tmp_path):

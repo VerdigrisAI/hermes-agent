@@ -3006,6 +3006,10 @@ class BasePlatformAdapter(ABC):
                 delivered = bool(_r and _r.success)
                 if delivered:
                     event.delivery_state.reply_delivered = True
+                else:
+                    event.delivery_state.reply_failed = True
+                if _r and getattr(_r, "failure_notice_delivered", False):
+                    event.delivery_state.failure_notice_delivered = True
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -3123,8 +3127,13 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_meta,
                         )
                         _delivered = bool(_r and _r.success)
-                        if _delivered and not event.delivery_state.completion_deferred:
-                            event.delivery_state.reply_delivered = True
+                        if not event.delivery_state.completion_deferred:
+                            if _delivered:
+                                event.delivery_state.reply_delivered = True
+                            else:
+                                event.delivery_state.reply_failed = True
+                            if _r and getattr(_r, "failure_notice_delivered", False):
+                                event.delivery_state.failure_notice_delivered = True
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -3193,8 +3202,13 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_meta,
                             )
                             _delivered = bool(_r and _r.success)
-                            if _delivered and not deferred:
-                                event.delivery_state.reply_delivered = True
+                            if not deferred:
+                                if _delivered:
+                                    event.delivery_state.reply_delivered = True
+                                else:
+                                    event.delivery_state.reply_failed = True
+                                if _r and getattr(_r, "failure_notice_delivered", False):
+                                    event.delivery_state.failure_notice_delivered = True
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,

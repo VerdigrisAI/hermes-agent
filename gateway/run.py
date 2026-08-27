@@ -11780,12 +11780,22 @@ class GatewayRunner:
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
-        async def _send_completion(content: str):
-            return await adapter._send_with_retry(
+        async def _send_completion(content: str, *, phase: str):
+            send_result = await adapter._send_with_retry(
                 chat_id=source.chat_id,
                 content=content,
                 metadata=_thread_metadata,
             )
+            if not getattr(send_result, "success", False):
+                logger.error(
+                    "background_task task_id=%s phase=%s delivery_success=false "
+                    "failure_notice_delivered=%s error=%s",
+                    task_id,
+                    phase,
+                    bool(getattr(send_result, "failure_notice_delivered", False)),
+                    getattr(send_result, "error", None) or "no success confirmation",
+                )
+            return send_result
 
         try:
             user_config = _load_gateway_config()
@@ -11795,7 +11805,8 @@ class GatewayRunner:
             )
             if not runtime_kwargs.get("api_key"):
                 await _send_completion(
-                    f"❌ Background task {task_id} failed: no provider credentials configured."
+                    f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    phase="credentials_error",
                 )
                 return
 
@@ -11870,8 +11881,9 @@ class GatewayRunner:
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
+            task_error = str(result.get("error") or "") if result else ""
+            if not response and task_error:
+                response = f"Error: {task_error}"
 
             # Extract media files from the response
             if response:
@@ -11881,12 +11893,18 @@ class GatewayRunner:
                 local_files, text_content = adapter.extract_local_files(text_content)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                if task_error:
+                    header = f'❌ Background task failed\nPrompt: "{preview}"\n\n'
+                else:
+                    header = f'Background task result\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await _send_completion(header + text_content)
+                    await _send_completion(header + text_content, phase="text_result")
                 elif not images and not media_files and not local_files:
-                    await _send_completion(header + "(No response generated)")
+                    await _send_completion(
+                        header + "(No response generated)",
+                        phase="empty_result",
+                    )
 
                 if images or media_files or local_files:
                     background_event = MessageEvent(
@@ -11894,21 +11912,33 @@ class GatewayRunner:
                         source=source,
                         message_id=event_message_id,
                     )
-                    await self._deliver_media_from_response(
+                    media_delivered = await self._deliver_media_from_response(
                         original_response,
                         background_event,
                         adapter,
                     )
+                    if media_delivered is False:
+                        logger.error(
+                            "background_task task_id=%s phase=media_result "
+                            "delivery_success=false failure_notice_delivered=%s",
+                            task_id,
+                            background_event.delivery_state.failure_notice_delivered,
+                        )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await _send_completion(
-                    f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)'
+                    f'⚠️ Background task finished without a response\n'
+                    f'Prompt: "{preview}"',
+                    phase="empty_result",
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await _send_completion(f"❌ Background task {task_id} failed: {e}")
+                await _send_completion(
+                    f"❌ Background task {task_id} failed: {e}",
+                    phase="task_exception",
+                )
             except Exception:
                 pass
 

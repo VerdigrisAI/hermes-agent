@@ -3873,12 +3873,18 @@ class TestSlashEphemeralAck:
     async def test_pop_slash_context_returns_and_removes(self, adapter):
         """_pop_slash_context returns the context and removes it."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/test",
             "ts": time.monotonic(),
         }
 
-        ctx = adapter._pop_slash_context("C1")
+        token = _slash_user_id.set("U1")
+        try:
+            ctx = adapter._pop_slash_context("C1")
+        finally:
+            _slash_user_id.reset(token)
         assert ctx is not None
         assert ctx["response_url"] == "https://hooks.slack.com/test"
         # Must be removed after pop
@@ -3907,6 +3913,8 @@ class TestSlashEphemeralAck:
     async def test_send_uses_response_url_when_context_exists(self, adapter):
         """send() should POST to response_url for slash command replies."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C_SLASH", "U_SLASH")] = {
             "response_url": "https://hooks.slack.com/commands/T123/456/abc",
             "ts": time.monotonic(),
@@ -3922,8 +3930,12 @@ class TestSlashEphemeralAck:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
-            result = await adapter.send("C_SLASH", "Queued for the next turn.")
+        token = _slash_user_id.set("U_SLASH")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+                result = await adapter.send("C_SLASH", "Queued for the next turn.")
+        finally:
+            _slash_user_id.reset(token)
 
         assert result.success is True
         # Verify response_url was POSTed to
@@ -3937,6 +3949,44 @@ class TestSlashEphemeralAck:
 
         # Context must be consumed
         assert len(adapter._slash_command_contexts) == 0
+
+    @pytest.mark.asyncio
+    async def test_long_slash_reply_delivers_remaining_chunks_privately(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/long",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "follow-up"}
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        content = "x" * (adapter.MAX_MESSAGE_LENGTH + 10)
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+                result = await adapter.send("C1", content)
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        assert adapter._app.client.chat_postEphemeral.await_args.kwargs["user"] == "U1"
+        remainder = adapter._app.client.chat_postEphemeral.await_args.kwargs["text"]
+        assert remainder.startswith("x" * 10)
+        assert remainder.endswith("(2/2)")
 
     @pytest.mark.asyncio
     async def test_send_falls_through_without_context(self, adapter):
@@ -3953,6 +4003,8 @@ class TestSlashEphemeralAck:
     async def test_send_slash_ephemeral_fallback_on_post_failure(self, adapter):
         """A failed response_url uses a second private Slack message."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/commands/bad",
             "channel_id": "C1",
@@ -3974,8 +4026,12 @@ class TestSlashEphemeralAck:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
-            result = await adapter.send("C1", "Some response")
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+                result = await adapter.send("C1", "Some response")
+        finally:
+            _slash_user_id.reset(token)
 
         assert result.success is True
         adapter._app.client.chat_postEphemeral.assert_awaited_once()
@@ -3988,6 +4044,8 @@ class TestSlashEphemeralAck:
     async def test_send_slash_ephemeral_fallback_on_exception(self, adapter):
         """Both private-delivery failures return a terminal failure."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/commands/timeout",
             "channel_id": "C1",
@@ -4003,8 +4061,12 @@ class TestSlashEphemeralAck:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
-            result = await adapter.send("C1", "Some response")
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+                result = await adapter.send("C1", "Some response")
+        finally:
+            _slash_user_id.reset(token)
 
         assert result.success is False
         assert "ephemeral failed" in result.error
@@ -4162,7 +4224,25 @@ class TestSlashEphemeralAck:
         # ContextVar is unset (default=None) — simulates a normal message send.
         assert _slash_user_id.get() is None
         ctx = adapter._pop_slash_context("C1")
-        # Fallback scan still finds it (channel-only) — this is fine for
-        # the normal single-user case; the ContextVar path is the precise one.
-        # The key invariant is: when the ContextVar IS set, it matches exactly.
-        assert ctx is not None  # fallback path finds the entry
+        assert ctx is None
+        assert ("C1", "U1") in adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_stale_slash_context_cannot_steal_ordinary_reply(self, adapter):
+        import time
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/stale",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "ordinary-1"}
+        )
+
+        result = await adapter.send("C1", "ordinary reply")
+
+        assert result.success
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        assert ("C1", "U1") in adapter._slash_command_contexts
