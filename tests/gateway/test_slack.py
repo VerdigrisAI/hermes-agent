@@ -962,7 +962,7 @@ class TestSendVideo:
         )
 
         assert not result.success
-        assert "Slack API error" in result.error
+        assert "RuntimeError" in result.error
         adapter._app.client.chat_postMessage.assert_not_awaited()
 
 
@@ -1487,6 +1487,34 @@ class TestIncomingDocumentHandling:
         assert "[Slack attachment notice]" in msg_event.text
         assert "photo.jpg could not be downloaded after retries" in msg_event.text
         assert "what is in this?" in msg_event.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mimetype", "filename"),
+        [
+            ("image/jpeg", "photo.jpg"),
+            ("audio/mpeg", "meeting.mp3"),
+            ("application/octet-stream", "archive.bin"),
+        ],
+    )
+    async def test_attachment_without_authorized_url_surfaces_notice(
+        self,
+        adapter,
+        mimetype,
+        filename,
+    ):
+        event = self._make_event(text="inspect this", files=[{
+            "id": "F_NO_URL",
+            "mimetype": mimetype,
+            "name": filename,
+            "size": 10,
+        }])
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "[Slack attachment notice]" in msg_event.text
+        assert f"{filename} has no authorized download URL" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_rich_text_blocks_do_not_duplicate_plain_text(self, adapter):
@@ -3292,7 +3320,7 @@ class TestFailedLocalUploadReporting:
         test_file.write_bytes(b"\xff\xd8\xff\xe0")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
-            side_effect=Exception("upload failed")
+            side_effect=Exception(f"upload failed at {test_file}")
         )
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "msg_ts"}
@@ -3307,7 +3335,8 @@ class TestFailedLocalUploadReporting:
         )
 
         assert not result.success
-        assert "upload failed" in result.error
+        assert "Slack image upload failed" in result.error
+        assert str(tmp_path) not in result.error
         adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -3316,7 +3345,7 @@ class TestFailedLocalUploadReporting:
         test_file.write_bytes(b"\x00\x00\x00\x1c")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
-            side_effect=Exception("upload failed")
+            side_effect=Exception(f"upload failed at {test_file}")
         )
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "msg_ts"}
@@ -3330,7 +3359,8 @@ class TestFailedLocalUploadReporting:
         )
 
         assert not result.success
-        assert "upload failed" in result.error
+        assert "Slack video upload failed" in result.error
+        assert str(tmp_path) not in result.error
         adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -3341,7 +3371,7 @@ class TestFailedLocalUploadReporting:
         test_file.write_bytes(b"%PDF-1.4")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
-            side_effect=Exception("upload failed")
+            side_effect=Exception(f"upload failed at {test_file}")
         )
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "msg_ts"}
@@ -3356,7 +3386,8 @@ class TestFailedLocalUploadReporting:
         )
 
         assert not result.success
-        assert "upload failed" in result.error
+        assert "Slack document upload failed" in result.error
+        assert str(tmp_path) not in result.error
         adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -3379,6 +3410,35 @@ class TestFailedLocalUploadReporting:
 
         assert not result.success
         adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method_name", "path_parameter", "filename"),
+        [
+            ("send_image_file", "image_path", "missing.png"),
+            ("send_voice", "audio_path", "missing.mp3"),
+            ("send_video", "video_path", "missing.mp4"),
+            ("send_document", "file_path", "missing.pdf"),
+        ],
+    )
+    async def test_missing_local_file_error_hides_parent_path(
+        self,
+        adapter,
+        tmp_path,
+        method_name,
+        path_parameter,
+        filename,
+    ):
+        missing = tmp_path / "private" / filename
+
+        result = await getattr(adapter, method_name)(
+            chat_id="C123",
+            **{path_parameter: str(missing)},
+        )
+
+        assert not result.success
+        assert filename in result.error
+        assert str(tmp_path) not in result.error
 
 
 # ---------------------------------------------------------------------------
@@ -3798,12 +3858,17 @@ class TestSlashEphemeralAck:
 
     @pytest.mark.asyncio
     async def test_send_slash_ephemeral_fallback_on_post_failure(self, adapter):
-        """_send_slash_ephemeral returns success=True even if POST fails."""
+        """A failed response_url uses a second private Slack message."""
         import time
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/commands/bad",
+            "channel_id": "C1",
+            "user_id": "U1",
             "ts": time.monotonic(),
         }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "fallback-1"}
+        )
 
         mock_resp = AsyncMock()
         mock_resp.status = 500
@@ -3819,17 +3884,26 @@ class TestSlashEphemeralAck:
         with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
             result = await adapter.send("C1", "Some response")
 
-        # Still success — the user saw the initial ack already
         assert result.success is True
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        fallback = adapter._app.client.chat_postEphemeral.await_args.kwargs
+        assert fallback["channel"] == "C1"
+        assert fallback["user"] == "U1"
+        assert fallback["text"] == "Some response"
 
     @pytest.mark.asyncio
     async def test_send_slash_ephemeral_fallback_on_exception(self, adapter):
-        """_send_slash_ephemeral returns success=True even if aiohttp raises."""
+        """Both private-delivery failures return a terminal failure."""
         import time
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/commands/timeout",
+            "channel_id": "C1",
+            "user_id": "U1",
             "ts": time.monotonic(),
         }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            side_effect=RuntimeError("ephemeral failed")
+        )
 
         mock_session = AsyncMock()
         mock_session.post = MagicMock(side_effect=Exception("connection timeout"))
@@ -3839,7 +3913,8 @@ class TestSlashEphemeralAck:
         with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
             result = await adapter.send("C1", "Some response")
 
-        assert result.success is True
+        assert result.success is False
+        assert "ephemeral failed" in result.error
 
     @pytest.mark.asyncio
     async def test_native_slash_stashes_context_and_dispatches(self, adapter):

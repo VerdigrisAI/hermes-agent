@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -267,6 +267,65 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_media_only_upload_failure_sends_visible_notice(self):
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={
+                "final_response": "MEDIA:/tmp/report.pdf",
+                "messages": [],
+            }
+        )
+
+        adapter = MagicMock()
+        adapter.name = "Slack"
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+        adapter.send_document = AsyncMock(
+            return_value=SendResult(success=False, error="upload failed")
+        )
+        adapter.send_video = AsyncMock(return_value=SendResult(success=True))
+        adapter.send_voice = AsyncMock(return_value=SendResult(success=True))
+        adapter.send_multiple_images = AsyncMock(return_value=SendResult(success=True))
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="notice-1")
+        )
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+
+        source = SessionSource(
+            platform=Platform.SLACK,
+            user_id="U123",
+            chat_id="C123",
+            user_name="testuser",
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task(
+                "make a report",
+                source,
+                "bg_test",
+            )
+
+        adapter.send_document.assert_awaited_once()
+        adapter._send_with_retry.assert_awaited_once()
+        notice = adapter._send_with_retry.await_args.kwargs["content"]
+        assert "report.pdf" in notice
+        assert "was not attached" in notice
 
     @pytest.mark.asyncio
     async def test_telegram_dm_topic_completion_preserves_reply_anchor_metadata(self, monkeypatch):

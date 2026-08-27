@@ -11864,6 +11864,7 @@ class GatewayRunner:
 
             # Extract media files from the response
             if response:
+                original_response = response
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
 
@@ -11883,28 +11884,17 @@ class GatewayRunner:
                         metadata=_thread_metadata,
                     )
 
-                # Send extracted images
-                for image_url, alt_text in (images or []):
-                    try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
-                            metadata=_thread_metadata,
-                        )
-                    except Exception:
-                        pass
-
-                # Send media files
-                for media_path, _is_voice in (media_files or []):
-                    try:
-                        await adapter.send_document(
-                            chat_id=source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_metadata,
-                        )
-                    except Exception:
-                        pass
+                if images or media_files:
+                    background_event = MessageEvent(
+                        text=prompt,
+                        source=source,
+                        message_id=event_message_id,
+                    )
+                    await self._deliver_media_from_response(
+                        original_response,
+                        background_event,
+                        adapter,
+                    )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(

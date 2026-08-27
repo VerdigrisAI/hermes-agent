@@ -700,9 +700,7 @@ class SlackAdapter(BasePlatformAdapter):
         lets us swap the "Running /cmd…" placeholder with the real reply,
         and the message stays ephemeral ("Only visible to you").
 
-        Falls back to a simple ``True`` SendResult if the POST fails —
-        the user already saw the initial ack, so a delivery failure here
-        is non-critical.
+        Falls back to a second ephemeral message if replacement fails.
         """
         formatted = self.format_message(content)
         # Slack's response_url has the same ~40k char limit as chat_postMessage.
@@ -735,8 +733,11 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning(
                 "[Slack] response_url POST failed: %s", e,
             )
-        # Non-fatal — the user saw the initial ack already.
-        return SendResult(success=True, message_id=None)
+        return await self.send_private_notice(
+            chat_id=str(ctx.get("channel_id") or ""),
+            user_id=str(ctx.get("user_id") or ""),
+            content=content,
+        )
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -1844,7 +1845,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             return await self._upload_file(chat_id, image_path, caption, reply_to, metadata)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Image file not found: {image_path}")
+            return SendResult(
+                success=False,
+                error=f"Image file not found: {os.path.basename(image_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1855,7 +1859,10 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return SendResult(success=False, error=str(e))
+            return SendResult(
+                success=False,
+                error=f"Slack image upload failed ({type(e).__name__}).",
+            )
 
     async def send_image(
         self,
@@ -1935,7 +1942,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             return await self._upload_file(chat_id, audio_path, caption, reply_to, metadata)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+            return SendResult(
+                success=False,
+                error=f"Audio file not found: {os.path.basename(audio_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1945,7 +1955,10 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return SendResult(success=False, error=str(e))
+            return SendResult(
+                success=False,
+                error=f"Slack audio upload failed ({type(e).__name__}).",
+            )
 
     async def send_video(
         self,
@@ -1962,7 +1975,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             video_path, video_bytes = self._prepare_local_upload(video_path)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Video file not found: {video_path}")
+            return SendResult(
+                success=False,
+                error=f"Video file not found: {os.path.basename(video_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
 
@@ -2003,7 +2019,10 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return SendResult(success=False, error=str(e))
+            return SendResult(
+                success=False,
+                error=f"Slack video upload failed ({type(e).__name__}).",
+            )
 
     async def send_document(
         self,
@@ -2021,7 +2040,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             file_path, file_bytes = self._prepare_local_upload(file_path)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"File not found: {file_path}")
+            return SendResult(
+                success=False,
+                error=f"File not found: {os.path.basename(file_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
 
@@ -2150,7 +2172,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return SendResult(
                 success=False,
-                error=f"Slack document upload failed: {e}",
+                error=f"Slack document upload failed ({type(e).__name__}).",
             )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -2599,6 +2621,12 @@ class SlackAdapter(BasePlatformAdapter):
 
             mimetype = f.get("mimetype", "unknown")
             url = f.get("url_private_download") or f.get("url_private", "")
+            if not url:
+                attachment_notices.append(
+                    "Slack attachment "
+                    f"{f.get('name') or f.get('id') or 'unknown'} has no authorized download URL."
+                )
+                continue
             if mimetype.startswith("image/") and url:
                 try:
                     ext = "." + mimetype.split("/")[-1].split(";")[0]
@@ -3550,6 +3578,8 @@ class SlackAdapter(BasePlatformAdapter):
         if response_url and user_id and channel_id and text.startswith("/"):
             self._slash_command_contexts[(channel_id, user_id)] = {
                 "response_url": response_url,
+                "channel_id": channel_id,
+                "user_id": user_id,
                 "ts": time.monotonic(),
             }
 
