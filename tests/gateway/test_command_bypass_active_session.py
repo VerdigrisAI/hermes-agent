@@ -274,6 +274,23 @@ class TestCommandBypassActiveSession:
             "/queue response was not sent back to the user"
         )
 
+    def test_start_records_reply_owner_before_background_task_runs(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_adapter()
+        event = _make_event("hello")
+        sk = _session_key()
+
+        def fake_create_task(coro):
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        assert adapter._start_session_processing(event, sk) is True
+        assert adapter._active_message_events[sk] is event
+
     def test_queued_turn_preserves_the_original_reply_contract(self):
         event = _make_event("/queue follow up")
         event.expects_reply = True
@@ -328,6 +345,31 @@ class TestCommandBypassActiveSession:
             ProcessingOutcome.SUCCESS,
         )
         assert event.delivery_state.reply_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_deferred_bypass_ack_does_not_complete_the_event(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        async def deferred_handler(event):
+            event.delivery_state.completion_deferred = True
+            return "Steer queued."
+
+        adapter._message_handler = deferred_handler
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="ack-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/steer also check tests")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._send_with_retry.assert_awaited_once()
+        adapter._run_processing_hook.assert_not_awaited()
+        assert event.delivery_state.reply_attempted is False
+        assert event.delivery_state.reply_delivered is False
 
     @pytest.mark.asyncio
     async def test_failed_reset_like_reply_completes_as_failure(self):
