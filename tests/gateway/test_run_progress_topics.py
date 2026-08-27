@@ -1933,11 +1933,14 @@ async def test_real_handler_propagates_queued_owners_and_streamed_delivery(
     assert response is None
     if with_queued_owner:
         assert event.delivery_state.reply_delivered is False
+        assert event.delivery_state.reply_failed is False
         assert queued.delivery_state.reply_delivered is True
+        assert queued.delivery_state.reply_failed is False
         assert queued in event.delivery_state.completion_events
         assert queued in event.delivery_state.final_response_events
     else:
         assert event.delivery_state.reply_delivered is True
+        assert event.delivery_state.reply_failed is False
         assert queued.delivery_state.reply_delivered is False
 
 
