@@ -694,6 +694,40 @@ class MediaOnlyAgent:
         }
 
 
+class QueuedMediaAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return {
+                "final_response": "",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "content": '{"artifact": "MEDIA:/tmp/queued-report.pdf"}',
+                    }
+                ],
+                "api_calls": 1,
+            }
+        return {
+            "final_response": "queued response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class RaisingAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        raise RuntimeError("agent failed")
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1147,6 +1181,62 @@ async def test_drain_rejects_every_accepted_queued_turn(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failed_agent_drain_rejects_every_accepted_queued_turn(
+    monkeypatch, tmp_path
+):
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"failed-queued-{index}",
+            expects_reply=True,
+        )
+        for index in range(3)
+    ]
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    runner._draining = True
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._pending_messages[session_key] = queued[0]
+    runner._queued_events = {session_key: queued[1:]}
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RaisingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    with pytest.raises(RuntimeError, match="agent failed"):
+        await runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-failed-drain",
+            session_key=session_key,
+        )
+
+    rejections = [call for call in adapter.sent if "resend" in call["content"]]
+    assert len(rejections) == 3
+    assert all(event.delivery_state.reply_delivered for event in queued)
+    assert session_key not in adapter._pending_messages
+    assert session_key not in runner._queued_events
+
+
+@pytest.mark.asyncio
 async def test_early_return_preserves_a_late_steer_as_the_next_turn(
     monkeypatch,
     tmp_path,
@@ -1196,6 +1286,7 @@ async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
         source=source,
         message_id="queued-after-steer",
         expects_reply=True,
+        timestamp=datetime.now() + timedelta(seconds=1),
     )
     steer = MessageEvent(
         text="/steer late steer",
@@ -1203,6 +1294,7 @@ async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
         source=source,
         message_id="late-steer",
         expects_reply=True,
+        timestamp=datetime.now(),
     )
 
     _adapter, result = await _run_with_agent(
@@ -1215,6 +1307,46 @@ async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
     )
 
     assert EarlyReturnSteerAgent.messages == ["hello", "late steer", "queued follow-up"]
+    assert result["final_response"] == "final response 3"
+
+
+@pytest.mark.asyncio
+async def test_late_steer_runs_after_earlier_queued_turn(monkeypatch, tmp_path):
+    EarlyReturnSteerAgent.calls = 0
+    EarlyReturnSteerAgent.messages = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = MessageEvent(
+        text="queued follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-before-steer",
+        expects_reply=True,
+        timestamp=datetime.now(),
+    )
+    steer = MessageEvent(
+        text="/steer late steer",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="late-steer",
+        expects_reply=True,
+        timestamp=datetime.now() + timedelta(seconds=1),
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-queue-before-steer",
+        pending_event=queued,
+        steer_events=[("late steer", steer)],
+    )
+
+    assert EarlyReturnSteerAgent.messages == ["hello", "queued follow-up", "late steer"]
     assert result["final_response"] == "final response 3"
 
 
@@ -1268,6 +1400,25 @@ async def test_media_only_result_is_not_replaced_by_empty_response(monkeypatch, 
     )
 
     assert result["final_response"] == "MEDIA:/tmp/report.pdf"
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_delivers_first_turn_tool_media(monkeypatch, tmp_path):
+    QueuedMediaAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedMediaAgent,
+        session_id="sess-queued-media",
+        pending_text="queued follow-up",
+    )
+
+    assert result["final_response"] == "queued response"
+    assert any(
+        call["content"] == "📎 File: /tmp/queued-report.pdf"
+        for call in adapter.sent
+    )
+    assert all("MEDIA:" not in call["content"] for call in adapter.sent)
 
 
 @pytest.mark.asyncio

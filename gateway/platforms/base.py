@@ -1386,7 +1386,7 @@ class BasePlatformAdapter(ABC):
     - Handling media
     """
 
-    def discard_reply_requirement(self, event: MessageEvent) -> None:
+    async def discard_reply_requirement(self, event: MessageEvent) -> None:
         """Mark an admitted event as intentionally silent."""
         event.expects_reply = False
     
@@ -1982,7 +1982,7 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
-        delivered = False
+        all_delivered = bool(images)
         last_error: Optional[str] = None
         for image_url, alt_text in images:
             if human_delay > 0:
@@ -2017,15 +2017,15 @@ class BasePlatformAdapter(ABC):
                     )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                    all_delivered = False
                     last_error = str(img_result.error or "image upload failed")
-                else:
-                    delivered = True
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                all_delivered = False
                 last_error = str(img_err)
         return SendResult(
-            success=delivered,
-            error=None if delivered else (last_error or "no images were delivered"),
+            success=all_delivered,
+            error=None if all_delivered else (last_error or "an image was not delivered"),
         )
 
     async def send_image(
@@ -3290,15 +3290,13 @@ class BasePlatformAdapter(ABC):
                     completion_event.delivery_state.merged_events
                 )
                 delivery_state = completion_event.delivery_state
-                if delivery_state.reply_attempted or completion_event.expects_reply:
+                if default_outcome != ProcessingOutcome.SUCCESS:
+                    outcome = default_outcome
+                elif delivery_state.reply_attempted or completion_event.expects_reply:
                     outcome = (
                         ProcessingOutcome.SUCCESS
                         if delivery_state.reply_delivered
-                        else (
-                            ProcessingOutcome.FAILURE
-                            if default_outcome == ProcessingOutcome.SUCCESS
-                            else default_outcome
-                        )
+                        else ProcessingOutcome.FAILURE
                     )
                 else:
                     outcome = default_outcome
@@ -3508,8 +3506,25 @@ class BasePlatformAdapter(ABC):
                             human_delay=human_delay,
                         )
                         _record_delivery(image_result)
+                        if not image_result.success:
+                            await report_media_delivery_failure(
+                                self,
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                file_path=images[0][0],
+                                metadata=_thread_metadata,
+                                detail=str(image_result.error or "upload returned no success confirmation"),
+                            )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await report_media_delivery_failure(
+                            self,
+                            chat_id=event.source.chat_id,
+                            thread_id=getattr(event.source, "thread_id", None),
+                            file_path=images[0][0],
+                            metadata=_thread_metadata,
+                            detail=str(batch_err),
+                        )
 
 
                 # Send extracted media files — route by file type
@@ -3551,8 +3566,25 @@ class BasePlatformAdapter(ABC):
                             human_delay=human_delay,
                         )
                         _record_delivery(image_result)
+                        if not image_result.success:
+                            await report_media_delivery_failure(
+                                self,
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                file_path=_image_paths[0],
+                                metadata=_thread_metadata,
+                                detail=str(image_result.error or "upload returned no success confirmation"),
+                            )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        await report_media_delivery_failure(
+                            self,
+                            chat_id=event.source.chat_id,
+                            thread_id=getattr(event.source, "thread_id", None),
+                            file_path=_image_paths[0],
+                            metadata=_thread_metadata,
+                            detail=str(batch_err),
+                        )
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
@@ -3690,14 +3722,13 @@ class BasePlatformAdapter(ABC):
             await _complete_delivery_events(outcome)
             raise
         except Exception as e:
-            await _complete_delivery_events(ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
+                error_result = await self.send(
                     chat_id=event.source.chat_id,
                     content=(
                         f"Sorry, I encountered an error ({error_type}).\n"
@@ -3706,8 +3737,10 @@ class BasePlatformAdapter(ABC):
                     ),
                     metadata=_thread_metadata,
                 )
+                _record_delivery(error_result)
             except Exception:
                 pass  # Last resort — don't let error reporting crash the handler
+            await _complete_delivery_events(ProcessingOutcome.FAILURE)
         finally:
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).

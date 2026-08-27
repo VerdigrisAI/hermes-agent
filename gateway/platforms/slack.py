@@ -1447,7 +1447,7 @@ class SlackAdapter(BasePlatformAdapter):
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
-        delivered = False
+        all_delivered = True
         last_error: Optional[str] = None
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -1470,6 +1470,8 @@ class SlackAdapter(BasePlatformAdapter):
                                 initial_comment_parts.append(
                                     "⚠️ One local image was not attached because it failed the Slack artifact policy."
                                 )
+                                all_delivered = False
+                                last_error = str(exc)
                                 continue
                             file_uploads.append({
                                 "content": local_bytes,
@@ -1478,6 +1480,8 @@ class SlackAdapter(BasePlatformAdapter):
                         else:
                             if not _is_safe_url(image_url):
                                 logger.warning("[Slack] Blocked unsafe image URL in batch")
+                                all_delivered = False
+                                last_error = "unsafe image URL was blocked"
                                 continue
                             try:
                                 response = await http_client.get(image_url)
@@ -1499,6 +1503,8 @@ class SlackAdapter(BasePlatformAdapter):
                                     "[Slack] Download failed for %s: %s",
                                     safe_url_for_log(image_url), dl_err,
                                 )
+                                all_delivered = False
+                                last_error = str(dl_err)
                                 continue
 
                 if not file_uploads:
@@ -1508,9 +1514,8 @@ class SlackAdapter(BasePlatformAdapter):
                             "\n".join(initial_comment_parts),
                             metadata=metadata,
                         )
-                        if comment_result.success:
-                            delivered = True
-                        else:
+                        if not comment_result.success:
+                            all_delivered = False
                             last_error = str(
                                 comment_result.error or "image caption send failed"
                             )
@@ -1530,7 +1535,6 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 self._record_uploaded_file_thread(chat_id, thread_ts)
                 _ = result
-                delivered = True
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
@@ -1543,15 +1547,14 @@ class SlackAdapter(BasePlatformAdapter):
                     metadata,
                     human_delay=human_delay,
                 )
-                if fallback_result.success:
-                    delivered = True
-                else:
+                if not fallback_result.success:
+                    all_delivered = False
                     last_error = str(
                         fallback_result.error or "image upload fallback failed"
                     )
         return SendResult(
-            success=delivered,
-            error=None if delivered else (last_error or "no images were delivered"),
+            success=all_delivered,
+            error=None if all_delivered else (last_error or "an image was not delivered"),
         )
 
     def _record_uploaded_file_thread(self, chat_id: str, thread_ts: Optional[str]) -> None:
@@ -1734,11 +1737,15 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
-    def discard_reply_requirement(self, event: MessageEvent) -> None:
+    async def discard_reply_requirement(self, event: MessageEvent) -> None:
         """Clear lifecycle state for a Slack event that must stay silent."""
-        super().discard_reply_requirement(event)
+        await super().discard_reply_requirement(event)
         ts = getattr(event, "message_id", None)
         if ts:
+            if ts in self._reacting_message_ids:
+                channel_id = getattr(event.source, "chat_id", None)
+                if channel_id:
+                    await self._remove_reaction(channel_id, ts, "eyes")
             self._reacting_message_ids.discard(ts)
             self._required_reply_message_ids.discard(ts)
 
@@ -1777,11 +1784,13 @@ class SlackAdapter(BasePlatformAdapter):
         terminal_signal_delivered = (
             outcome in {ProcessingOutcome.SUCCESS, ProcessingOutcome.CANCELLED}
             or failure_signaled
+            or event.delivery_state.reply_delivered
         )
         if (
             outcome == ProcessingOutcome.FAILURE
             and required_reply
             and not failure_signaled
+            and not event.delivery_state.reply_delivered
         ):
             fallback_result = await self._send_with_retry(
                 chat_id=channel_id,

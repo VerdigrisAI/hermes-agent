@@ -2478,6 +2478,33 @@ class TestReactions:
         assert adapter.send.await_args.kwargs["reply_to"] == event.message_id
 
     @pytest.mark.asyncio
+    async def test_detailed_error_reply_suppresses_generic_failure_text(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="detail"))
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000010",
+            expects_reply=True,
+        )
+        event.delivery_state.reply_attempted = True
+        event.delivery_state.reply_delivered = True
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.send.assert_not_awaited()
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
     async def test_required_failure_uses_text_when_reaction_fails(self, adapter):
         adapter._add_reaction = AsyncMock(return_value=False)
         adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback"))
@@ -2535,7 +2562,8 @@ class TestReactions:
         assert adapter.send.await_count == 2
         assert event.message_id not in adapter._required_reply_message_ids
 
-    def test_discard_reply_requirement_clears_slack_lifecycle_state(self, adapter):
+    @pytest.mark.asyncio
+    async def test_discard_reply_requirement_clears_slack_lifecycle_state(self, adapter):
         event = MessageEvent(
             text="ignored",
             message_type=MessageType.TEXT,
@@ -2551,11 +2579,38 @@ class TestReactions:
         adapter._reacting_message_ids.add(event.message_id)
         adapter._required_reply_message_ids.add(event.message_id)
 
-        adapter.discard_reply_requirement(event)
+        await adapter.discard_reply_requirement(event)
 
         assert event.expects_reply is False
         assert event.message_id not in adapter._reacting_message_ids
         assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_discard_reply_requirement_removes_existing_eyes(self, adapter):
+        event = MessageEvent(
+            text="ignored",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="group",
+                user_id="U_UNKNOWN",
+            ),
+            message_id="1234567890.000011",
+            expects_reply=True,
+        )
+        adapter._reacting_message_ids.add(event.message_id)
+        adapter._required_reply_message_ids.add(event.message_id)
+        adapter._remove_reaction = AsyncMock(return_value=True)
+
+        await adapter.discard_reply_requirement(event)
+
+        adapter._remove_reaction.assert_awaited_once_with(
+            "C123",
+            event.message_id,
+            "eyes",
+        )
+        assert event.message_id not in adapter._reacting_message_ids
 
     @pytest.mark.asyncio
     async def test_expected_cancellation_clears_reply_state_without_failure_signal(

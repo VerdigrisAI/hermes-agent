@@ -2415,6 +2415,39 @@ class GatewayRunner:
             queued_events.setdefault(session_key, []).insert(0, existing)
         pending_slot[session_key] = queued_event
 
+    def _merge_pending_events_by_arrival(
+        self,
+        session_key: str,
+        adapter: Any,
+        *events: "MessageEvent",
+    ) -> Optional["MessageEvent"]:
+        """Merge pending events and return the earliest event by arrival time."""
+        if adapter is None:
+            return min(events, key=lambda event: event.timestamp, default=None)
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return min(events, key=lambda event: event.timestamp, default=None)
+        queued_events = getattr(self, "_queued_events", None)
+        if queued_events is None:
+            queued_events = {}
+            self._queued_events = queued_events
+
+        ordered = [event for event in events if event is not None]
+        staged = pending_slot.pop(session_key, None)
+        if staged is not None:
+            ordered.append(staged)
+        ordered.extend(queued_events.pop(session_key, []))
+        ordered.sort(key=lambda event: event.timestamp)
+        if not ordered:
+            return None
+
+        first, *remaining = ordered
+        if remaining:
+            pending_slot[session_key] = remaining[0]
+        if len(remaining) > 1:
+            queued_events[session_key] = remaining[1:]
+        return first
+
     def _remember_steer_event(
         self,
         session_key: str,
@@ -2510,6 +2543,53 @@ class GatewayRunner:
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
         return depth
+
+    async def _reject_queued_events_after_failed_drain(
+        self,
+        session_key: str,
+        source: SessionSource,
+    ) -> None:
+        """Give every accepted queued turn a terminal result after run failure."""
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return
+        queued_events: list[MessageEvent] = []
+        queued_slot = _dequeue_pending_event(adapter, session_key)
+        if queued_slot is not None:
+            queued_events.append(queued_slot)
+        queued_events.extend(
+            getattr(self, "_queued_events", {}).pop(session_key, [])
+        )
+        for queued_event in queued_events:
+            delivered = False
+            try:
+                rejection_result = await adapter._send_with_retry(
+                    chat_id=queued_event.source.chat_id,
+                    content=(
+                        f"⏳ Gateway is {self._status_action_gerund()} and cannot "
+                        "accept the queued turn. Please resend after it comes back."
+                    ),
+                    reply_to=self._reply_anchor_for_event(queued_event),
+                    metadata=self._thread_metadata_for_source(
+                        queued_event.source,
+                        self._reply_anchor_for_event(queued_event),
+                    ),
+                )
+                delivered = _record_send_result_delivery(
+                    queued_event,
+                    rejection_result,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reject queued turn after drain error: %s",
+                    exc,
+                )
+                _record_reply_attempt(queued_event)
+            await adapter._run_processing_hook(
+                "on_processing_complete",
+                queued_event,
+                ProcessingOutcome.SUCCESS if delivered else ProcessingOutcome.FAILURE,
+            )
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
@@ -3002,7 +3082,7 @@ class GatewayRunner:
             adapter = self.adapters.get(event.source.platform)
             discard = getattr(adapter, "discard_reply_requirement", None)
             if callable(discard):
-                discard(event)
+                await discard(event)
             return True  # handled (silently dropped); do not fall through
 
         # --- Draining case (gateway restarting/stopping) ---
@@ -6624,12 +6704,12 @@ class GatewayRunner:
         """
         source = event.source
 
-        def _discard_reply_requirement() -> None:
+        async def _discard_reply_requirement() -> None:
             event.expects_reply = False
             adapter = self.adapters.get(source.platform)
             discard = getattr(adapter, "discard_reply_requirement", None)
             if callable(discard):
-                discard(event)
+                await discard(event)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -6666,7 +6746,7 @@ class GatewayRunner:
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
-                    _discard_reply_requirement()
+                    await _discard_reply_requirement()
                     return None
                 if _action == "rewrite":
                     _new_text = _result.get("text")
@@ -6688,7 +6768,7 @@ class GatewayRunner:
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
-                _discard_reply_requirement()
+                await _discard_reply_requirement()
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
@@ -6699,7 +6779,7 @@ class GatewayRunner:
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
                 if self.pairing_store._is_rate_limited(platform_name, source.user_id):
-                    _discard_reply_requirement()
+                    await _discard_reply_requirement()
                     return None
                 code = self.pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
@@ -6730,7 +6810,7 @@ class GatewayRunner:
                 source.chat_type == "dm"
                 and self._get_unauthorized_dm_behavior(source.platform) == "pair"
             ):
-                _discard_reply_requirement()
+                await _discard_reply_requirement()
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
@@ -11365,7 +11445,7 @@ class GatewayRunner:
         response: str,
         event: MessageEvent,
         adapter,
-    ) -> None:
+    ) -> bool:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
         Called after streaming has already sent the text to the user, so the
@@ -11385,14 +11465,14 @@ class GatewayRunner:
                 detail=detail,
             )
 
-        async def _check_result(file_path: str, result) -> None:
+        async def _check_result(file_path: str, result) -> bool:
             correlation_id = media_delivery_correlation_id(file_path)
             if not getattr(result, "success", False):
                 await _report_failure(
                     file_path,
                     str(getattr(result, "error", None) or "upload returned no success confirmation"),
                 )
-                return
+                return False
             logger.info(
                 "artifact_delivery correlation_id=%s stage=upload_result "
                 "platform=%s chat_id=%s thread_id=%s filename=%s "
@@ -11404,8 +11484,10 @@ class GatewayRunner:
                 Path(file_path).name,
                 getattr(result, "message_id", None),
             )
+            return True
 
         try:
+            delivery_results: list[bool] = []
             # Capture [[as_document]] before extract_media strips it, so the
             # dispatch partition below can route image-extension files
             # through send_document (preserving bytes) instead of
@@ -11413,7 +11495,7 @@ class GatewayRunner:
             force_document_attachments = "[[as_document]]" in response
 
             media_files, _ = adapter.extract_media(response)
-            _, cleaned = adapter.extract_images(response)
+            extracted_images, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
 
             for file_path, _ in media_files:
@@ -11457,18 +11539,24 @@ class GatewayRunner:
                 else:
                     non_image_local.append(file_path)
 
-            if image_paths:
+            if image_paths or extracted_images:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [
+                        *extracted_images,
+                        *((f"file://{_quote(p)}", "") for p in image_paths),
+                    ]
                     result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
-                    await _check_result(image_paths[0], result)
+                    first_image = image_paths[0] if image_paths else extracted_images[0][0]
+                    delivery_results.append(await _check_result(first_image, result))
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
-                    await _report_failure(image_paths[0], str(e))
+                    first_image = image_paths[0] if image_paths else extracted_images[0][0]
+                    await _report_failure(first_image, str(e))
+                    delivery_results.append(False)
 
             for media_path, is_voice in non_image_media:
                 try:
@@ -11491,10 +11579,11 @@ class GatewayRunner:
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
-                    await _check_result(media_path, result)
+                    delivery_results.append(await _check_result(media_path, result))
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
                     await _report_failure(media_path, str(e))
+                    delivery_results.append(False)
 
             for file_path in non_image_local:
                 try:
@@ -11511,13 +11600,17 @@ class GatewayRunner:
                             file_path=file_path,
                             metadata=_thread_meta,
                         )
-                    await _check_result(file_path, result)
+                    delivery_results.append(await _check_result(file_path, result))
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
                     await _report_failure(file_path, str(e))
+                    delivery_results.append(False)
+
+            return bool(delivery_results) and all(delivery_results)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+            return False
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
@@ -17089,6 +17182,10 @@ class GatewayRunner:
                     prefix = f"{final_response}\n" if final_response else ""
                     final_response = prefix + "\n".join(unique_tags)
 
+            # Queue handling reads this result after the worker returns.
+            # Keep it synchronized so tool-only MEDIA directives survive.
+            result["final_response"] = final_response
+
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
@@ -17627,11 +17724,13 @@ class GatewayRunner:
                         reply_event,
                     )
                     if leftover_event is not None and pending_event is not None:
-                        # The steer arrived during the run, before any later
-                        # /queue messages. Keep that temporal FIFO order.
-                        self._prepend_fifo(session_key, pending_event, adapter)
-                        pending_event = leftover_event
-                        pending = leftover_event.text
+                        pending_event = self._merge_pending_events_by_arrival(
+                            session_key,
+                            adapter,
+                            pending_event,
+                            leftover_event,
+                        )
+                        pending = pending_event.text if pending_event else None
                     elif leftover_event is not None:
                         pending_event = leftover_event
                         pending = leftover_event.text
@@ -17755,7 +17854,12 @@ class GatewayRunner:
                         or (_sc and getattr(_sc, "final_content_delivered", False))
                     )
                     first_response = result.get("final_response", "")
-                    if first_response and not _already_streamed:
+                    media_files, first_text = adapter.extract_media(first_response)
+                    images, first_text = adapter.extract_images(first_text)
+                    local_files, first_text = adapter.extract_local_files(first_text)
+                    first_text = first_text.replace("[[as_document]]", "").strip()
+                    has_media = bool(media_files or images or local_files)
+                    if first_text and not _already_streamed:
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
@@ -17765,7 +17869,7 @@ class GatewayRunner:
                                 _record_reply_attempt(reply_event)
                             first_send_result = await adapter._send_with_retry(
                                 chat_id=source.chat_id,
-                                content=first_response,
+                                content=first_text,
                                 metadata=_status_thread_metadata,
                             )
                             if reply_event is not None and _record_send_result_delivery(
@@ -17775,7 +17879,7 @@ class GatewayRunner:
                                 result["already_sent"] = True
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
-                    elif first_response:
+                    elif first_text:
                         if reply_event is not None:
                             _record_confirmed_reply_delivery(
                                 reply_event,
@@ -17785,6 +17889,25 @@ class GatewayRunner:
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
+                    if has_media:
+                        if reply_event is not None:
+                            _record_reply_attempt(reply_event)
+                        media_event = reply_event or MessageEvent(
+                            text=message,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id=event_message_id,
+                        )
+                        media_delivered = await self._deliver_media_from_response(
+                            first_response,
+                            media_event,
+                            adapter,
+                        )
+                        if media_delivered and reply_event is not None:
+                            _record_confirmed_reply_delivery(
+                                reply_event,
+                                {"already_sent": True, "failed": False},
+                            )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
@@ -17891,6 +18014,13 @@ class GatewayRunner:
                     followup_result,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
+        except Exception:
+            if self._draining and session_key:
+                await self._reject_queued_events_after_failed_drain(
+                    session_key,
+                    source,
+                )
+            raise
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:

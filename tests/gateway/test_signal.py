@@ -1363,7 +1363,7 @@ class TestSignalSendMultipleImages:
         adapter._stop_typing_indicator = AsyncMock()
 
         images = _make_image_files(tmp_path, 5)
-        await adapter.send_multiple_images(chat_id="+155****4567", images=images)
+        result = await adapter.send_multiple_images(chat_id="+155****4567", images=images)
 
         assert len(captured) == 1
         params = captured[0]["params"]
@@ -1372,6 +1372,7 @@ class TestSignalSendMultipleImages:
         assert len(params["attachments"]) == 5
         # raise_on_rate_limit must be opted into so the retry loop sees 429s
         assert captured[0]["kwargs"].get("raise_on_rate_limit") is True
+        assert result.success is True
 
     @pytest.mark.asyncio
     async def test_skips_bad_images_in_mixed_batch(self, monkeypatch, tmp_path):
@@ -1382,12 +1383,13 @@ class TestSignalSendMultipleImages:
 
         good = _make_image_files(tmp_path, 2, prefix="ok")
         bad = [(f"file://{tmp_path}/missing.png", "")]
-        await adapter.send_multiple_images(
+        result = await adapter.send_multiple_images(
             chat_id="+155****4567", images=good[:1] + bad + good[1:]
         )
 
         assert len(captured) == 1
         assert len(captured[0]["params"]["attachments"]) == 2
+        assert result.success is False
 
     @pytest.mark.asyncio
     async def test_429_calibrates_scheduler_then_retries(self, monkeypatch, tmp_path):
@@ -1409,7 +1411,7 @@ class TestSignalSendMultipleImages:
         _patch_scheduler_sleep(monkeypatch, sleep_calls)
 
         images = _make_image_files(tmp_path, 3)
-        await adapter.send_multiple_images(chat_id="+155****4567", images=images)
+        result = await adapter.send_multiple_images(chat_id="+155****4567", images=images)
 
         assert len(captured) == 2  # initial 429 + retry success
         assert sleep_calls == [pytest.approx(3 * 27.0, abs=1.0)]
@@ -1470,10 +1472,13 @@ class TestSignalSendMultipleImages:
         _patch_scheduler_sleep(monkeypatch, sleep_calls)
 
         images = _make_image_files(tmp_path, 33)  # forces 2 batches
-        await adapter.send_multiple_images(chat_id="+155****4567", images=images)
+        result = await adapter.send_multiple_images(
+            chat_id="+155****4567", images=images
+        )
 
         # 2 attempts on batch 0 + 1 on batch 1
         assert len(captured) == 3
+        assert result.success is False
 
     @pytest.mark.asyncio
     async def test_full_batch_emits_pacing_notice_for_followup(

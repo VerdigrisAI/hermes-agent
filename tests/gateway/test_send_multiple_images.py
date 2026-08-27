@@ -80,19 +80,43 @@ class TestBaseDefaultLoop:
             ("file:///tmp/foo.png", "local"),
             ("https://x.com/c.gif", ""),
         ]
-        _run(a.send_multiple_images("chat1", images))
+        result = _run(a.send_multiple_images("chat1", images))
         # 2 URL images + 1 animation + 1 local file
         assert len(a.sent_images) == 2
         assert len(a.sent_animations) == 1
         assert len(a.sent_files) == 1
         assert a.sent_files[0][1] == "/tmp/foo.png"
+        assert result.success is True
 
     def test_empty_batch_is_noop(self):
         a = _StubAdapter()
-        _run(a.send_multiple_images("chat1", []))
+        result = _run(a.send_multiple_images("chat1", []))
         assert a.sent_images == []
         assert a.sent_animations == []
         assert a.sent_files == []
+        assert result.success is False
+
+    def test_one_failed_image_makes_batch_fail(self):
+        a = _StubAdapter()
+        a.send_image = AsyncMock(
+            side_effect=[
+                SendResult(success=True, message_id="one"),
+                SendResult(success=False, error="upload failed"),
+            ]
+        )
+
+        result = _run(
+            a.send_multiple_images(
+                "chat1",
+                [
+                    ("https://x.com/a.png", "first"),
+                    ("https://x.com/b.png", "second"),
+                ],
+            )
+        )
+
+        assert result.success is False
+        assert result.error == "upload failed"
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +159,13 @@ class TestTelegramMultiImage:
         # Make InputMediaPhoto a concrete class that records its args
         telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media, "caption": caption})
 
-        _run(adapter.send_multiple_images("12345", images))
+        result = _run(adapter.send_multiple_images("12345", images))
 
         adapter._bot.send_media_group.assert_awaited_once()
         call_kwargs = adapter._bot.send_media_group.call_args.kwargs
         assert call_kwargs["chat_id"] == 12345
         assert len(call_kwargs["media"]) == 3
+        assert result.success is True
 
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""
@@ -236,10 +261,11 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=False)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("67890", images))
+        result = _run(adapter.send_multiple_images("67890", images))
 
         mock_channel.send.assert_awaited_once()
         assert len(mock_channel.send.call_args.kwargs["files"]) == 3
+        assert result.success is True
 
     def test_batch_over_10_chunks_into_two_messages(self, adapter, tmp_path):
         """15 local images → two channel.send calls (10 + 5)."""
@@ -354,13 +380,42 @@ class TestSlackMultiImage:
         sizes = [len(c.kwargs["file_uploads"]) for c in client.files_upload_v2.await_args_list]
         assert sizes == [10, 2]
 
+    def test_partial_chunk_failure_returns_failure(self, adapter, tmp_path):
+        paths = []
+        for i in range(12):
+            path = tmp_path / f"partial_{i}.png"
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 5)
+            paths.append(path)
+        client = adapter._get_client("C12345")
+        client.files_upload_v2.side_effect = [
+            {"ok": True},
+            RuntimeError("second chunk failed"),
+        ]
+
+        with patch.object(
+            BasePlatformAdapter,
+            "send_multiple_images",
+            new=AsyncMock(
+                return_value=SendResult(success=False, error="fallback failed")
+            ),
+        ):
+            result = _run(
+                adapter.send_multiple_images(
+                    "C12345",
+                    [(f"file://{path}", "") for path in paths],
+                )
+            )
+
+        assert result.success is False
+        assert result.error == "fallback failed"
+
     def test_empty_noop(self, adapter):
         _run(adapter.send_multiple_images("C12345", []))
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_not_called()
 
     def test_all_policy_denied_images_emit_visible_notice(self, adapter):
-        _run(adapter.send_multiple_images(
+        result = _run(adapter.send_multiple_images(
             "C12345", [("file:///etc/hosts", "requested image")]
         ))
 
@@ -369,6 +424,7 @@ class TestSlackMultiImage:
         adapter.send.assert_awaited_once()
         notice = adapter.send.await_args.args[1]
         assert "failed the Slack artifact policy" in notice
+        assert result.success is False
 
 
 # ---------------------------------------------------------------------------
@@ -402,13 +458,14 @@ class TestMattermostMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("channel123", images))
+        result = _run(adapter.send_multiple_images("channel123", images))
 
         assert adapter._upload_file.await_count == 3
         adapter._api_post.assert_awaited_once()
         payload = adapter._api_post.await_args.args[1]
         assert payload["channel_id"] == "channel123"
         assert len(payload["file_ids"]) == 3
+        assert result.success is True
 
     def test_batch_over_5_chunks(self, adapter, tmp_path):
         """7 images → 2 posts (5 + 2)."""
@@ -462,13 +519,14 @@ class TestEmailMultiImage:
         with patch.object(
             adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
         ) as mock_send:
-            _run(adapter.send_multiple_images("user@example.com", images))
+            result = _run(adapter.send_multiple_images("user@example.com", images))
 
         mock_send.assert_called_once()
         to_addr, body, file_paths = mock_send.call_args.args
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
+        assert result.success is True
 
     def test_remote_urls_linked_in_body(self, adapter, tmp_path):
         """Remote URL images get their URL appended to the body, no attachment."""

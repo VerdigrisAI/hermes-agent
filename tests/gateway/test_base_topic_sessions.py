@@ -303,6 +303,34 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_image_batch_failure_sends_visible_notice(self):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(
+                0,
+                result="Chart attached.\n![chart](https://example.com/chart.png)",
+            )
+        )
+        adapter._keep_typing = hold_typing
+        adapter.send_multiple_images = AsyncMock(
+            return_value=SendResult(success=False, error="upload failed")
+        )
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert len(adapter.sent) == 2
+        assert adapter.sent[0]["content"] == "Chart attached."
+        assert "was not attached" in adapter.sent[1]["content"]
+
+    @pytest.mark.asyncio
     async def test_queued_reply_events_receive_the_final_delivery_outcome(self):
         adapter = DummyTelegramAdapter()
 
@@ -410,6 +438,8 @@ class TestBasePlatformTopicSessions:
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
         ]
+        assert len(adapter.sent) == 1
+        assert "RuntimeError" in adapter.sent[0]["content"]
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_cancellation_unsuccessful(self):
