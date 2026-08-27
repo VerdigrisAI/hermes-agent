@@ -394,13 +394,16 @@ async def test_streaming_delivery_surfaces_image_batch_failure_in_same_thread():
     )
     image = "/opt/data/artifacts/slack/chart.png"
 
-    await GatewayRunner._deliver_media_from_response(
+    delivered = await GatewayRunner._deliver_media_from_response(
         _fake_runner({"thread_ts": thread_ts}),
         f"MEDIA:{image}",
         event,
         adapter,
     )
 
+    assert delivered is False
+    assert event.delivery_state.reply_failed is False
+    assert event.delivery_state.failure_notice_delivered is True
     adapter.send_multiple_images.assert_awaited_once()
     adapter.send.assert_awaited_once()
     notice = adapter.send.await_args.kwargs
