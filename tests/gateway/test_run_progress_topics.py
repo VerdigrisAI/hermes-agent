@@ -764,6 +764,27 @@ class QueuedFailedMediaAgent:
         }
 
 
+class QueuedFailedImageBatchAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "Charts attached.\n"
+                "![first](https://example.com/first.png)\n"
+                "![second](https://example.com/second.png)"
+                if type(self).calls == 1
+                else "queued response"
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class SecondCallRaisingAgent:
     calls = 0
 
@@ -814,6 +835,18 @@ class FailedMediaNoticeAdapter(ProgressCaptureAdapter):
         if content.startswith("⚠️"):
             return SendResult(success=False, error="notice failed")
         return SendResult(success=True, message_id="text-1")
+
+
+class FailedImageBatchAdapter(ProgressCaptureAdapter):
+    async def send_multiple_images(
+        self,
+        chat_id,
+        images,
+        reply_to=None,
+        metadata=None,
+        human_delay=0.0,
+    ):
+        return SendResult(success=False, error="one image failed")
 
 
 class RaisingAgent:
@@ -1736,6 +1769,40 @@ async def test_queued_media_and_notice_failure_mark_owner_failed(monkeypatch, tm
     assert result["final_response"] == "queued response"
     assert owner.delivery_state.reply_delivered is True
     assert owner.delivery_state.reply_failed is True
+
+
+@pytest.mark.asyncio
+async def test_queued_image_batch_failure_uses_generic_batch_name(monkeypatch, tmp_path):
+    QueuedFailedImageBatchAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="failed-image-batch-owner",
+        expects_reply=True,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedFailedImageBatchAgent,
+        session_id="sess-queued-failed-image-batch",
+        pending_text="queued follow-up",
+        reply_event=owner,
+        adapter_cls=FailedImageBatchAdapter,
+    )
+
+    assert result["final_response"] == "queued response"
+    notice = next(item["content"] for item in adapter.sent if "was not attached" in item["content"])
+    assert "2-image batch" in notice
+    assert "first.png" not in notice
+    assert owner.delivery_state.reply_failed is False
 
 
 @pytest.mark.asyncio

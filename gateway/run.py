@@ -11477,7 +11477,12 @@ class GatewayRunner:
         from pathlib import Path
         from urllib.parse import quote as _quote
 
-        async def _report_failure(file_path: str, detail: str) -> bool:
+        async def _report_failure(
+            file_path: str,
+            detail: str,
+            *,
+            display_name: str | None = None,
+        ) -> bool:
             return await report_media_delivery_failure(
                 adapter,
                 chat_id=event.source.chat_id,
@@ -11485,14 +11490,21 @@ class GatewayRunner:
                 file_path=file_path,
                 metadata=_thread_meta,
                 detail=detail,
+                display_name=display_name,
             )
 
-        async def _check_result(file_path: str, result) -> bool:
+        async def _check_result(
+            file_path: str,
+            result,
+            *,
+            display_name: str | None = None,
+        ) -> bool:
             correlation_id = media_delivery_correlation_id(file_path)
             if not getattr(result, "success", False):
                 return await _report_failure(
                     file_path,
                     str(getattr(result, "error", None) or "upload returned no success confirmation"),
+                    display_name=display_name,
                 )
             logger.info(
                 "artifact_delivery correlation_id=%s stage=upload_result "
@@ -11572,11 +11584,23 @@ class GatewayRunner:
                         metadata=_thread_meta,
                     )
                     first_image = image_paths[0] if image_paths else extracted_images[0][0]
-                    delivery_results.append(await _check_result(first_image, result))
+                    delivery_results.append(
+                        await _check_result(
+                            first_image,
+                            result,
+                            display_name=f"{len(images)}-image batch",
+                        )
+                    )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
                     first_image = image_paths[0] if image_paths else extracted_images[0][0]
-                    delivery_results.append(await _report_failure(first_image, str(e)))
+                    delivery_results.append(
+                        await _report_failure(
+                            first_image,
+                            str(e),
+                            display_name=f"{len(images)}-image batch",
+                        )
+                    )
 
             for media_path, is_voice in non_image_media:
                 try:
