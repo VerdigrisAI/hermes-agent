@@ -1423,6 +1423,25 @@ def _preserve_queued_followup_history_offset(
     return merged
 
 
+def _merge_followup_reply_events(
+    pending_event: MessageEvent | None,
+    followup_result: dict,
+) -> list[MessageEvent]:
+    """Collect reply events without assuming the follow-up has an event.
+
+    Interrupt messages and leftover steers are plain strings. Queued platform
+    messages have a ``MessageEvent`` and can carry merged delivery state.
+    """
+    reply_events = list(followup_result.get("_reply_events", []))
+    if pending_event is not None:
+        reply_events = [
+            pending_event,
+            *pending_event.delivery_state.merged_events,
+            *reply_events,
+        ]
+    return reply_events
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -17599,9 +17618,10 @@ class GatewayRunner:
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                 )
-                reply_events = [pending_event, *pending_event.delivery_state.merged_events]
-                reply_events.extend(followup_result.get("_reply_events", []))
-                followup_result["_reply_events"] = reply_events
+                followup_result["_reply_events"] = _merge_followup_reply_events(
+                    pending_event,
+                    followup_result,
+                )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

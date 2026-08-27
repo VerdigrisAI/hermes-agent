@@ -11,7 +11,7 @@ do not get recycled into the pending-user-message follow-up path.
 
 from types import SimpleNamespace
 
-from gateway.run import _is_control_interrupt_message
+from gateway.run import _is_control_interrupt_message, _merge_followup_reply_events
 
 
 def _extract_channel_prompt(pending_event):
@@ -70,3 +70,34 @@ class TestControlInterruptMessages:
     def test_real_user_interrupt_message_still_requeues(self):
         result = _extract_pending_text(True, None, "actually use postgres instead")
         assert result == "actually use postgres instead"
+
+
+class TestStringOnlyFollowupReplyEvents:
+    """String-only interrupt and steer paths have no MessageEvent."""
+
+    def test_interrupt_message_without_event_does_not_crash(self):
+        recursive_event = SimpleNamespace()
+
+        reply_events = _merge_followup_reply_events(
+            None,
+            {"_reply_events": [recursive_event]},
+        )
+
+        assert reply_events == [recursive_event]
+
+    def test_pending_steer_without_event_returns_empty_list(self):
+        assert _merge_followup_reply_events(None, {}) == []
+
+    def test_queued_event_includes_merged_and_recursive_events(self):
+        merged_event = SimpleNamespace()
+        recursive_event = SimpleNamespace()
+        pending_event = SimpleNamespace(
+            delivery_state=SimpleNamespace(merged_events=[merged_event])
+        )
+
+        reply_events = _merge_followup_reply_events(
+            pending_event,
+            {"_reply_events": [recursive_event]},
+        )
+
+        assert reply_events == [pending_event, merged_event, recursive_event]
