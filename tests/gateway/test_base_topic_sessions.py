@@ -245,6 +245,34 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_queued_reply_events_receive_the_final_delivery_outcome(self):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        queued = _make_event(
+            "-1001", "17585", message_id="2", expects_reply=True
+        )
+
+        async def handler(event):
+            event.delivery_state.completion_events.append(queued)
+            return "queued answer"
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert queued.delivery_state.reply_delivered is True
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.SUCCESS),
+            ("complete", "2", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_exception_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 

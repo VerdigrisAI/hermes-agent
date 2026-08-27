@@ -303,6 +303,32 @@ def test_session_expired_handler_returns_none_when_retry_also_fails(
         mcp_tool._servers.pop("srv-retry-fail", None)
 
 
+def test_session_reconnect_returns_application_error(monkeypatch, tmp_path):
+    """A completed retry is healthy transport even when the tool rejects input."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _handle_session_expired_and_retry
+
+    server, _ = _install_stub_server("srv-app-error")
+    mcp_tool._servers["srv-app-error"] = server
+    mcp_tool._server_error_counts["srv-app-error"] = 2
+    application_error = json.dumps({"error": "invalid tool argument"})
+
+    try:
+        result = _handle_session_expired_and_retry(
+            "srv-app-error",
+            RuntimeError("Invalid or expired session"),
+            lambda: application_error,
+            "tools/call",
+        )
+        assert result == application_error
+        assert mcp_tool._server_error_counts["srv-app-error"] == 0
+    finally:
+        mcp_tool._servers.pop("srv-app-error", None)
+        mcp_tool._server_error_counts.pop("srv-app-error", None)
+
+
 # ---------------------------------------------------------------------------
 # Parallel coverage for resources/list, resources/read, prompts/list,
 # prompts/get — all four handlers share the same exception path.

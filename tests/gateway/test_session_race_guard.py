@@ -228,6 +228,36 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.expects_reply is True
 
 
+def test_merge_pending_message_event_retains_required_reply_before_optional_followup():
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+    required = MessageEvent(
+        text="answer this",
+        message_type=MessageType.TEXT,
+        source=source,
+        expects_reply=True,
+    )
+    optional = MessageEvent(
+        text="extra context",
+        message_type=MessageType.TEXT,
+        source=source,
+        expects_reply=False,
+    )
+
+    merge_pending_message_event(pending, session_key, required, merge_text=True)
+    merge_pending_message_event(pending, session_key, optional, merge_text=True)
+
+    merged = pending[session_key]
+    assert merged.expects_reply is True
+    assert merged.delivery_state.merged_events == [optional]
+
+
 def test_merge_pending_message_event_promotes_document_followups_over_text():
     pending = {}
     source = SessionSource(

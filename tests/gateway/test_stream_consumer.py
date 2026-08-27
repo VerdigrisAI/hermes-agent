@@ -217,9 +217,10 @@ class TestSendOrEditMediaStripping:
         adapter.MAX_MESSAGE_LENGTH = 4096
 
         consumer = GatewayStreamConsumer(adapter, "chat_123")
-        await consumer._send_or_edit("MEDIA:/tmp/image.png")
+        result = await consumer._send_or_edit("MEDIA:/tmp/image.png")
 
         adapter.send.assert_not_called()
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_cursor_only_update_skips_send(self):
@@ -259,12 +260,12 @@ class TestSendOrEditMediaStripping:
         # No message_id yet (first send) — short text + cursor should be skipped
         assert consumer._message_id is None
         result = await consumer._send_or_edit("I ▉")
-        assert result is True
+        assert result is False
         adapter.send.assert_not_called()
 
         # 3 chars is still under the threshold
         result = await consumer._send_or_edit("Hi! ▉")
-        assert result is True
+        assert result is False
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1780,4 +1781,3 @@ class TestUtf16OverflowDetection:
         # auto-attr mock. Verified indirectly by all the other tests in
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
-

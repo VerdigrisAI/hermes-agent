@@ -2288,14 +2288,10 @@ def _handle_auth_error_and_retry(
 
         try:
             result = retry_call()
-            try:
-                parsed = json.loads(result)
-                if "error" not in parsed:
-                    _reset_server_error(server_name)
-                    return result
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)
-                return result
+            # A completed MCP response proves the transport recovered. The
+            # payload can still contain an application-level tool error.
+            _reset_server_error(server_name)
+            return result
         except Exception as retry_exc:
             logger.warning(
                 "MCP %s/%s retry after auth recovery failed: %s",
@@ -2431,14 +2427,11 @@ def _handle_session_expired_and_retry(
 
     try:
         result = retry_call()
-        try:
-            parsed = json.loads(result)
-            if "error" not in parsed:
-                _server_error_counts[server_name] = 0
-                return result
-        except (json.JSONDecodeError, TypeError):
-            _server_error_counts[server_name] = 0
-            return result
+        # A completed MCP response proves the replacement transport works.
+        # Preserve application-level errors instead of treating them as a
+        # second session failure.
+        _server_error_counts[server_name] = 0
+        return result
     except Exception as retry_exc:
         logger.warning(
             "MCP %s/%s retry after session reconnect failed: %s",

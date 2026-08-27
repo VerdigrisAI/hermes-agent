@@ -1003,6 +1003,8 @@ class MessageDeliveryState:
     """Delivery evidence shared across copies of one inbound event."""
 
     reply_delivered: bool = False
+    merged_events: List[Any] = field(default_factory=list)
+    completion_events: List[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -1215,6 +1217,8 @@ def merge_pending_message_event(
         # A merged event must retain the strongest reply contract. Otherwise,
         # a later optional fragment can hide an earlier direct mention or DM.
         existing.expects_reply = existing.expects_reply or event.expects_reply
+        existing.delivery_state.merged_events.append(event)
+        existing.delivery_state.merged_events.extend(event.delivery_state.merged_events)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -3506,6 +3510,17 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            completion_outcome = (
+                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE
+            )
+            for completion_event in event.delivery_state.completion_events:
+                if processing_ok:
+                    completion_event.delivery_state.reply_delivered = True
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    completion_event,
+                    completion_outcome,
+                )
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:

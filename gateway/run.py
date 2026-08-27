@@ -852,6 +852,14 @@ def _record_confirmed_reply_delivery(event: MessageEvent, agent_result: dict) ->
     return True
 
 
+def _record_send_result_delivery(event: MessageEvent, send_result: Any) -> bool:
+    """Record a direct adapter send only when the adapter confirms success."""
+    delivered = bool(send_result is not None and getattr(send_result, "success", False))
+    if delivered:
+        event.delivery_state.reply_delivered = True
+    return delivered
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -6523,21 +6531,23 @@ class GatewayRunner:
                 if code:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        await adapter.send(
+                        send_result = await adapter.send(
                             source.chat_id,
                             f"Hi~ I don't recognize you yet!\n\n"
                             f"Here's your pairing code: `{code}`\n\n"
                             f"Ask the bot owner to run:\n"
                             f"`hermes pairing approve {platform_name} {code}`"
                         )
+                        _record_send_result_delivery(event, send_result)
                 else:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        await adapter.send(
+                        send_result = await adapter.send(
                             source.chat_id,
                             "Too many pairing requests right now~ "
                             "Please try again later!"
                         )
+                        _record_send_result_delivery(event, send_result)
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
@@ -7786,10 +7796,11 @@ class GatewayRunner:
                 if _ctx_result.blocked:
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        await _adapter.send(
+                        send_result = await _adapter.send(
                             source.chat_id,
                             "\n".join(_ctx_result.warnings) or "Context injection refused.",
                         )
+                        _record_send_result_delivery(event, send_result)
                     return None
                 if _ctx_result.expanded:
                     message_text = _ctx_result.message
@@ -8451,6 +8462,9 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+            )
+            event.delivery_state.completion_events.extend(
+                agent_result.pop("_reply_events", [])
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -15571,6 +15585,9 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        _interim_delivery_futures: List[Any] = []
+        _interim_delivery_lock = threading.Lock()
+        _delivered_interim_texts: List[str] = []
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -16300,16 +16317,26 @@ class GatewayRunner:
                     return
                 if already_streamed or not _status_adapter or not str(text or "").strip():
                     return
-                safe_schedule_threadsafe(
-                    _status_adapter.send(
+                async def _send_interim_with_evidence() -> Any:
+                    send_result = await _status_adapter.send(
                         _status_chat_id,
                         text,
                         metadata=_status_thread_metadata,
-                    ),
+                    )
+                    if getattr(send_result, "success", False):
+                        with _interim_delivery_lock:
+                            _delivered_interim_texts.append(str(text).strip())
+                    return send_result
+
+                future = safe_schedule_threadsafe(
+                    _send_interim_with_evidence(),
                     _loop_for_step,
                     logger=logger,
                     log_message="interim_assistant_callback scheduling error",
                 )
+                if future is not None:
+                    with _interim_delivery_lock:
+                        _interim_delivery_futures.append(future)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
@@ -17261,6 +17288,28 @@ class GatewayRunner:
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
 
+            if not _inactivity_timeout and isinstance(response, dict):
+                with _interim_delivery_lock:
+                    interim_futures = list(_interim_delivery_futures)
+                if interim_futures:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                *(asyncio.wrap_future(future) for future in interim_futures),
+                                return_exceptions=True,
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        for future in interim_futures:
+                            future.cancel()
+                final_text = str(response.get("final_response") or "").strip()
+                with _interim_delivery_lock:
+                    preview_delivered = final_text in _delivered_interim_texts
+                response["response_previewed"] = bool(
+                    response.get("response_previewed") and preview_delivered
+                )
+
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
@@ -17557,6 +17606,9 @@ class GatewayRunner:
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                 )
+                reply_events = [pending_event, *pending_event.delivery_state.merged_events]
+                reply_events.extend(followup_result.get("_reply_events", []))
+                followup_result["_reply_events"] = reply_events
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

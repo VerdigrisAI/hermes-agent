@@ -13,6 +13,7 @@ Covers four fix paths:
 """
 
 import asyncio
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,7 +28,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import SessionSource, build_session_key
-from gateway.run import _record_confirmed_reply_delivery
+from gateway.run import _record_confirmed_reply_delivery, _record_send_result_delivery
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,21 @@ def test_failed_stream_does_not_record_reply_delivery():
 
     assert delivered is False
     assert event.delivery_state.reply_delivered is False
+
+
+def test_direct_send_records_only_confirmed_delivery_across_rewrite():
+    event = _make_event()
+    rewritten = dataclasses.replace(event, text="rewritten")
+
+    assert _record_send_result_delivery(
+        rewritten, SendResult(success=False, error="failed")
+    ) is False
+    assert event.delivery_state.reply_delivered is False
+
+    assert _record_send_result_delivery(
+        rewritten, SendResult(success=True, message_id="reply-1")
+    ) is True
+    assert event.delivery_state.reply_delivered is True
 
 
 # ===================================================================

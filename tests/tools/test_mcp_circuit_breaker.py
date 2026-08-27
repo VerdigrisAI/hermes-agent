@@ -287,3 +287,39 @@ def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
         )
     finally:
         _cleanup(mcp_tool, "srv")
+
+
+def test_auth_reconnect_returns_application_error_without_reauth(monkeypatch, tmp_path):
+    """A completed retry can return a tool error without a transport failure."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from mcp.client.auth import OAuthFlowError
+    from tools import mcp_tool
+    from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+
+    async def _call_tool_unused(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("session.call_tool should not be reached")
+
+    _install_stub_server(mcp_tool, "srv-app-error", _call_tool_unused)
+    mcp_tool._ensure_mcp_loop()
+    manager = get_manager()
+
+    async def _handle_401(_name, token=None):
+        return True
+
+    monkeypatch.setattr(manager, "handle_401", _handle_401)
+    application_error = json.dumps({"error": "invalid tool argument"})
+
+    try:
+        result = mcp_tool._handle_auth_error_and_retry(
+            "srv-app-error",
+            OAuthFlowError("initial"),
+            lambda: application_error,
+            "tools/call test",
+        )
+        assert result == application_error
+        assert mcp_tool._server_error_counts.get("srv-app-error", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv-app-error")

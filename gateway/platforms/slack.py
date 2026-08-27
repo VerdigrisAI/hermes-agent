@@ -434,6 +434,9 @@ class SlackAdapter(BasePlatformAdapter):
         self._THREAD_CACHE_TTL = 60.0
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
+        # Track every admitted turn that requires a reply. Unmentioned
+        # follow-ups stay quiet on success, but still get a visible failure.
+        self._required_reply_message_ids: set = set()
         # Track active assistant thread status indicators so stop_typing can
         # clear them (chat_id → thread_ts).
         self._active_status_threads: Dict[str, str] = {}
@@ -1719,14 +1722,20 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
-        if not ts or ts not in self._reacting_message_ids:
+        if not ts:
+            return
+        was_reacting = ts in self._reacting_message_ids
+        required_reply = ts in self._required_reply_message_ids
+        if not was_reacting and not required_reply:
             return
         self._reacting_message_ids.discard(ts)
+        self._required_reply_message_ids.discard(ts)
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes")
-        if outcome == ProcessingOutcome.SUCCESS:
+        if was_reacting:
+            await self._remove_reaction(channel_id, ts, "eyes")
+        if outcome == ProcessingOutcome.SUCCESS and was_reacting:
             await self._add_reaction(channel_id, ts, "white_check_mark")
         elif outcome == ProcessingOutcome.FAILURE:
             await self._add_reaction(channel_id, ts, "x")
@@ -2735,6 +2744,8 @@ class SlackAdapter(BasePlatformAdapter):
             # unmentioned follow-ups in an active or previously mentioned thread.
             expects_reply=True,
         )
+        if self._reactions_enabled():
+            self._required_reply_message_ids.add(ts)
 
         # Only react when bot is directly addressed (DM or @mention).
         # In listen-all channels (require_mention=false), reacting to every

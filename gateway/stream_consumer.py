@@ -1118,9 +1118,9 @@ class GatewayStreamConsumer:
             visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
         _visible_stripped = visible_without_cursor.strip()
         if not _visible_stripped:
-            return True  # cursor-only / whitespace-only update
+            return False  # no user-visible content was delivered
         if not text.strip():
-            return True  # nothing to send is "success"
+            return False
         # Guard: do not create a brand-new standalone message when the only
         # visible content is a handful of characters alongside the streaming
         # cursor.  During rapid tool-calling the model often emits 1-2 tokens
@@ -1133,9 +1133,9 @@ class GatewayStreamConsumer:
         _MIN_NEW_MSG_CHARS = 4
         if (self._message_id is None
                 and self.cfg.cursor
-                and self.cfg.cursor in text
-                and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
-            return True  # too short for a standalone message — accumulate more
+            and self.cfg.cursor in text
+            and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
+            return False  # too short for a standalone message — accumulate more
 
         # Native draft streaming: route mid-stream frames through send_draft.
         # The final answer is delivered via the regular sendMessage path

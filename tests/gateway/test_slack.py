@@ -2367,6 +2367,41 @@ class TestReactions:
         adapter._app.client.reactions_remove.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_admitted_unmentioned_followup_gets_failure_signal(self, adapter):
+        """A required thread reply stays quiet on success but shows failure."""
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._app.client.users_info = AsyncMock(return_value={
+            "user": {"profile": {"display_name": "Tyler"}}
+        })
+        adapter._mentioned_threads.add("1234567890.000000")
+
+        event = {
+            "text": "follow-up",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "1234567890.000000",
+            "ts": "1234567890.000005",
+        }
+        await adapter._handle_slack_message(event)
+        msg_event = adapter.handle_message.call_args.args[0]
+
+        assert msg_event.expects_reply is True
+        assert "1234567890.000005" not in adapter._reacting_message_ids
+        assert "1234567890.000005" in adapter._required_reply_message_ids
+
+        from gateway.platforms.base import ProcessingOutcome
+
+        await adapter.on_processing_complete(msg_event, ProcessingOutcome.FAILURE)
+
+        adapter._app.client.reactions_add.assert_awaited_once_with(
+            channel="C123", timestamp="1234567890.000005", name="x"
+        )
+        adapter._app.client.reactions_remove.assert_not_awaited()
+        assert "1234567890.000005" not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
     async def test_reactions_disabled_via_env(self, adapter, monkeypatch):
         """SLACK_REACTIONS=false should suppress all reaction lifecycle."""
         monkeypatch.setenv("SLACK_REACTIONS", "false")
