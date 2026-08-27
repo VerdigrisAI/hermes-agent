@@ -1634,6 +1634,7 @@ class TestMessageRouting:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_called_once()
+        assert adapter.handle_message.call_args.args[0].expects_reply is True
 
     @pytest.mark.asyncio
     async def test_channel_message_requires_mention(self, adapter):
@@ -1662,6 +1663,7 @@ class TestMessageRouting:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "what's the weather?"
         assert "<@U_BOT>" not in msg_event.text
+        assert msg_event.expects_reply is True
 
     @pytest.mark.asyncio
     async def test_bot_messages_ignored(self, adapter):
@@ -2385,6 +2387,7 @@ class TestReactions:
 
         # Should NOT register for reactions when toggle is off
         assert "1234567890.000004" not in adapter._reacting_message_ids
+        assert adapter.handle_message.call_args.args[0].expects_reply is True
 
         # Hooks should also be no-ops when disabled
         from gateway.platforms.base import MessageEvent, MessageType, SessionSource, ProcessingOutcome

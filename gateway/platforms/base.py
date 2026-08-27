@@ -1052,6 +1052,11 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # True when the platform admitted a message that requires a visible reply.
+    # An empty handler result is a failure for these events, even though it can
+    # be normal when streaming or queue handling owns delivery elsewhere.
+    expects_reply: bool = False
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -3475,7 +3480,11 @@ class BasePlatformAdapter(ABC):
                         )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (
+                delivery_succeeded
+                if delivery_attempted
+                else not bool(response) and not event.expects_reply
+            )
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,

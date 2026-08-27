@@ -2730,6 +2730,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            expects_reply=is_dm or is_mentioned,
         )
 
         # Only react when bot is directly addressed (DM or @mention).

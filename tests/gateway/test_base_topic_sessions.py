@@ -50,7 +50,13 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         self.processing_hooks.append(("complete", event.message_id, outcome))
 
 
-def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageEvent:
+def _make_event(
+    chat_id: str,
+    thread_id: str,
+    message_id: str = "1",
+    *,
+    expects_reply: bool = False,
+) -> MessageEvent:
     return MessageEvent(
         text="hello",
         source=SessionSource(
@@ -60,6 +66,7 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
             thread_id=thread_id,
         ),
         message_id=message_id,
+        expects_reply=expects_reply,
     )
 
 
@@ -171,6 +178,42 @@ class TestBasePlatformTopicSessions:
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_expected_reply_with_empty_response_is_unsuccessful(self):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=""))
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585", expects_reply=True)
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_optional_reply_with_empty_response_remains_successful(self):
+        adapter = DummyTelegramAdapter()
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=""))
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.SUCCESS),
         ]
 
     @pytest.mark.asyncio

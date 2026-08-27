@@ -179,6 +179,38 @@ def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
         _cleanup(mcp_tool, "srv")
 
 
+def test_tool_errors_do_not_trip_server_circuit_breaker(monkeypatch, tmp_path):
+    """A valid MCP error result proves that the server remains reachable."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    calls = {"n": 0}
+
+    async def _call_tool_error(*_args, **_kwargs):
+        calls["n"] += 1
+        result = MagicMock()
+        result.isError = True
+        block = MagicMock()
+        block.text = '{"error":"permission_denied"}'
+        result.content = [block]
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            assert "error" in json.loads(handler({}))
+
+        assert calls["n"] == mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
     """When the auth-recovery path successfully reconnects the server,
     the breaker should be cleared so subsequent calls aren't gated on a
