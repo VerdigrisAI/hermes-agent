@@ -1015,7 +1015,30 @@ class TestInterimCommentaryMessages:
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         assert sent_texts == ["I'll inspect the repository first.", "Done."]
+        assert consumer.delivered_commentary_texts == (
+            "I'll inspect the repository first.",
+        )
         assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_failed_commentary_is_not_recorded_as_delivered(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None)
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+
+        consumer.on_commentary("You're welcome.")
+        consumer.finish()
+        await consumer.run()
+
+        assert consumer.delivered_commentary_texts == ()
 
     @pytest.mark.asyncio
     async def test_failed_final_send_does_not_mark_final_response_sent(self):

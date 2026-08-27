@@ -17303,13 +17303,6 @@ class GatewayRunner:
                     except asyncio.TimeoutError:
                         for future in interim_futures:
                             future.cancel()
-                final_text = str(response.get("final_response") or "").strip()
-                with _interim_delivery_lock:
-                    preview_delivered = final_text in _delivered_interim_texts
-                response["response_previewed"] = bool(
-                    response.get("response_previewed") and preview_delivered
-                )
-
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
@@ -17684,6 +17677,20 @@ class GatewayRunner:
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
+            with _interim_delivery_lock:
+                direct_preview_delivered = (
+                    str(_final).strip() in _delivered_interim_texts
+                )
+            streamed_commentary = (
+                getattr(_sc, "delivered_commentary_texts", ()) if _sc else ()
+            )
+            response["response_previewed"] = bool(
+                response.get("response_previewed")
+                and (
+                    direct_preview_delivered
+                    or str(_final).strip() in streamed_commentary
+                )
+            )
             _streamed = bool(
                 _sc and getattr(_sc, "final_response_sent", False)
             )

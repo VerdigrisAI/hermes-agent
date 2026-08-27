@@ -155,6 +155,7 @@ class GatewayStreamConsumer:
         # streaming, even if the final edit (cursor removal etc.)
         # subsequently failed.
         self._final_content_delivered = False
+        self._delivered_commentary_texts: list[str] = []
         # Cache adapter lifecycle capability: only platforms that need an
         # explicit finalize call (e.g. DingTalk AI Cards) force us to make
         # a redundant final edit.  Everyone else keeps the fast path.
@@ -197,6 +198,11 @@ class GatewayStreamConsumer:
         """True when the final response content reached the user, even if
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
+
+    @property
+    def delivered_commentary_texts(self) -> tuple[str, ...]:
+        """Return exact interim messages confirmed by the adapter."""
+        return tuple(self._delivered_commentary_texts)
 
     async def _edit_message(
         self,
@@ -1013,6 +1019,7 @@ class GatewayStreamConsumer:
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
             if result.success:
+                self._delivered_commentary_texts.append(text.strip())
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
