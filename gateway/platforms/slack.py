@@ -1774,7 +1774,10 @@ class SlackAdapter(BasePlatformAdapter):
             await self._add_reaction(channel_id, ts, "white_check_mark")
         elif reactions_enabled and outcome == ProcessingOutcome.FAILURE:
             failure_signaled = await self._add_reaction(channel_id, ts, "x")
-        terminal_signal_delivered = outcome == ProcessingOutcome.SUCCESS or failure_signaled
+        terminal_signal_delivered = (
+            outcome in {ProcessingOutcome.SUCCESS, ProcessingOutcome.CANCELLED}
+            or failure_signaled
+        )
         if (
             outcome == ProcessingOutcome.FAILURE
             and required_reply

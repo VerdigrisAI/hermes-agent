@@ -2558,6 +2558,30 @@ class TestReactions:
         assert event.message_id not in adapter._required_reply_message_ids
 
     @pytest.mark.asyncio
+    async def test_expected_cancellation_clears_reply_state_without_failure_signal(
+        self, adapter
+    ):
+        event = MessageEvent(
+            text="cancelled",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000010",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+        adapter.send = AsyncMock()
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+        assert event.message_id not in adapter._required_reply_message_ids
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_reactions_enabled_by_default(self, adapter):
         """SLACK_REACTIONS defaults to true (matches existing behavior)."""
         assert adapter._reactions_enabled() is True
