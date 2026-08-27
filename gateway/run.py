@@ -6999,8 +6999,11 @@ class GatewayRunner:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        queued_event = _queued_reply_event(event, steer_text)
-                        adapter._pending_messages[_quick_key] = queued_event
+                        self._enqueue_fifo(
+                            _quick_key,
+                            _queued_reply_event(event, steer_text),
+                            adapter,
+                        )
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -16940,6 +16943,7 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            result = None
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -16976,7 +16980,9 @@ class GatewayRunner:
             finally:
                 _close_steering = getattr(agent, "_close_steering", None)
                 if callable(_close_steering):
-                    _close_steering()
+                    _leftover_steer = _close_steering()
+                    if _leftover_steer and isinstance(result, dict):
+                        result.setdefault("pending_steer", _leftover_steer)
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,

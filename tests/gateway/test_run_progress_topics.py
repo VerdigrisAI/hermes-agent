@@ -5,13 +5,15 @@ import importlib
 import sys
 import time
 import types
+from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig, StreamingConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -638,6 +640,28 @@ class QueuedCommentaryAgent:
         }
 
 
+class EarlyReturnSteerAgent:
+    """Simulate a runtime branch that returns before the loop-level drain."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": f"final response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+    def _close_steering(self):
+        if type(self).calls == 1:
+            return "late steer"
+        return None
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1043,6 +1067,123 @@ async def test_queue_accepted_before_drain_gets_a_terminal_reply(monkeypatch, tm
     assert any("resend" in call["content"] for call in adapter.sent)
     assert queued.delivery_state.reply_delivered is True
     assert any(item is queued for item in result["_reply_events"])
+
+
+@pytest.mark.asyncio
+async def test_early_return_preserves_a_late_steer_as_the_next_turn(
+    monkeypatch,
+    tmp_path,
+):
+    EarlyReturnSteerAgent.calls = 0
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-early-return-steer",
+    )
+
+    assert EarlyReturnSteerAgent.calls == 2
+    assert result["final_response"] == "final response 2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_queued_owner", [False, True])
+async def test_real_handler_propagates_queued_owners_and_streamed_delivery(
+    monkeypatch,
+    with_queued_owner,
+):
+    """Exercise the production bridge from runner metadata to event state."""
+    from gateway.run import GatewayRunner
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    event = MessageEvent(
+        text="original",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+    )
+    session_key = build_session_key(source)
+    created = datetime.now()
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-real-handler",
+        created_at=created,
+        updated_at=created + timedelta(seconds=1),
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+
+    adapter = ProgressCaptureAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")
+        }
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._show_reasoning = False
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._cache_session_source = MagicMock()
+    runner._is_telegram_topic_lane = MagicMock(return_value=False)
+    runner._set_session_env = MagicMock(return_value=())
+    runner._clear_session_env = MagicMock()
+    runner._prepare_inbound_message_text = AsyncMock(return_value=event.text)
+    runner._bind_adapter_run_generation = MagicMock()
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._clear_restart_failure_count = MagicMock()
+    runner._should_send_voice_reply = MagicMock(return_value=False)
+    runner._deliver_media_from_response = AsyncMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "streamed answer",
+            "messages": [],
+            "api_calls": 1,
+            "already_sent": True,
+            "failed": False,
+            "_reply_events": [queued] if with_queued_owner else [],
+            "_final_reply_events": [queued] if with_queued_owner else [],
+        }
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        run_generation=1,
+    )
+
+    assert response is None
+    if with_queued_owner:
+        assert event.delivery_state.reply_delivered is False
+        assert queued.delivery_state.reply_delivered is True
+        assert queued in event.delivery_state.completion_events
+        assert queued in event.delivery_state.final_response_events
+    else:
+        assert event.delivery_state.reply_delivered is True
+        assert queued.delivery_state.reply_delivered is False
 
 
 @pytest.mark.asyncio

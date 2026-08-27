@@ -314,10 +314,11 @@ class TestSlackMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("C12345", images))
+        result = _run(adapter.send_multiple_images("C12345", images))
 
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_awaited_once()
+        assert result.success is True
         kwargs = client.files_upload_v2.await_args.kwargs
         assert len(kwargs["file_uploads"]) == 3
 

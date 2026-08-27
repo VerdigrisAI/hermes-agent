@@ -152,6 +152,25 @@ async def test_steer_with_pending_sentinel_falls_back_to_queue():
 
 
 @pytest.mark.asyncio
+async def test_steer_with_pending_sentinel_preserves_an_existing_queue():
+    from gateway.run import _AGENT_PENDING_SENTINEL, _queued_reply_event
+
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+    first = _make_event("/queue first")
+    adapter._pending_messages[sk] = _queued_reply_event(first, "first")
+
+    event = _make_event("/steer second")
+    result = await runner._handle_message(event)
+
+    assert "queued" in result.lower()
+    assert adapter._pending_messages[sk].text == "first"
+    assert runner._queued_events[sk][0].text == "second"
+    assert runner._queued_events[sk][0].delivery_state is event.delivery_state
+
+
+@pytest.mark.asyncio
 async def test_steer_agent_without_steer_method_falls_back():
     """If the running agent somehow lacks the steer() method (older build,
     test stub), the handler must not explode — fall back to /queue."""

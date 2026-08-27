@@ -2422,11 +2422,12 @@ class TestReactions:
         }
         await adapter._handle_slack_message(event)
 
-        # Should NOT register for reactions when toggle is off
+        # Track required replies independently from optional reactions.
         assert "1234567890.000004" not in adapter._reacting_message_ids
+        assert "1234567890.000004" in adapter._required_reply_message_ids
         assert adapter.handle_message.call_args.args[0].expects_reply is True
 
-        # Hooks should also be no-ops when disabled
+        # A failed turn must use a visible text fallback when reactions are off.
         from gateway.platforms.base import MessageEvent, MessageType, SessionSource, ProcessingOutcome
         from gateway.config import Platform
         source = SessionSource(
@@ -2441,13 +2442,15 @@ class TestReactions:
             source=source,
             message_id="1234567890.000004",
         )
-        # Force-add to verify hooks respect the toggle independently
-        adapter._reacting_message_ids.add("1234567890.000004")
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
         await adapter.on_processing_start(msg_event)
-        await adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS)
+        await adapter.on_processing_complete(msg_event, ProcessingOutcome.FAILURE)
 
         adapter._app.client.reactions_add.assert_not_called()
         adapter._app.client.reactions_remove.assert_not_called()
+        adapter.send.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_required_failure_uses_text_when_reactions_are_disabled(
@@ -2469,7 +2472,6 @@ class TestReactions:
             expects_reply=True,
         )
         adapter._required_reply_message_ids.add(event.message_id)
-
         await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
         adapter.send.assert_awaited_once()

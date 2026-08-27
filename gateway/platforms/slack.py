@@ -2783,8 +2783,7 @@ class SlackAdapter(BasePlatformAdapter):
             # unmentioned follow-ups in an active or previously mentioned thread.
             expects_reply=True,
         )
-        if self._reactions_enabled():
-            self._required_reply_message_ids.add(ts)
+        self._required_reply_message_ids.add(ts)
 
         # Only react when bot is directly addressed (DM or @mention).
         # In listen-all channels (require_mention=false), reacting to every
