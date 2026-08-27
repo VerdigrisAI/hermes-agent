@@ -2535,6 +2535,28 @@ class TestReactions:
         assert adapter.send.await_count == 2
         assert event.message_id not in adapter._required_reply_message_ids
 
+    def test_discard_reply_requirement_clears_slack_lifecycle_state(self, adapter):
+        event = MessageEvent(
+            text="ignored",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="group",
+                user_id="U_UNKNOWN",
+            ),
+            message_id="1234567890.000009",
+            expects_reply=True,
+        )
+        adapter._reacting_message_ids.add(event.message_id)
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        adapter.discard_reply_requirement(event)
+
+        assert event.expects_reply is False
+        assert event.message_id not in adapter._reacting_message_ids
+        assert event.message_id not in adapter._required_reply_message_ids
+
     @pytest.mark.asyncio
     async def test_reactions_enabled_by_default(self, adapter):
         """SLACK_REACTIONS defaults to true (matches existing behavior)."""

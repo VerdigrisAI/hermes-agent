@@ -1734,6 +1734,14 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    def discard_reply_requirement(self, event: MessageEvent) -> None:
+        """Clear lifecycle state for a Slack event that must stay silent."""
+        super().discard_reply_requirement(event)
+        ts = getattr(event, "message_id", None)
+        if ts:
+            self._reacting_message_ids.discard(ts)
+            self._required_reply_message_ids.discard(ts)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():

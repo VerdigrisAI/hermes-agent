@@ -2998,6 +2998,11 @@ class GatewayRunner:
                 event.source.platform.value if event.source.platform else "unknown",
                 session_key,
             )
+            event.expects_reply = False
+            adapter = self.adapters.get(event.source.platform)
+            discard = getattr(adapter, "discard_reply_requirement", None)
+            if callable(discard):
+                discard(event)
             return True  # handled (silently dropped); do not fall through
 
         # --- Draining case (gateway restarting/stopping) ---
@@ -6619,6 +6624,13 @@ class GatewayRunner:
         """
         source = event.source
 
+        def _discard_reply_requirement() -> None:
+            event.expects_reply = False
+            adapter = self.adapters.get(source.platform)
+            discard = getattr(adapter, "discard_reply_requirement", None)
+            if callable(discard):
+                discard(event)
+
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
@@ -6654,6 +6666,7 @@ class GatewayRunner:
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
+                    _discard_reply_requirement()
                     return None
                 if _action == "rewrite":
                     _new_text = _result.get("text")
@@ -6675,6 +6688,7 @@ class GatewayRunner:
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                _discard_reply_requirement()
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
@@ -6685,6 +6699,7 @@ class GatewayRunner:
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
                 if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                    _discard_reply_requirement()
                     return None
                 code = self.pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
@@ -6711,6 +6726,11 @@ class GatewayRunner:
                         _record_send_result_delivery(event, send_result)
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
+            if not (
+                source.chat_type == "dm"
+                and self._get_unauthorized_dm_behavior(source.platform) == "pair"
+            ):
+                _discard_reply_requirement()
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
@@ -17706,7 +17726,7 @@ class GatewayRunner:
                     )
                     adapter = self.adapters.get(source.platform)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._prepend_fifo(session_key, pending_event, adapter)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

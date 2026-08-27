@@ -1385,6 +1385,10 @@ class BasePlatformAdapter(ABC):
     - Sending messages/responses
     - Handling media
     """
+
+    def discard_reply_requirement(self, event: MessageEvent) -> None:
+        """Mark an admitted event as intentionally silent."""
+        event.expects_reply = False
     
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config

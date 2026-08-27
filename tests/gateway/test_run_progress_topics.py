@@ -748,6 +748,7 @@ async def _run_with_agent(
     overflow_events=None,
     steer_events=None,
     draining=False,
+    interrupt_depth=0,
 ):
     if config_data:
         import yaml
@@ -801,6 +802,7 @@ async def _run_with_agent(
         session_id=session_id,
         session_key=session_key,
         reply_event=reply_event,
+        _interrupt_depth=interrupt_depth,
     )
     return adapter, result
 
@@ -1213,6 +1215,45 @@ async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
 
     assert EarlyReturnSteerAgent.messages == ["hello", "late steer", "queued follow-up"]
     assert result["final_response"] == "final response 3"
+
+
+@pytest.mark.asyncio
+async def test_recursion_limit_preserves_current_turn_before_staged_queue(
+    monkeypatch, tmp_path
+):
+    EarlyReturnSteerAgent.calls = 0
+    EarlyReturnSteerAgent.messages = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    first = MessageEvent(
+        text="first queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-first",
+    )
+    second = MessageEvent(
+        text="second queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-second",
+    )
+
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-depth-queue",
+        pending_event=first,
+        overflow_events=[second],
+        interrupt_depth=100,
+    )
+
+    session_key = "agent:main:telegram:group:-1001:17585"
+    assert adapter._pending_messages[session_key] is first
 
 
 @pytest.mark.asyncio
