@@ -834,3 +834,35 @@ class TestTelegramAutoTtsCaptionDelivery:
             "voice-1",
             ProcessingOutcome.SUCCESS,
         )
+
+    @pytest.mark.asyncio
+    async def test_auto_tts_exception_keeps_followup_text(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+        adapter._keep_typing = self._hold_typing()
+        adapter._should_auto_tts_for_chat = lambda _chat_id: True
+        adapter.play_tts = AsyncMock(side_effect=RuntimeError("playback failed"))
+        adapter.set_message_handler(
+            lambda _event: asyncio.sleep(0, result="Short reply")
+        )
+
+        tts_path = tmp_path / "reply.ogg"
+        tts_path.write_text("audio", encoding="utf-8")
+        event = self._make_voice_event()
+
+        with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value=json.dumps({"file_path": str(tts_path)}),
+        ):
+            await adapter._process_message_background(
+                event,
+                build_session_key(event.source),
+            )
+
+        adapter.play_tts.assert_awaited_once()
+        assert [item["content"] for item in adapter.sent] == ["Short reply"]
+        assert event.delivery_state.reply_failed is False
+        assert adapter.processing_hooks[-1] == (
+            "complete",
+            "voice-1",
+            ProcessingOutcome.SUCCESS,
+        )

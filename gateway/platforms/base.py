@@ -3475,6 +3475,12 @@ class BasePlatformAdapter(ABC):
                         )
                         if getattr(tts_result, "success", False):
                             _record_delivery(tts_result)
+                    except Exception as tts_send_err:
+                        logger.warning(
+                            "[%s] Auto-TTS delivery failed: %s",
+                            self.name,
+                            tts_send_err,
+                        )
                     finally:
                         try:
                             os.remove(_tts_path)
