@@ -93,7 +93,10 @@ async def report_media_delivery_failure(
             if callable(send_with_retry)
             else await adapter.send(**send_kwargs)
         )
-        delivered = bool(getattr(result, "success", False))
+        delivered = bool(
+            getattr(result, "success", False)
+            or getattr(result, "failure_notice_delivered", False)
+        )
         if not delivered:
             logger.error(
                 "artifact_delivery correlation_id=%s stage=user_notice "

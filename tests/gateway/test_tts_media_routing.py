@@ -122,6 +122,31 @@ async def test_media_failure_notice_reports_failed_delivery(side_effect):
 
 
 @pytest.mark.asyncio
+async def test_media_failure_notice_preserves_nested_terminal_notice():
+    adapter = SimpleNamespace(
+        name="slack",
+        _send_with_retry=AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="detailed notice failed",
+                failure_notice_delivered=True,
+            )
+        ),
+    )
+
+    delivered = await report_media_delivery_failure(
+        adapter,
+        chat_id="C123",
+        thread_id="thread-1",
+        file_path="/tmp/report.pdf",
+        metadata={"thread_ts": "thread-1"},
+        detail="upload failed",
+    )
+
+    assert delivered is True
+
+
+@pytest.mark.asyncio
 async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender():
     adapter = _MediaRoutingAdapter()
     event = _event()
