@@ -3455,6 +3455,13 @@ class TestFailedLocalUploadReporting:
 
         assert not result.success
         assert filename in result.error
+        expected_prefix = {
+            "send_image_file": "Image file not found: ",
+            "send_voice": "Audio file not found: ",
+            "send_video": "Video file not found: ",
+            "send_document": "File not found: ",
+        }[method_name]
+        assert result.error == expected_prefix + filename
         assert str(tmp_path) not in result.error
 
 
