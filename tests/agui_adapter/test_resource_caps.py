@@ -108,3 +108,16 @@ async def test_clean_queue_still_reports_success():
     body = "".join(frames)
     assert "RUN_FINISHED" in body
     assert "RUN_ERROR" not in body
+
+
+def test_the_run_cap_is_fixed_at_import(monkeypatch):
+    """Setting the variable after import must not appear to change the cap.
+
+    The semaphore is built at module scope, so _max_concurrent_runs() reflects
+    the environment afterwards while _run_slots does not. Asserting the gap
+    keeps the comment honest rather than aspirational.
+    """
+    before = server._run_slots._initial_value  # type: ignore[attr-defined]
+    monkeypatch.setenv("HERMES_AGUI_MAX_CONCURRENT_RUNS", str(before + 5))
+    assert server._max_concurrent_runs() == before + 5
+    assert server._run_slots._initial_value == before  # type: ignore[attr-defined]

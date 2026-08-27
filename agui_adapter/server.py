@@ -334,6 +334,12 @@ def _max_queue_events() -> int:
 
 # One OS thread per POST, previously uncapped. A retry storm was enough to
 # exhaust the process.
+#
+# Read ONCE, at import, because the semaphore is built here. Unlike
+# HERMES_AGUI_MAX_QUEUE_EVENTS, which is read per run, setting this after the
+# module is imported has no effect. That is fine for a process started by a
+# platform that sets its environment first, and confusing for anyone who
+# exports it into a running shell and expects the cap to move.
 def _max_concurrent_runs() -> int:
     return _positive_int_env("HERMES_AGUI_MAX_CONCURRENT_RUNS", 8)
 
