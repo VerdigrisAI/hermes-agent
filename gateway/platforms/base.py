@@ -2828,6 +2828,49 @@ class BasePlatformAdapter(ABC):
             _persist_failure()
         return fallback_result
 
+    async def _send_terminal_error_notice(
+        self,
+        event: "MessageEvent",
+        error: Exception,
+    ) -> "SendResult":
+        """Send and persist a routed terminal error for an admitted event."""
+        error_type = type(error).__name__
+        error_detail = str(error)[:300] if str(error) else "no details available"
+        content = (
+            f"Sorry, I encountered an error ({error_type}).\n"
+            f"{error_detail}\n"
+            "Try again or use /reset to start a fresh session."
+        )
+        metadata = _delivery_metadata_for_event(event)
+        try:
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=content,
+                reply_to=_reply_anchor_for_event(event),
+                metadata=metadata,
+            )
+            return result or SendResult(success=False, error="no send result")
+        except Exception as send_error:
+            logger.warning(
+                "[%s] Could not send terminal error notice: %s",
+                self.name,
+                send_error,
+            )
+            try:
+                self.persist_delivery_retry(
+                    event.source.chat_id,
+                    content,
+                    reply_to=_reply_anchor_for_event(event),
+                    metadata=metadata,
+                )
+            except Exception as persist_error:
+                logger.warning(
+                    "[%s] Could not persist terminal error notice: %s",
+                    self.name,
+                    persist_error,
+                )
+            return SendResult(success=False, error=str(send_error))
+
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
         """Merge a new caption into existing text, avoiding duplicates.
@@ -3232,7 +3275,16 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
-                    _delivered = False
+                    error_result = await self._send_terminal_error_notice(event, e)
+                    _delivered = bool(error_result.success)
+                    if not event.delivery_state.completion_deferred:
+                        event.delivery_state.reply_attempted = True
+                        if _delivered:
+                            event.delivery_state.reply_delivered = True
+                        else:
+                            event.delivery_state.reply_failed = True
+                        if error_result.failure_notice_delivered:
+                            event.delivery_state.failure_notice_delivered = True
                 if not event.delivery_state.completion_deferred:
                     await self._run_processing_hook(
                         "on_processing_complete",
@@ -3984,22 +4036,8 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _delivery_metadata_for_event(event)
-                error_result = await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-                _record_delivery(error_result)
-            except Exception:
-                pass  # Last resort — don't let error reporting crash the handler
+            error_result = await self._send_terminal_error_notice(event, e)
+            _record_delivery(error_result)
             await _complete_delivery_events(ProcessingOutcome.FAILURE)
         finally:
             # Fire any one-shot post-delivery callback registered for this

@@ -125,6 +125,39 @@ async def test_sentinel_cleaned_up_after_handler_returns():
     )
 
 
+@pytest.mark.asyncio
+async def test_goal_continuation_uses_queued_final_response_owner():
+    runner = _make_runner()
+    event = _make_event()
+    queued_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="private-destination",
+        chat_type="dm",
+        user_id="u1",
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=queued_source,
+        private_reply_user_id="u1",
+        platform_team_id="team-2",
+    )
+    runner._post_turn_goal_continuation = AsyncMock()
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        ev.delivery_state.final_response_events.append(queued)
+        return {"final_response": "queued answer"}
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    call = runner._post_turn_goal_continuation.await_args.kwargs
+    assert call["source"] is queued_source
+    assert call["event"] is queued
+    assert call["event"].private_reply_user_id == "u1"
+    assert call["event"].platform_team_id == "team-2"
+
+
 # ------------------------------------------------------------------
 # Test 3: Sentinel cleaned up on exception
 # ------------------------------------------------------------------

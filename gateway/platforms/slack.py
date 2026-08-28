@@ -416,9 +416,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
-        # Track pending approval message_ts → resolved flag to prevent
-        # double-clicks on approval buttons.
-        self._approval_resolved: Dict[str, bool] = {}
+        # Track pending approval message_ts → lifecycle state to prevent
+        # concurrent or redelivered button clicks.
+        self._approval_resolved: Dict[str, str] = {}
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -3168,7 +3168,7 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self._get_client(chat_id).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
-                self._approval_resolved[msg_ts] = False
+                self._approval_resolved[msg_ts] = "pending"
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
@@ -3589,13 +3589,9 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "deny")
 
-        # Prevent double-clicks. Missing state means the gateway restarted or
-        # the prompt expired, so tell the clicker instead of acknowledging
-        # silently.
-        approval_state = self._approval_resolved.get(msg_ts)
-        if approval_state is None:
+        async def _send_expired_notice() -> None:
             stale_text = (
-                "⚠️ This approval request expired after the gateway restarted. "
+                "⚠️ This approval request expired or is no longer active. "
                 "Run the command again to request a new approval."
             )
             team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "")
@@ -3620,10 +3616,39 @@ class SlackAdapter(BasePlatformAdapter):
                     stale_text,
                     metadata or None,
                 )
+
+        # Prevent double-clicks. Missing state means the gateway restarted or
+        # the prompt expired, so tell the clicker instead of acknowledging
+        # silently.
+        approval_state = self._approval_resolved.get(msg_ts)
+        if approval_state is None:
+            await _send_expired_notice()
             return
-        if approval_state:
+        if approval_state in {"claimed", "resolved"}:
             return
-        self._approval_resolved[msg_ts] = True
+        self._approval_resolved[msg_ts] = "claimed"
+
+        # Resolve before publishing the decision. A zero count means the
+        # underlying request expired, so an Approved label would be false.
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(session_key, choice)
+        except Exception as exc:
+            logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
+            self._approval_resolved.pop(msg_ts, None)
+            await _send_expired_notice()
+            return
+        if count <= 0:
+            logger.warning(
+                "Slack approval was no longer active for session %s (choice=%s, user=%s)",
+                session_key,
+                choice,
+                user_name,
+            )
+            self._approval_resolved.pop(msg_ts, None)
+            await _send_expired_notice()
+            return
+        self._approval_resolved[msg_ts] = "resolved"
 
         # Update the message to show the decision and remove buttons
         label_map = {
@@ -3667,16 +3692,10 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
 
-        # Resolve the approval — this unblocks the agent thread
-        try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
-            logger.info(
-                "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                count, session_key, choice, user_name,
-            )
-        except Exception as exc:
-            logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
+        logger.info(
+            "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+            count, session_key, choice, user_name,
+        )
 
         # Keep the resolved state so concurrent or redelivered clicks remain
         # distinguishable from prompts lost across a process restart.

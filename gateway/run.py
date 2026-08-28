@@ -7853,11 +7853,16 @@ class GatewayRunner:
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
+                        goal_event = (
+                            event.delivery_state.final_response_events[0]
+                            if event.delivery_state.final_response_events
+                            else event
+                        )
                         await self._post_turn_goal_continuation(
                             session_entry=session_entry,
-                            source=source,
+                            source=goal_event.source,
                             final_response=_final_text,
-                            event=event,
+                            event=goal_event,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -12313,6 +12318,13 @@ class GatewayRunner:
                     bool(getattr(send_result, "failure_notice_delivered", False)),
                     getattr(send_result, "error", None) or "no success confirmation",
                 )
+                pending_content = content
+                if adapter._is_timeout_error(getattr(send_result, "error", None)):
+                    pending_content = (
+                        "⚠️ Hermes could not confirm whether a background result "
+                        "was delivered. Please check the conversation before you "
+                        "run the task again."
+                    )
                 _mark_outcome(
                     "delivery_failed_notified"
                     if getattr(send_result, "failure_notice_delivered", False)
@@ -12320,7 +12332,7 @@ class GatewayRunner:
                     detail=phase,
                     pending_notice=self._background_pending_notice(
                         job_state,
-                        content,
+                        pending_content,
                         _thread_metadata,
                     ),
                 )

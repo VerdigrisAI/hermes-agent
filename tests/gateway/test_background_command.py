@@ -632,6 +632,42 @@ class TestRunBackgroundTask:
         assert runner._background_task_outcomes["bg_test"]["status"] == "delivery_failed"
 
     @pytest.mark.asyncio
+    async def test_timeout_persists_uncertain_notice_instead_of_result(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+        adapter._is_timeout_error = BasePlatformAdapter._is_timeout_error
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=False, error="ReadTimeout")
+        )
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "sensitive completed result", "messages": []}
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task("work", source, "bg_timeout")
+
+        pending = runner._background_task_outcomes["bg_timeout"]["pending_notice"]
+        assert "could not confirm" in pending["content"]
+        assert "sensitive completed result" not in pending["content"]
+
+    @pytest.mark.asyncio
     async def test_agent_error_is_not_labeled_successful(self):
         runner = _make_runner()
         adapter = MagicMock()

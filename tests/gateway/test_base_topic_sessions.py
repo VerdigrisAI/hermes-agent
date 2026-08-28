@@ -3,7 +3,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -679,6 +679,35 @@ class TestBasePlatformTopicSessions:
         ]
         assert len(adapter.sent) == 1
         assert "RuntimeError" in adapter.sent[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_private_command_exception_persists_terminal_notice(self):
+        adapter = DummyTelegramAdapter()
+        adapter.send = AsyncMock(side_effect=RuntimeError("send failed"))
+        adapter.persist_delivery_retry = MagicMock(return_value=True)
+
+        async def handler(_event):
+            raise RuntimeError("command failed")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        event = _make_event("-1001", "17585", message_id="")
+        event.text = "/status"
+        event.message_type = MessageType.COMMAND
+        event.expects_reply = True
+        event.private_reply_user_id = "U_PRIVATE"
+        event.platform_team_id = "T_SECONDARY"
+
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        adapter.persist_delivery_retry.assert_called_once()
+        metadata = adapter.persist_delivery_retry.call_args.kwargs["metadata"]
+        assert metadata["private_reply_user_id"] == "U_PRIVATE"
+        assert metadata["team_id"] == "T_SECONDARY"
+        assert event.delivery_state.reply_failed is True
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_cancellation_unsuccessful(self):

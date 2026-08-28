@@ -157,7 +157,7 @@ class TestSlackApprovalAction:
     @pytest.mark.asyncio
     async def test_resolves_approval(self):
         adapter = _make_adapter()
-        adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_resolved["1234.5678"] = "pending"
 
         ack = AsyncMock()
         body = {
@@ -184,7 +184,7 @@ class TestSlackApprovalAction:
 
         ack.assert_called_once()
         mock_resolve.assert_called_once_with("agent:main:slack:group:C1:1111", "once")
-        assert adapter._approval_resolved["1234.5678"] is True
+        assert adapter._approval_resolved["1234.5678"] == "resolved"
 
         # Message should be updated with decision
         mock_client.chat_update.assert_called_once()
@@ -192,9 +192,10 @@ class TestSlackApprovalAction:
         assert "Approved once by norbert" in update_kwargs["text"]
 
     @pytest.mark.asyncio
-    async def test_prevents_double_click(self):
+    @pytest.mark.parametrize("state", ["claimed", "resolved"])
+    async def test_prevents_double_click(self, state):
         adapter = _make_adapter()
-        adapter._approval_resolved["1234.5678"] = True  # Already resolved
+        adapter._approval_resolved["1234.5678"] = state
 
         ack = AsyncMock()
         body = {
@@ -213,6 +214,44 @@ class TestSlackApprovalAction:
         # Should have acked but NOT resolved
         ack.assert_called_once()
         mock_resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resolve_result", [0, RuntimeError("queue failed")])
+    async def test_unresolved_approval_never_publishes_false_decision(
+        self,
+        resolve_result,
+    ):
+        adapter = _make_adapter()
+        adapter._approval_resolved["1234.5678"] = "pending"
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "team": {"id": "T1"},
+            "user": {"id": "U1", "name": "norbert"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "expired-session",
+        }
+
+        patch_kwargs = (
+            {"side_effect": resolve_result}
+            if isinstance(resolve_result, Exception)
+            else {"return_value": resolve_result}
+        )
+        with patch("tools.approval.resolve_gateway_approval", **patch_kwargs):
+            await adapter._handle_approval_action(ack, body, action)
+
+        mock_client.chat_update.assert_not_awaited()
+        adapter.send_private_notice.assert_awaited_once()
+        assert "no longer active" in (
+            adapter.send_private_notice.await_args.kwargs["content"]
+        )
+        assert "1234.5678" not in adapter._approval_resolved
 
     @pytest.mark.asyncio
     async def test_stale_approval_click_gets_private_notice(self):
@@ -247,7 +286,7 @@ class TestSlackApprovalAction:
     @pytest.mark.asyncio
     async def test_deny_action(self):
         adapter = _make_adapter()
-        adapter._approval_resolved["1.2"] = False
+        adapter._approval_resolved["1.2"] = "pending"
 
         ack = AsyncMock()
         body = {

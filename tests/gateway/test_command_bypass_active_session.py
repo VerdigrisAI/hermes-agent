@@ -25,6 +25,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     ProcessingOutcome,
+    SendResult,
 )
 from gateway.session import SessionSource, build_session_key
 from gateway.run import _queued_reply_event
@@ -169,6 +170,27 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:status" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_busy_private_command_error_is_persisted(self):
+        adapter = _make_adapter()
+        session_key = _session_key()
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._message_handler = AsyncMock(side_effect=RuntimeError("boom"))
+        adapter._send_with_retry = AsyncMock(side_effect=RuntimeError("send failed"))
+        adapter.persist_delivery_retry = MagicMock(return_value=True)
+        event = _make_event("/status")
+        event.expects_reply = True
+        event.private_reply_user_id = "U_PRIVATE"
+        event.platform_team_id = "T_SECONDARY"
+
+        await adapter.handle_message(event)
+
+        adapter.persist_delivery_retry.assert_called_once()
+        metadata = adapter.persist_delivery_retry.call_args.kwargs["metadata"]
+        assert metadata["private_reply_user_id"] == "U_PRIVATE"
+        assert metadata["team_id"] == "T_SECONDARY"
+        assert event.delivery_state.reply_failed is True
 
     @pytest.mark.asyncio
     async def test_agents_bypasses_guard(self):
