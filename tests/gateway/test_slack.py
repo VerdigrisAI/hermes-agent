@@ -4316,6 +4316,32 @@ class TestSlashEphemeralAck:
         resolve.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_slash_confirm_resolves_only_once(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        resolve = AsyncMock(return_value="done")
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        ack = AsyncMock()
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        await asyncio.gather(
+            adapter._handle_slash_confirm_action(ack, body, action),
+            adapter._handle_slash_confirm_action(ack, body, action),
+        )
+
+        assert ack.await_count == 2
+        resolve.assert_awaited_once_with("session-1", "confirm-1", "once")
+
+    @pytest.mark.asyncio
     async def test_stale_slash_confirm_never_displays_approved(self, adapter, monkeypatch):
         monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
         adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
