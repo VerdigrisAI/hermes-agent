@@ -1067,6 +1067,18 @@ class TestBangPrefixCommands:
         assert msg_event.source.thread_id == "1111111111.000001"
 
     @pytest.mark.asyncio
+    async def test_bang_update_preserves_secondary_workspace(self, adapter):
+        """Deferred update notices must return to the originating workspace."""
+        event = self._make_event("!update")
+        event["team"] = "T_SECONDARY"
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args.args[0]
+        assert msg_event.text == "/update"
+        assert msg_event.platform_team_id == "T_SECONDARY"
+
+    @pytest.mark.asyncio
     async def test_bang_unknown_token_passes_through_unchanged(self, adapter):
         """``!nice work`` is just a casual message — must NOT be rewritten."""
         await adapter._handle_slack_message(self._make_event("!nice work"))

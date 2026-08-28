@@ -3027,6 +3027,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            platform_team_id=team_id or None,
             # Every Slack message that passes the admission rules represents
             # a user turn that requires a visible answer. This includes
             # unmentioned follow-ups in an active or previously mentioned thread.
