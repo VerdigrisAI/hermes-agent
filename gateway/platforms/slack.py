@@ -517,7 +517,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._persist_slash_confirm_outcomes()
 
     async def retry_pending_private_notices(self) -> int:
-        """Retry confirmation notices that failed before a restart."""
+        """Retry durable Slack notices that failed before a restart."""
         delivered = 0
         for key, outcome in list(self._slash_confirm_outcomes.items()):
             pending = outcome.get("pending_notice")
@@ -529,12 +529,21 @@ class SlackAdapter(BasePlatformAdapter):
             if pending.get("team_id"):
                 metadata["team_id"] = pending["team_id"]
             try:
-                result = await self.send_private_notice(
-                    chat_id=str(pending.get("chat_id") or ""),
-                    user_id=str(pending.get("user_id") or ""),
-                    content=str(pending.get("content") or ""),
-                    metadata=metadata or None,
-                )
+                user_id = str(pending.get("user_id") or "")
+                if user_id:
+                    result = await self.send_private_notice(
+                        chat_id=str(pending.get("chat_id") or ""),
+                        user_id=user_id,
+                        content=str(pending.get("content") or ""),
+                        metadata=metadata or None,
+                    )
+                else:
+                    result = await self.send(
+                        chat_id=str(pending.get("chat_id") or ""),
+                        content=str(pending.get("content") or ""),
+                        reply_to=str(pending.get("reply_to") or "") or None,
+                        metadata=metadata or None,
+                    )
             except Exception as exc:
                 logger.warning("[Slack] Confirmation notice retry failed: %s", exc)
                 continue
@@ -568,6 +577,34 @@ class SlackAdapter(BasePlatformAdapter):
                 "user_id": user_id,
                 "team_id": metadata.get("team_id"),
                 "thread_id": metadata.get("thread_id") or metadata.get("thread_ts"),
+                "content": content,
+            },
+        )
+        return True
+
+    def persist_delivery_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist a failed public or private Slack delivery."""
+        if not chat_id or not content:
+            return False
+        metadata = metadata or {}
+        private_user_id = str(metadata.get("private_reply_user_id") or "")
+        notice_id = os.urandom(12).hex()
+        self._record_slash_confirm_outcome(
+            "delivery-retry",
+            notice_id,
+            "delivery_failed",
+            pending_notice={
+                "chat_id": chat_id,
+                "user_id": private_user_id or None,
+                "team_id": metadata.get("team_id"),
+                "thread_id": metadata.get("thread_id") or metadata.get("thread_ts"),
+                "reply_to": reply_to,
                 "content": content,
             },
         )
@@ -1199,6 +1236,18 @@ class SlackAdapter(BasePlatformAdapter):
                 if result.success:
                     self._discard_slash_context(slash_ctx)
                 return result
+
+            private_user_id = str(
+                (metadata or {}).get("private_reply_user_id") or ""
+            )
+            if private_user_id:
+                return await self.send_private_notice(
+                    chat_id=chat_id,
+                    user_id=private_user_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
 
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
@@ -3540,8 +3589,39 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "deny")
 
-        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default)
-        if self._approval_resolved.pop(msg_ts, True):
+        # Prevent double-clicks. Missing state means the gateway restarted or
+        # the prompt expired, so tell the clicker instead of acknowledging
+        # silently.
+        approval_state = self._approval_resolved.pop(msg_ts, None)
+        if approval_state is None:
+            stale_text = (
+                "⚠️ This approval request expired after the gateway restarted. "
+                "Run the command again to request a new approval."
+            )
+            team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "")
+            metadata = {"team_id": team_id} if team_id else {}
+            thread_ts = message.get("thread_ts")
+            if thread_ts:
+                metadata["thread_id"] = thread_ts
+            try:
+                stale_result = await self.send_private_notice(
+                    chat_id=channel_id,
+                    user_id=user_id,
+                    content=stale_text,
+                    reply_to=thread_ts or None,
+                    metadata=metadata or None,
+                )
+            except Exception:
+                stale_result = SendResult(success=False, error="stale notice failed")
+            if not stale_result.success:
+                self.persist_private_notice_retry(
+                    channel_id,
+                    user_id,
+                    stale_text,
+                    metadata or None,
+                )
+            return
+        if approval_state:
             return
 
         # Update the message to show the decision and remove buttons

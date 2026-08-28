@@ -21,6 +21,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    BasePlatformAdapter,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -4706,6 +4707,57 @@ class TestSlashEphemeralAck:
         assert adapter._app.client.chat_postEphemeral.await_count == 2
         adapter._app.client.chat_postMessage.assert_not_awaited()
         assert ("C1", "U1") not in adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_private_route_metadata_stays_private_after_queue(self, adapter):
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "private-1"}
+        )
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        result = await adapter.send(
+            "C1",
+            "queued private result",
+            metadata={"private_reply_user_id": "U1", "team_id": "T2"},
+        )
+
+        assert result.success
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_public_reply_is_persisted_and_retried(
+        self, adapter
+    ):
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="offline", retryable=True)
+        )
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await BasePlatformAdapter._send_with_retry(
+                adapter,
+                "C1",
+                "durable answer",
+                reply_to="thread-1",
+                metadata={"team_id": "T2"},
+                max_retries=1,
+                base_delay=0,
+            )
+
+        assert not result.success
+        saved = json.loads(adapter._slash_confirm_outcomes_path.read_text())
+        assert saved[-1]["pending_notice"]["content"] == "durable answer"
+        assert saved[-1]["pending_notice"]["team_id"] == "T2"
+
+        restarted = SlackAdapter(PlatformConfig(enabled=True, token="test-token"))
+        restarted._app = MagicMock()
+        restarted.send = AsyncMock(return_value=SendResult(success=True))
+        assert await restarted.retry_pending_private_notices() == 1
+        restarted.send.assert_awaited_once_with(
+            chat_id="C1",
+            content="durable answer",
+            reply_to="thread-1",
+            metadata={"team_id": "T2"},
+        )
 
     @pytest.mark.asyncio
     async def test_native_slash_stashes_context_and_dispatches(self, adapter):

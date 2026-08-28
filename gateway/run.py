@@ -895,6 +895,8 @@ def _queued_reply_event(event: MessageEvent, text: str) -> MessageEvent:
         message_id=event.message_id,
         channel_prompt=event.channel_prompt,
         expects_reply=event.expects_reply,
+        private_reply_user_id=event.private_reply_user_id,
+        platform_team_id=event.platform_team_id,
         delivery_state=event.delivery_state,
         timestamp=event.timestamp,
     )
@@ -10044,7 +10046,11 @@ class GatewayRunner:
                 indent=None,
             )
         except Exception as e:
-            logger.debug("Failed to write restart notify file: %s", e)
+            logger.error("Failed to write restart notify file: %s", e)
+            return EphemeralReply(
+                "✗ Restart stopped because Hermes could not save the completion route. "
+                "Please try again."
+            )
 
         # Record the triggering platform + update_id in a dedicated dedup
         # marker.  Unlike .restart_notify.json (which gets unlinked once the
@@ -11882,12 +11888,11 @@ class GatewayRunner:
             "detail": detail,
             "updated_at": datetime.now().isoformat(),
         }
-        if pending_notice is not None:
-            outcome["pending_notice"] = pending_notice
-        elif (
+        if (
             status
             in {
                 "delivery_failed",
+                "delivery_failed_notified",
                 "failed_and_undelivered",
                 "cancelled_undelivered",
                 "interrupt_unconfirmed",
@@ -11895,6 +11900,8 @@ class GatewayRunner:
             and previous.get("pending_notice")
         ):
             outcome["pending_notice"] = previous["pending_notice"]
+        elif pending_notice is not None:
+            outcome["pending_notice"] = pending_notice
         outcomes[task_id] = outcome
         while len(outcomes) > 512:
             outcomes.pop(next(iter(outcomes)))
@@ -11919,12 +11926,15 @@ class GatewayRunner:
     ) -> Dict[str, Any]:
         """Build a JSON-safe retry payload for one background result."""
         source = job["source"]
+        retry_metadata = dict(metadata or {})
+        if job.get("team_id"):
+            retry_metadata["team_id"] = job["team_id"]
         return {
             "platform": source.platform.value,
             "chat_id": source.chat_id,
             "private_user_id": job.get("private_user_id"),
             "content": content,
-            "metadata": dict(metadata or {}),
+            "metadata": retry_metadata,
         }
 
     async def _retry_background_task_outcomes(self) -> int:
@@ -11983,7 +11993,9 @@ class GatewayRunner:
                     logger.warning("Private notice retry failed: %s", exc)
             await self._retry_background_task_outcomes()
             if include_lifecycle:
-                await self._send_update_notification()
+                update_task = getattr(self, "_update_notification_task", None)
+                if update_task is None or update_task.done():
+                    await self._send_update_notification()
                 await self._send_restart_notification()
 
     async def _send_routed_notice(
@@ -12058,17 +12070,20 @@ class GatewayRunner:
         metadata: Optional[Dict[str, Any]],
     ) -> SendResult:
         """Send a background result through its original public/private route."""
+        route_metadata = dict(metadata or {})
+        if job.get("team_id"):
+            route_metadata["team_id"] = job["team_id"]
         if not job.get("private_user_id"):
             return await adapter._send_with_retry(
                 chat_id=job["source"].chat_id,
                 content=content,
-                metadata=metadata,
+                metadata=route_metadata or None,
             )
         return await self._send_routed_notice(
             adapter,
             job["source"].chat_id,
             content,
-            metadata,
+            route_metadata or None,
             private_user_id=job.get("private_user_id"),
         )
 
@@ -14560,12 +14575,42 @@ class GatewayRunner:
         lock_path = _hermes_home / ".update_request.lock"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        if lock_path.exists() and not pending_path.exists() and not claimed_path.exists():
+            # A process can die after it creates the exclusive lock but before
+            # it publishes the route marker. Keep recent locks because another
+            # coroutine in this process can still be publishing its marker.
+            try:
+                lock_age = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                lock_age = 0.0
+            try:
+                lock_payload = json.loads(lock_path.read_text(encoding="utf-8"))
+                lock_pid = int(lock_payload.get("pid") or 0)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError):
+                lock_pid = 0
+            owner_alive = False
+            if lock_pid:
+                try:
+                    os.kill(lock_pid, 0)
+                    owner_alive = True
+                except ProcessLookupError:
+                    owner_alive = False
+                except PermissionError:
+                    owner_alive = True
+                except OSError:
+                    owner_alive = False
+            if lock_age >= 60.0 and not owner_alive:
+                lock_path.unlink(missing_ok=True)
         if pending_path.exists() or claimed_path.exists():
             return "⚠️ A Hermes update is already in progress."
         try:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             try:
-                os.write(lock_fd, datetime.now().isoformat().encode("utf-8"))
+                lock_record = {
+                    "pid": os.getpid(),
+                    "created_at": datetime.now().isoformat(),
+                }
+                os.write(lock_fd, json.dumps(lock_record).encode("utf-8"))
             finally:
                 os.close(lock_fd)
         except FileExistsError:

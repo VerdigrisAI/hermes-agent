@@ -296,6 +296,34 @@ class TestHandleUpdateCommand:
         popen.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_recovers_old_orphan_update_lock(self, tmp_path):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        event = _make_event()
+        fake_root = tmp_path / "project"
+        (fake_root / ".git").mkdir(parents=True)
+        (fake_root / "gateway").mkdir()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        (fake_root / "gateway" / "run.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        lock_path = hermes_home / ".update_request.lock"
+        lock_path.write_text(json.dumps({"pid": 999999999, "created_at": "old"}))
+        old = lock_path.stat().st_mtime - 120
+        os.utime(lock_path, (old, old))
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", fake_file), \
+             patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+             patch("subprocess.Popen"):
+            result = await runner._handle_update_command(event)
+
+        assert "Starting Hermes update" in result
+        assert (hermes_home / ".update_pending.json").exists()
+        lock = json.loads(lock_path.read_text())
+        assert lock["pid"] == os.getpid()
+
+    @pytest.mark.asyncio
     async def test_spawns_setsid(self, tmp_path):
         """Uses setsid when available."""
         runner = _make_runner()
@@ -866,6 +894,26 @@ class TestSendUpdateNotification:
             await runner._retry_deferred_deliveries(include_lifecycle=True)
 
         assert not (tmp_path / ".update_pending.claimed.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_deferred_worker_does_not_race_active_update_watcher(self):
+        runner = _make_runner()
+        runner._deferred_delivery_lock = asyncio.Lock()
+        runner._background_task_outcomes = {}
+        runner._send_update_notification = AsyncMock()
+        runner._send_restart_notification = AsyncMock()
+        active = asyncio.create_task(asyncio.sleep(60))
+        runner._update_notification_task = active
+
+        try:
+            await runner._retry_deferred_deliveries(include_lifecycle=True)
+        finally:
+            active.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+
+        runner._send_update_notification.assert_not_awaited()
+        runner._send_restart_notification.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_legacy_send_failure_retains_update_artifacts_for_retry(self, tmp_path):

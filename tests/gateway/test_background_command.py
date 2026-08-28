@@ -447,6 +447,58 @@ class TestRunBackgroundTask:
         assert persisted == runner._background_task_outcomes
         assert runner._load_background_task_outcomes() == persisted
 
+    def test_later_media_warning_does_not_replace_failed_text_result(self):
+        runner = _make_runner()
+        runner._background_task_outcomes = {}
+        answer = {"content": "the actual answer"}
+        warning = {"content": "attachment was blocked"}
+
+        runner._record_background_task_outcome(
+            "bg_mixed",
+            "delivery_failed",
+            detail="text_result",
+            pending_notice=answer,
+        )
+        runner._record_background_task_outcome(
+            "bg_mixed",
+            "delivery_failed",
+            detail="private_media_blocked",
+            pending_notice=warning,
+        )
+        runner._record_background_task_outcome(
+            "bg_mixed",
+            "delivery_failed_notified",
+            detail="private_media_blocked",
+        )
+
+        assert runner._background_task_outcomes["bg_mixed"]["pending_notice"] == answer
+
+    @pytest.mark.asyncio
+    async def test_background_notice_adds_secondary_workspace_to_live_and_retry_route(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=False))
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+        job = {"source": source, "team_id": "T2"}
+
+        await runner._send_background_job_notice(
+            adapter,
+            job,
+            "shutdown notice",
+            {"thread_id": "root-1"},
+        )
+        pending = runner._background_pending_notice(
+            job,
+            "shutdown notice",
+            {"thread_id": "root-1"},
+        )
+
+        assert adapter._send_with_retry.await_args.kwargs["metadata"] == {
+            "thread_id": "root-1",
+            "team_id": "T2",
+        }
+        assert pending["metadata"] == {"thread_id": "root-1", "team_id": "T2"}
+
     @pytest.mark.asyncio
     async def test_failed_background_result_persists_route_and_retries(self, tmp_path):
         runner = _make_runner()

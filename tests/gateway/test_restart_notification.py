@@ -189,6 +189,31 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_restart_stops_when_completion_route_cannot_be_saved(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "atomic_json_write",
+        MagicMock(side_effect=OSError("disk full")),
+    )
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+        message_id="m1",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert "Restart stopped" in result.text
+    runner.request_restart.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_sethome_updates_running_config_for_same_process_restart(tmp_path, monkeypatch):
     """/sethome persists to env and updates in-memory config before restart."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)

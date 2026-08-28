@@ -169,6 +169,21 @@ def _reply_anchor_for_event(event) -> str | None:
     return getattr(event, "message_id", None)
 
 
+def _delivery_metadata_for_event(event: "MessageEvent") -> dict | None:
+    """Build thread and private-route metadata for one admitted event."""
+    metadata = _thread_metadata_for_source(
+        event.source,
+        _reply_anchor_for_event(event),
+    )
+    if event.private_reply_user_id or event.platform_team_id:
+        metadata = dict(metadata or {})
+        if event.private_reply_user_id:
+            metadata["private_reply_user_id"] = event.private_reply_user_id
+        if event.platform_team_id:
+            metadata["team_id"] = event.platform_team_id
+    return metadata or None
+
+
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
     """Return True when a media file should use the platform's audio sender.
 
@@ -1997,6 +2012,28 @@ class BasePlatformAdapter(ABC):
         """Persist a private notice for later delivery when supported."""
         return False
 
+    def persist_delivery_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist an exhausted delivery for a later adapter retry."""
+        private_user_id = str((metadata or {}).get("private_reply_user_id") or "")
+        if not private_user_id:
+            return False
+        retry_metadata = dict(metadata or {})
+        retry_metadata.pop("private_reply_user_id", None)
+        if reply_to and "thread_id" not in retry_metadata:
+            retry_metadata["thread_id"] = reply_to
+        return self.persist_private_notice_retry(
+            chat_id,
+            private_user_id,
+            content,
+            retry_metadata or None,
+        )
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
@@ -2693,6 +2730,21 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        def _persist_failure() -> None:
+            try:
+                self.persist_delivery_retry(
+                    chat_id,
+                    content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            except Exception as persist_error:
+                logger.warning(
+                    "[%s] Could not persist failed delivery: %s",
+                    self.name,
+                    persist_error,
+                )
+
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -2751,6 +2803,7 @@ class BasePlatformAdapter(ABC):
                         return result
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
+                _persist_failure()
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
@@ -2763,6 +2816,7 @@ class BasePlatformAdapter(ABC):
         )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
+            _persist_failure()
         return fallback_result
 
     @staticmethod
@@ -3004,7 +3058,7 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
-        thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        thread_meta = _delivery_metadata_for_event(event)
         delivered = not event.expects_reply
 
         try:
@@ -3140,7 +3194,7 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    _thread_meta = _delivery_metadata_for_event(event)
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     _delivered = not event.expects_reply and not bool(_text)
@@ -3207,9 +3261,7 @@ class BasePlatformAdapter(ABC):
                         self.name, session_key,
                     )
                     try:
-                        _thread_meta = _thread_metadata_for_source(
-                            event.source, _reply_anchor_for_event(event)
-                        )
+                        _thread_meta = _delivery_metadata_for_event(event)
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
                         deferred = self.defer_event_to_active_response(
@@ -3401,13 +3453,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-        if event.private_reply_user_id or event.platform_team_id:
-            _thread_metadata = dict(_thread_metadata or {})
-            if event.private_reply_user_id:
-                _thread_metadata["private_reply_user_id"] = event.private_reply_user_id
-            if event.platform_team_id:
-                _thread_metadata["team_id"] = event.platform_team_id
+        _thread_metadata = _delivery_metadata_for_event(event)
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -3924,7 +3970,7 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                _thread_metadata = _delivery_metadata_for_event(event)
                 error_result = await self.send(
                     chat_id=event.source.chat_id,
                     content=(

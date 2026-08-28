@@ -297,12 +297,16 @@ class TestCommandBypassActiveSession:
     def test_queued_turn_preserves_the_original_reply_contract(self):
         event = _make_event("/queue follow up")
         event.expects_reply = True
+        event.private_reply_user_id = "U_PRIVATE"
+        event.platform_team_id = "T_SECONDARY"
 
         queued = _queued_reply_event(event, "follow up")
 
         assert queued.text == "follow up"
         assert queued.message_id == event.message_id
         assert queued.expects_reply is True
+        assert queued.private_reply_user_id == "U_PRIVATE"
+        assert queued.platform_team_id == "T_SECONDARY"
         assert queued.delivery_state is event.delivery_state
         assert event.delivery_state.completion_deferred is True
 

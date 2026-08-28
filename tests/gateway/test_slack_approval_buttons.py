@@ -46,6 +46,7 @@ _ensure_slack_mock()
 import gateway.platforms.slack as _slack_mod
 from gateway.platforms.slack import SlackAdapter, _SlackAttachmentError
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 
 
 def _make_adapter():
@@ -211,6 +212,36 @@ class TestSlackApprovalAction:
         # Should have acked but NOT resolved
         ack.assert_called_once()
         mock_resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_approval_click_gets_private_notice(self):
+        adapter = _make_adapter()
+        adapter.send_private_notice = AsyncMock(
+            return_value=SendResult(success=True)
+        )
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "stale.1", "thread_ts": "root.1", "blocks": []},
+            "channel": {"id": "C1"},
+            "team": {"id": "T1"},
+            "user": {"id": "U1", "name": "norbert"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "some-session",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        ack.assert_awaited_once()
+        mock_resolve.assert_not_called()
+        adapter.send_private_notice.assert_awaited_once()
+        assert "expired" in adapter.send_private_notice.await_args.kwargs["content"]
+        assert adapter.send_private_notice.await_args.kwargs["metadata"] == {
+            "team_id": "T1",
+            "thread_id": "root.1",
+        }
 
     @pytest.mark.asyncio
     async def test_deny_action(self):
