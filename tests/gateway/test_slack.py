@@ -4760,6 +4760,30 @@ class TestSlashEphemeralAck:
         )
 
     @pytest.mark.asyncio
+    async def test_private_timeout_persists_uncertain_delivery_notice(self, adapter):
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="ReadTimeout: request timed out",
+            )
+        )
+
+        result = await BasePlatformAdapter._send_with_retry(
+            adapter,
+            "C1",
+            "possibly delivered private answer",
+            metadata={"private_reply_user_id": "U1", "team_id": "T2"},
+        )
+
+        assert not result.success
+        saved = json.loads(adapter._slash_confirm_outcomes_path.read_text())
+        pending = saved[-1]["pending_notice"]
+        assert "could not confirm" in pending["content"]
+        assert "possibly delivered private answer" not in pending["content"]
+        assert pending["user_id"] == "U1"
+        assert pending["team_id"] == "T2"
+
+    @pytest.mark.asyncio
     async def test_native_slash_stashes_context_and_dispatches(self, adapter):
         """Full flow: native /q slash → stash + handle_message dispatch."""
         command = {

@@ -2720,6 +2720,7 @@ class BasePlatformAdapter(ABC):
         metadata: Any = None,
         max_retries: int = 2,
         base_delay: float = 2.0,
+        persist_failure: bool = True,
     ) -> "SendResult":
         """
         Send a message with automatic retry for transient network errors.
@@ -2730,11 +2731,13 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
-        def _persist_failure() -> None:
+        def _persist_failure(retry_content: str = content) -> None:
+            if not persist_failure:
+                return
             try:
                 self.persist_delivery_retry(
                     chat_id,
-                    content,
+                    retry_content,
                     reply_to=reply_to,
                     metadata=metadata,
                 )
@@ -2759,8 +2762,14 @@ class BasePlatformAdapter(ABC):
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been
-        # delivered) and not formatting errors — return the failure as-is.
+        # delivered) and not formatting errors. Persist a distinct uncertain
+        # notice instead of retrying the original payload and risking a
+        # duplicate.
         if not is_network and self._is_timeout_error(error_str):
+            _persist_failure(
+                "⚠️ Hermes could not confirm whether the previous response was "
+                "delivered. Please check the conversation before you retry."
+            )
             return result
 
         if is_network:
@@ -3484,6 +3493,14 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
 
+            # A recursive queued turn can own the final response even though
+            # this outer adapter task started for an earlier event. Route the
+            # terminal payload through that queued event's private/workspace
+            # contract.
+            final_route_events = event.delivery_state.final_response_events
+            delivery_event = final_route_events[0] if final_route_events else event
+            _thread_metadata = _delivery_metadata_for_event(delivery_event)
+
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
             # for system notices like "✨ New session started!" that the user
@@ -3601,7 +3618,7 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content and not _tts_caption_delivered:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    _reply_anchor = _reply_anchor_for_event(event)
+                    _reply_anchor = _reply_anchor_for_event(delivery_event)
                     # Mark final response messages for notification delivery.
                     # Platform adapters that support per-message notification
                     # control (e.g. Telegram's disable_notification) use this
@@ -3638,7 +3655,7 @@ class BasePlatformAdapter(ABC):
                         )
 
                 private_media_blocked = bool(
-                    event.private_reply_user_id
+                    delivery_event.private_reply_user_id
                     and (images or media_files or local_files)
                 )
                 if private_media_blocked:
@@ -3654,10 +3671,10 @@ class BasePlatformAdapter(ABC):
                     for attempt in range(3):
                         try:
                             private_result = await self.send_private_notice(
-                                chat_id=event.source.chat_id,
-                                user_id=event.private_reply_user_id,
+                                chat_id=delivery_event.source.chat_id,
+                                user_id=delivery_event.private_reply_user_id,
                                 content=private_notice,
-                                reply_to=_reply_anchor_for_event(event),
+                                reply_to=_reply_anchor_for_event(delivery_event),
                                 metadata=_thread_metadata,
                             )
                         except Exception as exc:
@@ -3677,8 +3694,8 @@ class BasePlatformAdapter(ABC):
                             await asyncio.sleep(2 ** attempt)
                     if not private_result.success:
                         self.persist_private_notice_retry(
-                            event.source.chat_id,
-                            event.private_reply_user_id,
+                            delivery_event.source.chat_id,
+                            delivery_event.private_reply_user_id,
                             private_notice,
                             _thread_metadata,
                         )

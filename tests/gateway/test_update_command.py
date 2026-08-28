@@ -308,7 +308,8 @@ class TestHandleUpdateCommand:
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         lock_path = hermes_home / ".update_request.lock"
-        lock_path.write_text(json.dumps({"pid": 999999999, "created_at": "old"}))
+        # The old owner PID can be reused by an unrelated live process.
+        lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": "old"}))
         old = lock_path.stat().st_mtime - 120
         os.utime(lock_path, (old, old))
 

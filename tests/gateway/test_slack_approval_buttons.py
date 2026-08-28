@@ -184,6 +184,7 @@ class TestSlackApprovalAction:
 
         ack.assert_called_once()
         mock_resolve.assert_called_once_with("agent:main:slack:group:C1:1111", "once")
+        assert adapter._approval_resolved["1234.5678"] is True
 
         # Message should be updated with decision
         mock_client.chat_update.assert_called_once()

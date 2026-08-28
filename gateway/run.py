@@ -2588,10 +2588,7 @@ class GatewayRunner:
                         "accept the queued turn. Please resend after it comes back."
                     ),
                     reply_to=self._reply_anchor_for_event(queued_event),
-                    metadata=self._thread_metadata_for_source(
-                        queued_event.source,
-                        self._reply_anchor_for_event(queued_event),
-                    ),
+                    metadata=self._delivery_metadata_for_event(queued_event),
                 )
                 _record_send_result_delivery(
                     queued_event,
@@ -7860,6 +7857,7 @@ class GatewayRunner:
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            event=event,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -10845,6 +10843,9 @@ class GatewayRunner:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    expects_reply=True,
+                    private_reply_user_id=event.private_reply_user_id,
+                    platform_team_id=event.platform_team_id,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -10903,7 +10904,12 @@ class GatewayRunner:
         idx = len(mgr.state.subgoals) if mgr.state else 0
         return f"✓ Added subgoal {idx}: {text}"
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
+    async def _send_goal_status_notice(
+        self,
+        source: Any,
+        message: str,
+        event: Optional[MessageEvent] = None,
+    ) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self.adapters.get(source.platform)
         if not adapter:
@@ -10911,7 +10917,10 @@ class GatewayRunner:
             return
 
         try:
-            metadata = self._thread_metadata_for_source(source)
+            metadata = self._merge_event_delivery_metadata(
+                self._thread_metadata_for_source(source),
+                event,
+            )
         except Exception:
             metadata = None
 
@@ -10922,7 +10931,12 @@ class GatewayRunner:
                 getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self,
+        source: Any,
+        message: str,
+        event: Optional[MessageEvent] = None,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The gateway message handler returns the agent response to the platform
@@ -10939,7 +10953,7 @@ class GatewayRunner:
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(source, message, event)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -10971,6 +10985,7 @@ class GatewayRunner:
         session_entry: Any,
         source: Any,
         final_response: str,
+        event: Optional[MessageEvent] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -11008,7 +11023,7 @@ class GatewayRunner:
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._defer_goal_status_notice_after_delivery(source, msg, event)
 
         if not decision.get("should_continue"):
             return
@@ -11029,6 +11044,13 @@ class GatewayRunner:
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    expects_reply=True,
+                    private_reply_user_id=(
+                        event.private_reply_user_id if event is not None else None
+                    ),
+                    platform_team_id=(
+                        event.platform_team_id if event is not None else None
+                    ),
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -12078,6 +12100,7 @@ class GatewayRunner:
                 chat_id=job["source"].chat_id,
                 content=content,
                 metadata=route_metadata or None,
+                persist_failure=False,
             )
         return await self._send_routed_notice(
             adapter,
@@ -14370,6 +14393,36 @@ class GatewayRunner:
         return metadata
 
     @staticmethod
+    def _merge_event_delivery_metadata(
+        metadata: Optional[Dict[str, Any]],
+        event: Optional[MessageEvent],
+    ) -> Optional[Dict[str, Any]]:
+        """Add private user and workspace ownership from an admitted event."""
+        if event is None or not (
+            event.private_reply_user_id or event.platform_team_id
+        ):
+            return metadata
+        merged = dict(metadata or {})
+        if event.private_reply_user_id:
+            merged["private_reply_user_id"] = event.private_reply_user_id
+        if event.platform_team_id:
+            merged["team_id"] = event.platform_team_id
+        return merged
+
+    def _delivery_metadata_for_event(
+        self,
+        event: MessageEvent,
+    ) -> Optional[Dict[str, Any]]:
+        """Build thread and private-route metadata for one event."""
+        return self._merge_event_delivery_metadata(
+            self._thread_metadata_for_source(
+                event.source,
+                self._reply_anchor_for_event(event),
+            ),
+            event,
+        )
+
+    @staticmethod
     def _reply_anchor_for_event(event: MessageEvent) -> Optional[str]:
         """Return the platform-specific reply anchor for GatewayRunner sends."""
         return _reply_anchor_for_event(event)
@@ -14583,19 +14636,7 @@ class GatewayRunner:
                 lock_age = time.time() - lock_path.stat().st_mtime
             except OSError:
                 lock_age = 0.0
-            try:
-                lock_payload = json.loads(lock_path.read_text(encoding="utf-8"))
-                lock_pid = int(lock_payload.get("pid") or 0)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError):
-                lock_pid = 0
-            owner_alive = False
-            if lock_pid:
-                try:
-                    from gateway.status import _pid_exists
-                    owner_alive = _pid_exists(lock_pid)
-                except Exception:
-                    owner_alive = False
-            if lock_age >= 60.0 and not owner_alive:
+            if lock_age >= 60.0:
                 lock_path.unlink(missing_ok=True)
         if pending_path.exists() or claimed_path.exists():
             return "⚠️ A Hermes update is already in progress."
@@ -16274,6 +16315,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        reply_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -16369,7 +16411,10 @@ class GatewayRunner:
             else bool(_plat_streaming)
         )
 
-        _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        _thread_metadata = self._merge_event_delivery_metadata(
+            self._thread_metadata_for_source(source, event_message_id),
+            reply_event,
+        )
 
         if _streaming_enabled:
             try:
@@ -16587,6 +16632,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                reply_event=reply_event,
             )
 
         from run_agent import AIAgent
@@ -16820,6 +16866,10 @@ class GatewayRunner:
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
+        _progress_metadata = self._merge_event_delivery_metadata(
+            _progress_metadata,
+            reply_event,
+        )
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -17205,6 +17255,10 @@ class GatewayRunner:
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+        _status_thread_metadata = self._merge_event_delivery_metadata(
+            _status_thread_metadata,
+            reply_event,
+        )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -18583,10 +18637,7 @@ class GatewayRunner:
                             chat_id=drain_event.source.chat_id,
                             content=rejection,
                             reply_to=self._reply_anchor_for_event(drain_event),
-                            metadata=self._thread_metadata_for_source(
-                                drain_event.source,
-                                self._reply_anchor_for_event(drain_event),
-                            ),
+                            metadata=self._delivery_metadata_for_event(drain_event),
                         )
                         _record_send_result_delivery(drain_event, rejection_result)
                     except Exception as exc:

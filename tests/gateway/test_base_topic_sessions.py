@@ -570,6 +570,8 @@ class TestBasePlatformTopicSessions:
         queued = _make_event(
             "-1001", "17585", message_id="2", expects_reply=True
         )
+        queued.private_reply_user_id = "U_PRIVATE"
+        queued.platform_team_id = "T_SECONDARY"
 
         async def handler(event):
             event.delivery_state.completion_events.append(queued)
@@ -583,6 +585,13 @@ class TestBasePlatformTopicSessions:
         await adapter._process_message_background(event, build_session_key(event.source))
 
         assert queued.delivery_state.reply_delivered is True
+        assert adapter.sent[-1]["reply_to"] is None
+        assert adapter.sent[-1]["metadata"] == {
+            "thread_id": "17585",
+            "private_reply_user_id": "U_PRIVATE",
+            "team_id": "T_SECONDARY",
+            "notify": True,
+        }
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),

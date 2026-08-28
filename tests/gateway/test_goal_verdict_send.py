@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -135,20 +136,35 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
 
     mgr = GoalManager(session_entry.session_id)
     mgr.set("polish the docs")
+    event = MessageEvent(
+        text="continue",
+        source=src,
+        private_reply_user_id="U_PRIVATE",
+        platform_team_id="T_SECONDARY",
+    )
 
     with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False)):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
             final_response="here's a partial edit",
+            event=event,
         )
         await asyncio.sleep(0.05)
 
     # Status line sent back
     assert len(adapter.sends) == 1
     assert "Continuing toward goal" in adapter.sends[0]["content"]
+    assert adapter.sends[0]["metadata"] == {
+        "private_reply_user_id": "U_PRIVATE",
+        "team_id": "T_SECONDARY",
+    }
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
+    continuation = next(iter(adapter._pending_messages.values()))
+    assert continuation.private_reply_user_id == "U_PRIVATE"
+    assert continuation.platform_team_id == "T_SECONDARY"
+    assert continuation.expects_reply is True
 
 
 @pytest.mark.asyncio

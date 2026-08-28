@@ -497,6 +497,7 @@ class TestRunBackgroundTask:
             "thread_id": "root-1",
             "team_id": "T2",
         }
+        assert adapter._send_with_retry.await_args.kwargs["persist_failure"] is False
         assert pending["metadata"] == {"thread_id": "root-1", "team_id": "T2"}
 
     @pytest.mark.asyncio

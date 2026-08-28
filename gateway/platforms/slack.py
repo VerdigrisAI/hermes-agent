@@ -3592,7 +3592,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Prevent double-clicks. Missing state means the gateway restarted or
         # the prompt expired, so tell the clicker instead of acknowledging
         # silently.
-        approval_state = self._approval_resolved.pop(msg_ts, None)
+        approval_state = self._approval_resolved.get(msg_ts)
         if approval_state is None:
             stale_text = (
                 "⚠️ This approval request expired after the gateway restarted. "
@@ -3623,6 +3623,7 @@ class SlackAdapter(BasePlatformAdapter):
             return
         if approval_state:
             return
+        self._approval_resolved[msg_ts] = True
 
         # Update the message to show the decision and remove buttons
         label_map = {
@@ -3677,7 +3678,8 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
 
-        # (approval state already consumed by atomic pop above)
+        # Keep the resolved state so concurrent or redelivered clicks remain
+        # distinguishable from prompts lost across a process restart.
 
     # ----- Thread context fetching -----
 

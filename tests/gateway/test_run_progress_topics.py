@@ -646,6 +646,23 @@ class QueuedCommentaryAgent:
         }
 
 
+class EveryTurnCommentaryAgent(QueuedCommentaryAgent):
+    calls = 0
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback(
+                f"private commentary {type(self).calls}",
+                already_streamed=False,
+            )
+        return {
+            "final_response": f"final response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class EarlyReturnSteerAgent:
     """Simulate a runtime branch that returns before the loop-level drain."""
 
@@ -1193,6 +1210,56 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
     assert result["final_response"] == "final response 2"
     assert "I'll inspect the repo first." in sent_texts
     assert "final response 1" in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_recursive_private_queue_routes_interim_to_private_workspace(
+    monkeypatch, tmp_path
+):
+    EveryTurnCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        chat_type="group",
+        thread_id="root-1",
+    )
+    original = MessageEvent(
+        text="active public turn",
+        source=source,
+        message_id="root-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="private queued turn",
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+        private_reply_user_id="U_PRIVATE",
+        platform_team_id="T_SECONDARY",
+    )
+
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EveryTurnCommentaryAgent,
+        session_id="sess-private-queue-route",
+        platform=Platform.SLACK,
+        chat_id="C1",
+        chat_type="group",
+        thread_id="root-1",
+        reply_event=original,
+        pending_event=queued,
+        config_data={"display": {"interim_assistant_messages": True}},
+    )
+
+    second_commentary = next(
+        call for call in adapter.sent if call["content"] == "private commentary 2"
+    )
+    assert second_commentary["metadata"] == {
+        "thread_id": "root-1",
+        "private_reply_user_id": "U_PRIVATE",
+        "team_id": "T_SECONDARY",
+    }
 
 
 @pytest.mark.asyncio
