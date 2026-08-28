@@ -2183,6 +2183,48 @@ async def test_base_processing_drops_post_delivery_callback_when_main_send_fails
 
 
 @pytest.mark.asyncio
+async def test_base_processing_releases_callback_for_delivered_queued_owner():
+    adapter = ProgressCaptureAdapter()
+    released = []
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="channel-1",
+        chat_type="group",
+    )
+    event = MessageEvent(
+        text="original",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+        private_reply_user_id="U1",
+        platform_team_id="T2",
+    )
+
+    async def _handler(owner):
+        owner.delivery_state.final_response_events.append(queued)
+        return "queued answer"
+
+    adapter.set_message_handler(_handler)
+    session_key = build_session_key(source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._post_delivery_callbacks[session_key] = lambda: released.append(True)
+
+    await adapter._process_message_background(event, session_key)
+
+    assert event.delivery_state.reply_delivered is False
+    assert queued.delivery_state.reply_delivered is True
+    assert released == [True]
+
+
+@pytest.mark.asyncio
 async def test_run_agent_drops_tool_progress_after_generation_invalidation(monkeypatch, tmp_path):
     import yaml
 

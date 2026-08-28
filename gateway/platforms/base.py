@@ -4071,9 +4071,11 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
+            callback_routes = event.delivery_state.final_response_events
+            callback_event = callback_routes[0] if callback_routes else event
             primary_delivery_confirmed = (
-                event.delivery_state.reply_delivered
-                and not event.delivery_state.reply_failed
+                callback_event.delivery_state.reply_delivered
+                and not callback_event.delivery_state.reply_failed
             )
             if callable(_post_cb) and primary_delivery_confirmed:
                 try:
