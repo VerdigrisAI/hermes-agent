@@ -3874,6 +3874,7 @@ class TestSlashEphemeralAck:
         assert ctx["response_url"] == "https://hooks.slack.com/commands/T123/456/abc"
         assert "ts" in ctx
         event = adapter.handle_message.await_args.args[0]
+        assert event.expects_reply is True
         assert event.private_reply_user_id == "U_SLASH"
         assert event.platform_team_id == "T_SECONDARY"
 

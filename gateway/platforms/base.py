@@ -3228,7 +3228,15 @@ class BasePlatformAdapter(ABC):
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
-                        _delivered = False
+                        error_result = await self._send_terminal_error_notice(event, e)
+                        _delivered = bool(error_result.success)
+                        event.delivery_state.reply_attempted = True
+                        if _delivered:
+                            event.delivery_state.reply_delivered = True
+                        else:
+                            event.delivery_state.reply_failed = True
+                        if error_result.failure_notice_delivered:
+                            event.delivery_state.failure_notice_delivered = True
                     await self._run_processing_hook(
                         "on_processing_complete",
                         event,

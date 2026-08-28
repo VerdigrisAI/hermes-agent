@@ -193,6 +193,27 @@ class TestCommandBypassActiveSession:
         assert event.delivery_state.reply_failed is True
 
     @pytest.mark.asyncio
+    async def test_busy_private_reset_error_is_persisted(self):
+        adapter = _make_adapter()
+        session_key = _session_key()
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._message_handler = AsyncMock(side_effect=RuntimeError("boom"))
+        adapter._send_with_retry = AsyncMock(side_effect=RuntimeError("send failed"))
+        adapter.persist_delivery_retry = MagicMock(return_value=True)
+        event = _make_event("/reset")
+        event.expects_reply = True
+        event.private_reply_user_id = "U_PRIVATE"
+        event.platform_team_id = "T_SECONDARY"
+
+        await adapter.handle_message(event)
+
+        adapter.persist_delivery_retry.assert_called_once()
+        metadata = adapter.persist_delivery_retry.call_args.kwargs["metadata"]
+        assert metadata["private_reply_user_id"] == "U_PRIVATE"
+        assert metadata["team_id"] == "T_SECONDARY"
+        assert event.delivery_state.reply_failed is True
+
+    @pytest.mark.asyncio
     async def test_agents_bypasses_guard(self):
         """/agents must bypass so active-task queries don't interrupt runs."""
         adapter = _make_adapter()

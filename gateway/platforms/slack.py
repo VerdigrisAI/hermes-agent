@@ -4088,6 +4088,7 @@ class SlackAdapter(BasePlatformAdapter):
             message_type=MessageType.COMMAND if text.startswith("/") else MessageType.TEXT,
             source=source,
             raw_message=command,
+            expects_reply=bool(response_url and text.startswith("/")),
             private_reply_user_id=(
                 user_id if response_url and text.startswith("/") else None
             ),
