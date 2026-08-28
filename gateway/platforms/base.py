@@ -4071,7 +4071,11 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
+            primary_delivery_confirmed = (
+                event.delivery_state.reply_delivered
+                and not event.delivery_state.reply_failed
+            )
+            if callable(_post_cb) and primary_delivery_confirmed:
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):

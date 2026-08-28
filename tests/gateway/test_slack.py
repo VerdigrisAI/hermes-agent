@@ -4075,6 +4075,15 @@ class TestSlashEphemeralAck:
         assert "timed out" in result.error
         adapter.send_private_notice.assert_not_awaited()
 
+        second_result = await adapter._send_slash_ephemeral(
+            adapter._slash_command_contexts[("C1", "U1")],
+            "later status",
+        )
+        assert second_result.success is False
+        assert "timed out" in second_result.error
+        session.post.assert_called_once()
+        adapter.send_private_notice.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_partial_slash_retry_resumes_failed_suffix(self, adapter):
         import time

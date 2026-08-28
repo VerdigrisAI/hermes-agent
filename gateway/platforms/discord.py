@@ -4055,6 +4055,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -4087,6 +4088,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             view = ExecApprovalView(
                 session_key=session_key,
+                approval_id=approval_id,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
@@ -5043,9 +5045,11 @@ def _define_discord_view_classes() -> None:
             session_key: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            approval_id: Optional[str] = None,
         ):
             super().__init__(timeout=300)  # 5-minute timeout
             self.session_key = session_key
+            self.approval_id = approval_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
@@ -5073,6 +5077,30 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            try:
+                from tools.approval import resolve_gateway_approval
+                if self.approval_id:
+                    count = resolve_gateway_approval(
+                        self.session_key,
+                        choice,
+                        approval_id=self.approval_id,
+                    )
+                else:
+                    count = resolve_gateway_approval(self.session_key, choice)
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from button: %s", exc)
+                await interaction.response.send_message(
+                    "This approval is no longer active. Run the command again.",
+                    ephemeral=True,
+                )
+                return
+            if count <= 0:
+                await interaction.response.send_message(
+                    "This approval is no longer active. Run the command again.",
+                    ephemeral=True,
+                )
+                return
+
             self.resolved = True
 
             # Update the embed with the decision
@@ -5087,16 +5115,10 @@ def _define_discord_view_classes() -> None:
 
             await interaction.response.edit_message(embed=embed, view=self)
 
-            # Unblock the waiting agent thread via the gateway approval queue
-            try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
-                logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
-                )
-            except Exception as exc:
-                logger.error("Failed to resolve gateway approval from button: %s", exc)
+            logger.info(
+                "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                count, self.session_key, choice, interaction.user.display_name,
+            )
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(

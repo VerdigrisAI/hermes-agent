@@ -2151,6 +2151,38 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
 
 
 @pytest.mark.asyncio
+async def test_base_processing_drops_post_delivery_callback_when_main_send_fails():
+    adapter = ProgressCaptureAdapter()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=False, error="ReadTimeout")
+    )
+    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="done"))
+    released = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg-1",
+        expects_reply=True,
+    )
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._post_delivery_callbacks[session_key] = lambda: released.append(True)
+
+    await adapter._process_message_background(event, session_key)
+
+    assert released == []
+    assert session_key not in adapter._post_delivery_callbacks
+    assert event.delivery_state.reply_failed is True
+
+
+@pytest.mark.asyncio
 async def test_run_agent_drops_tool_progress_after_generation_invalidation(monkeypatch, tmp_path):
     import yaml
 

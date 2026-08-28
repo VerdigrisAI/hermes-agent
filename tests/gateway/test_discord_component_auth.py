@@ -13,6 +13,7 @@ behavior on missing role data so the parity cannot regress.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -156,6 +157,32 @@ def test_exec_approval_view_role_default_is_empty_set():
     assert view.allowed_role_ids == set()
     assert view._check_auth(_interaction(11111)) is True
     assert view._check_auth(_interaction(99999)) is False
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_view_resolves_exact_parallel_approval():
+    view = ExecApprovalView(
+        session_key="sess-1",
+        approval_id="approval-2",
+        allowed_user_ids={"11111"},
+    )
+    interaction = _interaction(11111)
+    interaction.user.display_name = "Alice"
+    interaction.message = SimpleNamespace(embeds=[])
+    interaction.response = SimpleNamespace(
+        edit_message=AsyncMock(),
+        send_message=AsyncMock(),
+    )
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+        await view._resolve(interaction, "deny", None, "Denied")
+
+    resolve.assert_called_once_with(
+        "sess-1",
+        "deny",
+        approval_id="approval-2",
+    )
+    interaction.response.edit_message.assert_awaited_once()
 
 
 def test_slash_confirm_view_accepts_role_allowlist():

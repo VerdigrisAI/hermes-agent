@@ -17800,7 +17800,11 @@ class GatewayRunner:
                             "description": desc,
                             "metadata": _status_thread_metadata,
                         }
-                        if _status_adapter.platform == Platform.SLACK:
+                        if _status_adapter.platform in {
+                            Platform.DISCORD,
+                            Platform.SLACK,
+                            Platform.TELEGRAM,
+                        }:
                             _approval_kwargs["approval_id"] = approval_data.get(
                                 "approval_id"
                             )

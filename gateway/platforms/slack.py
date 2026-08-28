@@ -905,6 +905,11 @@ class SlackAdapter(BasePlatformAdapter):
         # chunks as private follow-up messages to the same verified user.
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         text = chunks[0] if chunks else formatted
+        if ctx.get("delivery_mode") == "uncertain":
+            return SendResult(
+                success=False,
+                error="response_url delivery timed out",
+            )
         if ctx.get("delivery_content") != content:
             ctx["delivery_content"] = content
             ctx["delivery_mode"] = None
