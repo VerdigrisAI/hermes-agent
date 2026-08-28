@@ -752,6 +752,52 @@ class TestSendUpdateNotification:
         assert not (tmp_path / ".update_pending.json").exists()
 
     @pytest.mark.asyncio
+    async def test_legacy_send_failure_retains_update_artifacts_for_retry(self, tmp_path):
+        runner = _make_runner()
+        pending_path = tmp_path / ".update_pending.json"
+        output_path = tmp_path / ".update_output.txt"
+        exit_path = tmp_path / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+        }))
+        output_path.write_text("done")
+        exit_path.write_text("0")
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+        adapter._is_retryable_error.return_value = False
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        assert (tmp_path / ".update_pending.claimed.json").exists()
+        assert output_path.exists()
+        assert exit_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_legacy_private_update_never_uses_public_send(self, tmp_path):
+        runner = _make_runner()
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+            "private_user_id": "U1",
+        }))
+        (tmp_path / ".update_exit_code").write_text("0")
+        adapter = MagicMock()
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        adapter.send = AsyncMock()
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            result = await runner._send_update_notification()
+
+        assert result is True
+        adapter.send_private_notice.assert_awaited_once()
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_timeout_send_failure_retains_update_artifacts(self, tmp_path):
         runner = _make_runner()
         runner._update_prompt_pending = {}
