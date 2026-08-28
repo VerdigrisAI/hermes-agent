@@ -92,7 +92,7 @@ def _upload_response(filename: str, *, file_id: str = "F123") -> dict:
 @pytest.fixture()
 def adapter(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    config = PlatformConfig(enabled=True, token="xoxb-fake-token")
+    config = PlatformConfig(enabled=True, token="test-token")
     a = SlackAdapter(config)
     # Mock the Slack app client
     a._app = MagicMock()
@@ -4624,7 +4624,7 @@ class TestSlashEphemeralAck:
         assert saved[-1]["status"] == "delivery_failed"
         assert saved[-1]["pending_notice"]["team_id"] == "T2"
 
-        restarted = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake-token"))
+        restarted = SlackAdapter(PlatformConfig(enabled=True, token="test-token"))
         restarted._app = MagicMock()
         restarted.send_private_notice = AsyncMock(return_value=SendResult(success=True))
         assert await restarted.retry_pending_private_notices() == 1
