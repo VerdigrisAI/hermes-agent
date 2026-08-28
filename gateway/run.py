@@ -1695,6 +1695,8 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._user_background_jobs: Dict[asyncio.Task, Dict[str, Any]] = {}
+        self._background_task_outcomes: Dict[str, Dict[str, Any]] = {}
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -6033,6 +6035,8 @@ class GatewayRunner:
                         _entry[0] if isinstance(_entry, tuple) else _entry
                     )
                     self._cleanup_agent_resources(_agent)
+
+            await GatewayRunner._cancel_user_background_jobs_for_shutdown(self)
 
             for platform, adapter in list(self.adapters.items()):
                 _adapter_started_at = time.monotonic()
@@ -11754,9 +11758,86 @@ class GatewayRunner:
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
+        user_jobs = getattr(self, "_user_background_jobs", None)
+        if user_jobs is None:
+            user_jobs = self._user_background_jobs = {}
+        user_jobs[_task] = {
+            "task_id": task_id,
+            "source": source,
+            "event_message_id": event_message_id,
+        }
+        _task.add_done_callback(lambda completed: user_jobs.pop(completed, None))
+        self._record_background_task_outcome(task_id, "running")
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    def _record_background_task_outcome(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Retain terminal evidence for user-owned background work."""
+        outcomes = getattr(self, "_background_task_outcomes", None)
+        if outcomes is None:
+            outcomes = self._background_task_outcomes = {}
+        outcomes[task_id] = {
+            "status": status,
+            "detail": detail,
+            "updated_at": datetime.now().isoformat(),
+        }
+        logger.info(
+            "background_task_outcome task_id=%s status=%s detail=%s",
+            task_id,
+            status,
+            detail or "",
+        )
+
+    async def _cancel_user_background_jobs_for_shutdown(self) -> None:
+        """Notify users, then cancel accepted background jobs before disconnect."""
+        jobs = list(getattr(self, "_user_background_jobs", {}).items())
+        tasks_to_cancel = []
+        for task, job in jobs:
+            if task.done():
+                continue
+            task_id = str(job.get("task_id") or "unknown")
+            source = job.get("source")
+            adapter = self.adapters.get(source.platform) if source else None
+            notified = False
+            if adapter is not None:
+                try:
+                    result = await adapter._send_with_retry(
+                        chat_id=source.chat_id,
+                        content=(
+                            f"⚠️ Background task {task_id} stopped because "
+                            "the gateway is shutting down. Please run it again."
+                        ),
+                        metadata=self._thread_metadata_for_source(
+                            source,
+                            job.get("event_message_id"),
+                        ),
+                    )
+                    notified = bool(
+                        getattr(result, "success", False)
+                        or getattr(result, "failure_notice_delivered", False)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Background shutdown notice failed for %s: %s",
+                        task_id,
+                        exc,
+                    )
+            self._record_background_task_outcome(
+                task_id,
+                "cancelled" if notified else "cancelled_undelivered",
+                detail="gateway shutdown",
+            )
+            task.cancel()
+            tasks_to_cancel.append(task)
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
     async def _run_background_task(
         self,
@@ -11776,9 +11857,20 @@ class GatewayRunner:
         adapter = self.adapters.get(source.platform)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            self._record_background_task_outcome(
+                task_id,
+                "failed_and_undelivered",
+                detail=f"no adapter for {source.platform}",
+            )
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        terminal_status = "running"
+
+        def _mark_outcome(status: str, detail: Optional[str] = None) -> None:
+            nonlocal terminal_status
+            terminal_status = status
+            self._record_background_task_outcome(task_id, status, detail=detail)
 
         async def _send_completion(content: str, *, phase: str):
             send_result = await adapter._send_with_retry(
@@ -11795,6 +11887,12 @@ class GatewayRunner:
                     bool(getattr(send_result, "failure_notice_delivered", False)),
                     getattr(send_result, "error", None) or "no success confirmation",
                 )
+                _mark_outcome(
+                    "delivery_failed_notified"
+                    if getattr(send_result, "failure_notice_delivered", False)
+                    else "delivery_failed",
+                    detail=phase,
+                )
             return send_result
 
         try:
@@ -11804,9 +11902,15 @@ class GatewayRunner:
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await _send_completion(
+                error_result = await _send_completion(
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
                     phase="credentials_error",
+                )
+                _mark_outcome(
+                    "failed"
+                    if getattr(error_result, "success", False)
+                    else "failed_and_undelivered",
+                    detail="no provider credentials",
                 )
                 return
 
@@ -11924,6 +12028,12 @@ class GatewayRunner:
                             task_id,
                             background_event.delivery_state.failure_notice_delivered,
                         )
+                        _mark_outcome(
+                            "delivery_failed_notified"
+                            if background_event.delivery_state.failure_notice_delivered
+                            else "delivery_failed",
+                            detail="media_result",
+                        )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await _send_completion(
@@ -11931,16 +12041,36 @@ class GatewayRunner:
                     f'Prompt: "{preview}"',
                     phase="empty_result",
                 )
+                if terminal_status == "running":
+                    _mark_outcome("empty", detail="no response generated")
 
+            if terminal_status == "running":
+                _mark_outcome("failed" if task_error else "success")
+
+        except asyncio.CancelledError:
+            existing_status = (
+                getattr(self, "_background_task_outcomes", {})
+                .get(task_id, {})
+                .get("status")
+            )
+            if not str(existing_status or "").startswith("cancelled"):
+                _mark_outcome("cancelled", detail="task cancelled")
+            raise
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await _send_completion(
+                error_result = await _send_completion(
                     f"❌ Background task {task_id} failed: {e}",
                     phase="task_exception",
                 )
+                _mark_outcome(
+                    "failed"
+                    if getattr(error_result, "success", False)
+                    else "failed_and_undelivered",
+                    detail=str(e),
+                )
             except Exception:
-                pass
+                _mark_outcome("failed_and_undelivered", detail=str(e))
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.

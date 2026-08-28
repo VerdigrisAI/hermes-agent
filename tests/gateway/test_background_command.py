@@ -192,6 +192,20 @@ class TestHandleBackgroundCommand:
 
 
 class TestRunBackgroundTask:
+    @pytest.mark.asyncio
+    async def test_missing_adapter_records_terminal_outcome(self):
+        runner = _make_runner()
+        runner.adapters = {}
+        runner._background_task_outcomes = {}
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        await runner._run_background_task("test", source, "bg_no_adapter")
+
+        assert (
+            runner._background_task_outcomes["bg_no_adapter"]["status"]
+            == "failed_and_undelivered"
+        )
+
     """Tests for GatewayRunner._run_background_task (the actual execution)."""
 
     @pytest.mark.asyncio
@@ -270,6 +284,7 @@ class TestRunBackgroundTask:
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Background task result" in content
         assert "Hello from background!" in content
+        assert runner._background_task_outcomes["bg_test"]["status"] == "success"
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
@@ -364,6 +379,7 @@ class TestRunBackgroundTask:
         assert "background_task task_id=bg_test" in caplog.text
         assert "phase=text_result delivery_success=false" in caplog.text
         assert "error=delivery exhausted" in caplog.text
+        assert runner._background_task_outcomes["bg_test"]["status"] == "delivery_failed"
 
     @pytest.mark.asyncio
     async def test_agent_error_is_not_labeled_successful(self):
@@ -397,6 +413,7 @@ class TestRunBackgroundTask:
         content = adapter._send_with_retry.await_args.kwargs["content"]
         assert content.startswith("❌ Background task failed")
         assert "✅" not in content
+        assert runner._background_task_outcomes["bg_test"]["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_empty_result_is_not_labeled_successful(self):
@@ -425,6 +442,72 @@ class TestRunBackgroundTask:
         content = adapter._send_with_retry.await_args.kwargs["content"]
         assert content.startswith("⚠️ Background task finished without a response")
         assert "✅" not in content
+        assert runner._background_task_outcomes["bg_test"]["status"] == "empty"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_notifies_before_cancelling_user_background_job(self):
+        runner = _make_runner()
+        runner._user_background_jobs = {}
+        runner._background_task_outcomes = {}
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        started = asyncio.Event()
+
+        async def pending_job():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(pending_job())
+        await started.wait()
+        runner._user_background_jobs[task] = {
+            "task_id": "bg_shutdown",
+            "source": source,
+            "event_message_id": "thread-1",
+        }
+
+        await runner._cancel_user_background_jobs_for_shutdown()
+
+        assert task.cancelled()
+        adapter._send_with_retry.assert_awaited_once()
+        assert "shutting down" in adapter._send_with_retry.await_args.kwargs["content"]
+        assert runner._background_task_outcomes["bg_shutdown"]["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_retains_undelivered_cancellation_outcome(self):
+        runner = _make_runner()
+        runner._user_background_jobs = {}
+        runner._background_task_outcomes = {}
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=False, error="offline")
+        )
+        runner.adapters[Platform.SLACK] = adapter
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        started = asyncio.Event()
+
+        async def pending_job():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(pending_job())
+        await started.wait()
+        runner._user_background_jobs[task] = {
+            "task_id": "bg_shutdown_failed",
+            "source": source,
+            "event_message_id": None,
+        }
+
+        await runner._cancel_user_background_jobs_for_shutdown()
+
+        assert task.cancelled()
+        assert (
+            runner._background_task_outcomes["bg_shutdown_failed"]["status"]
+            == "cancelled_undelivered"
+        )
 
     @pytest.mark.asyncio
     async def test_bare_local_artifact_is_uploaded_without_exposing_path(self, tmp_path):

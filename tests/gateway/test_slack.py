@@ -3849,10 +3849,12 @@ class TestSlashEphemeralAck:
         }
         await adapter._handle_slash_command(command)
 
-        # The context should be stashed under (channel_id, user_id).
-        key = ("C_SLASH", "U_SLASH")
-        assert key in adapter._slash_command_contexts
-        ctx = adapter._slash_command_contexts[key]
+        matching = [
+            ctx for key, ctx in adapter._slash_command_contexts.items()
+            if key[:2] == ("C_SLASH", "U_SLASH")
+        ]
+        assert len(matching) == 1
+        ctx = matching[0]
         assert ctx["response_url"] == "https://hooks.slack.com/commands/T123/456/abc"
         assert "ts" in ctx
 
@@ -3989,6 +3991,162 @@ class TestSlashEphemeralAck:
         assert remainder.endswith("(2/2)")
 
     @pytest.mark.asyncio
+    async def test_slash_continuation_is_not_formatted_twice(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/format",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "fallback-1"}
+        )
+        response = AsyncMock()
+        response.status = 500
+        response.text = AsyncMock(return_value="failed")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+                result = await adapter.send("C1", "**bold**")
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        assert adapter._app.client.chat_postEphemeral.await_args.kwargs["text"] == "*bold*"
+
+    @pytest.mark.asyncio
+    async def test_partial_slash_retry_resumes_failed_suffix(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_invocation_id, _slash_user_id
+
+        invocation_id = "invoke-1"
+        adapter._slash_command_contexts[("C1", "U1", invocation_id)] = {
+            "response_url": "https://hooks.slack.com/commands/resume",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "invocation_id": invocation_id,
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            side_effect=[
+                {"message_ts": "chunk-2"},
+                RuntimeError("transient chunk failure"),
+                {"message_ts": "chunk-3"},
+            ]
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        content = "x" * (adapter.MAX_MESSAGE_LENGTH * 2 + 10)
+        user_token = _slash_user_id.set("U1")
+        invocation_token = _slash_invocation_id.set(invocation_id)
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await adapter._send_with_retry(
+                    "C1", content, max_retries=1, base_delay=0
+                )
+        finally:
+            _slash_invocation_id.reset(invocation_token)
+            _slash_user_id.reset(user_token)
+
+        assert result.success
+        session.post.assert_called_once()
+        assert adapter._app.client.chat_postEphemeral.await_count == 3
+        calls = adapter._app.client.chat_postEphemeral.await_args_list
+        assert calls[0].kwargs["text"].endswith("(2/3)")
+        assert calls[1].kwargs["text"].endswith("(3/3)")
+        assert calls[2].kwargs["text"].endswith("(3/3)")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_user_slashes_keep_exact_context(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_invocation_id, _slash_user_id
+
+        contexts = {}
+        for invocation_id in ("first", "second"):
+            key = ("C1", "U1", invocation_id)
+            contexts[invocation_id] = {
+                "response_url": f"https://hooks.slack.com/commands/{invocation_id}",
+                "channel_id": "C1",
+                "user_id": "U1",
+                "invocation_id": invocation_id,
+                "ts": time.monotonic(),
+            }
+            adapter._slash_command_contexts[key] = contexts[invocation_id]
+
+        seen = []
+
+        async def capture(ctx, content):
+            seen.append((ctx["invocation_id"], content))
+            return SendResult(success=True)
+
+        adapter._send_slash_ephemeral = AsyncMock(side_effect=capture)
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        async def send_bound(invocation_id, content):
+            user_token = _slash_user_id.set("U1")
+            invocation_token = _slash_invocation_id.set(invocation_id)
+            try:
+                return await adapter.send("C1", content)
+            finally:
+                _slash_invocation_id.reset(invocation_token)
+                _slash_user_id.reset(user_token)
+
+        results = await asyncio.gather(
+            send_bound("first", "first reply"),
+            send_bound("second", "second reply"),
+        )
+
+        assert all(result.success for result in results)
+        assert sorted(seen) == [("first", "first reply"), ("second", "second reply")]
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bound_delayed_slash_context_is_not_expired_publicly(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_invocation_id, _slash_user_id
+
+        invocation_id = "slow"
+        adapter._slash_command_contexts[("C1", "U1", invocation_id)] = {
+            "response_url": "https://hooks.slack.com/commands/slow",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "invocation_id": invocation_id,
+            "ts": time.monotonic() - adapter._SLASH_CTX_TTL - 1,
+        }
+        adapter._send_slash_ephemeral = AsyncMock(return_value=SendResult(success=True))
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        user_token = _slash_user_id.set("U1")
+        invocation_token = _slash_invocation_id.set(invocation_id)
+        try:
+            result = await adapter.send("C1", "delayed private reply")
+        finally:
+            _slash_invocation_id.reset(invocation_token)
+            _slash_user_id.reset(user_token)
+
+        assert result.success
+        adapter._send_slash_ephemeral.assert_awaited_once()
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_send_falls_through_without_context(self, adapter):
         """send() should use normal chat_postMessage when no slash context exists."""
         mock_result = {"ts": "1234.5678", "ok": True}
@@ -4073,6 +4231,129 @@ class TestSlashEphemeralAck:
         assert ("C1", "U1") in adapter._slash_command_contexts
 
     @pytest.mark.asyncio
+    async def test_slash_confirm_prompt_is_private_and_bound_to_invoker(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/confirm",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "ephemeral-confirm"}
+        )
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        token = _slash_user_id.set("U1")
+        try:
+            result = await adapter.send_slash_confirm(
+                "C1", "Confirm", "Run /new?", "session-1", "confirm-1"
+            )
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        assert adapter._app.client.chat_postEphemeral.await_args.kwargs["user"] == "U1"
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+        assert adapter._slash_confirm_owners[("session-1", "confirm-1")]["user_id"] == "U1"
+        assert adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_keeps_final_answer_private(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/confirm-final",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "ephemeral-confirm"}
+        )
+        adapter._send_slash_ephemeral = AsyncMock(return_value=SendResult(success=True))
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        token = _slash_user_id.set("U1")
+        try:
+            confirm_result = await adapter.send_slash_confirm(
+                "C1", "Confirm", "Run /new?", "session-1", "confirm-1"
+            )
+            final_result = await adapter.send("C1", "Private final answer")
+        finally:
+            _slash_user_id.reset(token)
+
+        assert confirm_result.success
+        assert final_result.success
+        adapter._send_slash_ephemeral.assert_awaited_once()
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+        assert not adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_rejects_other_allowed_user(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1,U2")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        resolve = AsyncMock(return_value="done")
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        ack = AsyncMock()
+        body = {
+            "user": {"id": "U2", "name": "other"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        await adapter._handle_slash_confirm_action(ack, body, action)
+
+        ack.assert_awaited_once()
+        resolve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_slash_confirm_never_displays_approved(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        resolve = AsyncMock(return_value=None)
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        adapter.send_private_notice = AsyncMock()
+        response = AsyncMock()
+        response.status = 200
+        session = AsyncMock()
+        session.post = AsyncMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        ack = AsyncMock()
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.com/actions/update",
+            "message": {
+                "ts": "prompt-1",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "Confirm?"}}
+                ],
+            },
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+            await adapter._handle_slash_confirm_action(ack, body, action)
+
+        payload = session.post.await_args.kwargs["json"]
+        assert "expired or was superseded" in payload["text"]
+        assert "Approved" not in payload["text"]
+        adapter.send_private_notice.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_send_retry_keeps_slash_fallback_private(self, adapter):
         """A failed private slash send retries privately and never posts publicly."""
         import time
@@ -4133,7 +4414,7 @@ class TestSlashEphemeralAck:
         assert event.message_type == MessageType.COMMAND
 
         # 2. Context stashed for ephemeral routing
-        assert ("C_Q", "U_Q") in adapter._slash_command_contexts
+        assert any(key[:2] == ("C_Q", "U_Q") for key in adapter._slash_command_contexts)
 
     @pytest.mark.asyncio
     async def test_legacy_hermes_slash_stashes_context(self, adapter):
@@ -4148,7 +4429,7 @@ class TestSlashEphemeralAck:
         await adapter._handle_slash_command(command)
 
         adapter.handle_message.assert_called_once()
-        assert ("C_H", "U_H") in adapter._slash_command_contexts
+        assert any(key[:2] == ("C_H", "U_H") for key in adapter._slash_command_contexts)
 
     @pytest.mark.asyncio
     async def test_freeform_hermes_question_does_not_stash_context(self, adapter):
