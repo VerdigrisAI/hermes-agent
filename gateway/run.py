@@ -14591,13 +14591,9 @@ class GatewayRunner:
             owner_alive = False
             if lock_pid:
                 try:
-                    os.kill(lock_pid, 0)
-                    owner_alive = True
-                except ProcessLookupError:
-                    owner_alive = False
-                except PermissionError:
-                    owner_alive = True
-                except OSError:
+                    from gateway.status import _pid_exists
+                    owner_alive = _pid_exists(lock_pid)
+                except Exception:
                     owner_alive = False
             if lock_age >= 60.0 and not owner_alive:
                 lock_path.unlink(missing_ok=True)
