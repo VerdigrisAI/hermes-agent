@@ -4045,6 +4045,37 @@ class TestSlashEphemeralAck:
         assert adapter._app.client.chat_postEphemeral.await_args.kwargs["text"] == "*bold*"
 
     @pytest.mark.asyncio
+    async def test_response_url_timeout_does_not_resend_payload(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/timeout",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter.send_private_notice = AsyncMock()
+        response = AsyncMock()
+        response.__aenter__ = AsyncMock(side_effect=asyncio.TimeoutError())
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+                result = await adapter.send("C1", "command result")
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success is False
+        assert "timed out" in result.error
+        adapter.send_private_notice.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_partial_slash_retry_resumes_failed_suffix(self, adapter):
         import time
         from gateway.platforms.slack import _slash_invocation_id, _slash_user_id

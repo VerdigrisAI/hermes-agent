@@ -933,6 +933,16 @@ class SlackAdapter(BasePlatformAdapter):
                                 body[:200],
                             )
                             ctx["delivery_mode"] = "ephemeral"
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "[Slack] response_url POST delivery is uncertain: %s",
+                    e,
+                )
+                ctx["delivery_mode"] = "uncertain"
+                return SendResult(
+                    success=False,
+                    error="response_url delivery timed out",
+                )
             except Exception as e:
                 logger.warning(
                     "[Slack] response_url POST failed: %s", e,
@@ -3099,6 +3109,7 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """Send a Block Kit approval prompt with interactive buttons.
 
@@ -3112,6 +3123,12 @@ class SlackAdapter(BasePlatformAdapter):
             cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
             thread_ts = self._resolve_thread_ts(None, metadata)
 
+            button_value = session_key
+            if approval_id:
+                button_value = json.dumps(
+                    {"session_key": session_key, "approval_id": approval_id},
+                    separators=(",", ":"),
+                )
             blocks = [
                 {
                     "type": "section",
@@ -3132,26 +3149,26 @@ class SlackAdapter(BasePlatformAdapter):
                             "text": {"type": "plain_text", "text": "Allow Once"},
                             "style": "primary",
                             "action_id": "hermes_approve_once",
-                            "value": session_key,
+                            "value": button_value,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Allow Session"},
                             "action_id": "hermes_approve_session",
-                            "value": session_key,
+                            "value": button_value,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Always Allow"},
                             "action_id": "hermes_approve_always",
-                            "value": session_key,
+                            "value": button_value,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Deny"},
                             "style": "danger",
                             "action_id": "hermes_deny",
-                            "value": session_key,
+                            "value": button_value,
                         },
                     ],
                 },
@@ -3560,7 +3577,16 @@ class SlackAdapter(BasePlatformAdapter):
         await ack()
 
         action_id = action.get("action_id", "")
-        session_key = action.get("value", "")
+        action_value = action.get("value", "")
+        session_key = action_value
+        approval_id = None
+        try:
+            decoded_value = json.loads(action_value)
+            if isinstance(decoded_value, dict):
+                session_key = str(decoded_value.get("session_key") or "")
+                approval_id = str(decoded_value.get("approval_id") or "") or None
+        except (TypeError, ValueError):
+            pass
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
@@ -3632,7 +3658,14 @@ class SlackAdapter(BasePlatformAdapter):
         # underlying request expired, so an Approved label would be false.
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            if approval_id:
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    approval_id=approval_id,
+                )
+            else:
+                count = resolve_gateway_approval(session_key, choice)
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
             self._approval_resolved.pop(msg_ts, None)

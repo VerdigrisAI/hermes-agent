@@ -1,6 +1,7 @@
 """Tests for Slack Block Kit approval buttons and thread context fetching."""
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -106,6 +107,28 @@ class TestSlackExecApproval:
             assert e["value"] == "agent:main:slack:group:C1:1111"
 
     @pytest.mark.asyncio
+    async def test_buttons_bind_to_exact_approval(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        await adapter.send_exec_approval(
+            chat_id="C1",
+            command="rm -rf /important",
+            session_key="agent:main:slack:group:C1:1111",
+            approval_id="approval-2",
+        )
+
+        elements = mock_client.chat_postMessage.call_args.kwargs["blocks"][1]["elements"]
+        values = [json.loads(element["value"]) for element in elements]
+        assert values == [
+            {
+                "session_key": "agent:main:slack:group:C1:1111",
+                "approval_id": "approval-2",
+            }
+        ] * 4
+
+    @pytest.mark.asyncio
     async def test_sends_in_thread(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
@@ -190,6 +213,68 @@ class TestSlackApprovalAction:
         mock_client.chat_update.assert_called_once()
         update_kwargs = mock_client.chat_update.call_args[1]
         assert "Approved once by norbert" in update_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_resolves_exact_approval_from_button_value(self):
+        adapter = _make_adapter()
+        adapter._approval_resolved["1234.5678"] = "pending"
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "norbert"},
+        }
+        action = {
+            "action_id": "hermes_deny",
+            "value": (
+                '{"session_key":"agent:main:slack:group:C1:1111",'
+                '"approval_id":"approval-2"}'
+            ),
+        }
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        resolve.assert_called_once_with(
+            "agent:main:slack:group:C1:1111",
+            "deny",
+            approval_id="approval-2",
+        )
+
+    @pytest.mark.asyncio
+    async def test_out_of_order_click_resolves_matching_parallel_approval(self):
+        from tools import approval as approval_module
+
+        adapter = _make_adapter()
+        first = approval_module._ApprovalEntry({"command": "first"})
+        second = approval_module._ApprovalEntry({"command": "second"})
+        session_key = "parallel-session"
+        approval_module._gateway_queues[session_key] = [first, second]
+        adapter._approval_resolved["second-message"] = "pending"
+        body = {
+            "message": {"ts": "second-message", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "norbert"},
+        }
+        action = {
+            "action_id": "hermes_deny",
+            "value": json.dumps(
+                {
+                    "session_key": session_key,
+                    "approval_id": second.approval_id,
+                }
+            ),
+        }
+
+        try:
+            await adapter._handle_approval_action(AsyncMock(), body, action)
+
+            assert second.event.is_set()
+            assert second.result == "deny"
+            assert not first.event.is_set()
+            assert approval_module._gateway_queues[session_key] == [first]
+        finally:
+            approval_module._gateway_queues.pop(session_key, None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("state", ["claimed", "resolved"])
