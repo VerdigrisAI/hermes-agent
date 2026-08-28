@@ -4628,6 +4628,9 @@ class TestSlashEphemeralAck:
         restarted._app = MagicMock()
         restarted.send_private_notice = AsyncMock(return_value=SendResult(success=True))
         assert await restarted.retry_pending_private_notices() == 1
+        assert restarted.send_private_notice.await_args.kwargs["metadata"] == {
+            "team_id": "T2"
+        }
         assert (
             restarted._slash_confirm_outcomes[("session-1", "confirm-1")]["status"]
             == "retry_delivered"
