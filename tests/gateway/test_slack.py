@@ -4375,6 +4375,8 @@ class TestSlashEphemeralAck:
             await adapter._handle_slash_confirm_action(ack, body, action)
 
         payload = session.post.await_args.kwargs["json"]
+        assert payload["response_type"] == "ephemeral"
+        assert payload["replace_original"] is True
         assert "expired or was superseded" in payload["text"]
         assert "Approved" not in payload["text"]
         adapter.send_private_notice.assert_not_awaited()
