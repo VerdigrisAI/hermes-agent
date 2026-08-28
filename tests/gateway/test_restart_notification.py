@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import HomeChannel, Platform
+from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
-from gateway.session import build_session_key
+from gateway.session import SessionSource, build_session_key
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -61,6 +61,33 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     assert data["platform"] == "telegram"
     assert data["chat_id"] == "42"
     assert "thread_id" not in data  # no thread → omitted
+
+
+@pytest.mark.asyncio
+async def test_restart_command_persists_private_slack_owner(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(enabled=True, token="***")
+    slack = MagicMock()
+    slack.private_reply_user_id.return_value = "U_PRIVATE"
+    runner.adapters[Platform.SLACK] = slack
+    runner.request_restart = MagicMock(return_value=True)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        user_id="U_PRIVATE",
+    )
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+    )
+
+    await runner._handle_restart_command(event)
+
+    data = json.loads((tmp_path / ".restart_notify.json").read_text())
+    assert data["private_user_id"] == "U_PRIVATE"
 
 
 @pytest.mark.asyncio
@@ -389,6 +416,34 @@ async def test_send_restart_notification_with_thread(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_restart_notification_preserves_private_slack_route(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "slack",
+        "chat_id": "C1",
+        "private_user_id": "U1",
+    }))
+    runner, _adapter = make_restart_runner()
+    from gateway.platforms.base import SendResult
+
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(enabled=True, token="***")
+    slack = MagicMock()
+    slack.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+    slack.send = AsyncMock()
+    runner.adapters[Platform.SLACK] = slack
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("slack", "C1", None)
+    slack.send_private_notice.assert_awaited_once()
+    slack.send.assert_not_awaited()
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_send_restart_notification_noop_when_no_file(tmp_path, monkeypatch):
     """Nothing happens if there's no pending restart notification."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -402,8 +457,8 @@ async def test_send_restart_notification_noop_when_no_file(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, monkeypatch):
-    """If the requester's platform isn't connected, clean up without crashing."""
+async def test_send_restart_notification_retries_when_adapter_missing(tmp_path, monkeypatch):
+    """Keep the marker when the requester's platform is not connected."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
@@ -416,15 +471,14 @@ async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, mo
 
     await runner._send_restart_notification()
 
-    # File cleaned up even though we couldn't send
-    assert not notify_path.exists()
+    assert notify_path.exists()
 
 
 @pytest.mark.asyncio
-async def test_send_restart_notification_cleans_up_on_send_failure(
+async def test_send_restart_notification_retries_on_send_failure(
     tmp_path, monkeypatch
 ):
-    """If the adapter.send() raises, the file is still cleaned up."""
+    """If the adapter send raises, keep the marker for a later retry."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
@@ -438,9 +492,8 @@ async def test_send_restart_notification_cleans_up_on_send_failure(
 
     delivered_target = await runner._send_restart_notification()
 
-    # File cleaned up even though send raised.
     assert delivered_target is None
-    assert not notify_path.exists()
+    assert notify_path.exists()
 
 
 @pytest.mark.asyncio
@@ -492,8 +545,7 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
         "Expected a WARNING line mentioning the failure; "
         f"got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
-    # Still cleans up.
-    assert not notify_path.exists()
+    assert notify_path.exists()
 
 
 @pytest.mark.asyncio

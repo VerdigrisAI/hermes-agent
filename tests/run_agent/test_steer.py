@@ -26,6 +26,21 @@ def _bare_agent() -> AIAgent:
 
 
 class TestSteerAcceptance:
+    def test_run_conversation_closes_steering_after_early_result(self, monkeypatch):
+        agent = _bare_agent()
+
+        def early_result(active_agent, *_args, **_kwargs):
+            assert active_agent.steer("late guidance") is True
+            return {"completed": False, "error": "provider failed"}
+
+        monkeypatch.setattr("agent.conversation_loop.run_conversation", early_result)
+
+        result = agent.run_conversation("hello")
+
+        assert agent._accepting_steers is False
+        assert agent._pending_steer is None
+        assert result["pending_steer"] == "late guidance"
+
     def test_accepts_non_empty_text(self):
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True

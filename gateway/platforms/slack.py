@@ -448,7 +448,8 @@ class SlackAdapter(BasePlatformAdapter):
         # (channel_id, user_id, invocation_id). The invocation component keeps
         # overlapping commands from the same user isolated.
         self._slash_command_contexts: Dict[Tuple[str, ...], Dict[str, Any]] = {}
-        self._slash_confirm_owners: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._slash_confirm_owners: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._slash_confirm_outcomes: Dict[Tuple[str, str], Dict[str, str]] = {}
 
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
@@ -719,6 +720,11 @@ class SlackAdapter(BasePlatformAdapter):
             if candidate is ctx:
                 self._slash_command_contexts.pop(key, None)
                 return
+
+    def private_reply_user_id(self, chat_id: str) -> Optional[str]:
+        """Return the verified user bound to the active slash invocation."""
+        ctx = self._peek_slash_context(chat_id)
+        return str(ctx.get("user_id") or "") if ctx else None
 
     async def _send_slash_ephemeral(
         self,
@@ -3062,8 +3068,19 @@ class SlackAdapter(BasePlatformAdapter):
 
             result = await self._get_client(chat_id).chat_postEphemeral(**kwargs)
             msg_ts = result.get("message_ts") or result.get("ts", "")
+            now = time.monotonic()
+            stale_owner_keys = [
+                key
+                for key, owner in self._slash_confirm_owners.items()
+                if now - float(owner.get("created_at", 0)) > self._SLASH_CTX_TTL
+            ]
+            for key in stale_owner_keys:
+                self._slash_confirm_owners.pop(key, None)
+            while len(self._slash_confirm_owners) >= 256:
+                self._slash_confirm_owners.pop(next(iter(self._slash_confirm_owners)))
             self._slash_confirm_owners[(session_key, confirm_id)] = {
                 "user_id": str(slash_ctx.get("user_id") or ""),
+                "created_at": now,
             }
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
@@ -3099,7 +3116,17 @@ class SlackAdapter(BasePlatformAdapter):
             return
         session_key, confirm_id = value.split("|", 1)
         owner = self._slash_confirm_owners.get((session_key, confirm_id))
-        if not owner or user_id != owner.get("user_id"):
+        owner_created_at = owner.get("created_at") if owner else None
+        if (
+            not owner
+            or (
+                owner_created_at is not None
+                and time.monotonic() - float(owner_created_at) > self._SLASH_CTX_TTL
+            )
+            or user_id != owner.get("user_id")
+        ):
+            if owner:
+                self._slash_confirm_owners.pop((session_key, confirm_id), None)
             logger.warning(
                 "[Slack] Slash-confirm actor mismatch for session %s: %s",
                 session_key,
@@ -3160,10 +3187,11 @@ class SlackAdapter(BasePlatformAdapter):
             },
         ]
         response_url = str(body.get("response_url") or "")
+        update_delivered = False
         if response_url:
             try:
                 async with aiohttp.ClientSession(trust_env=True) as session:
-                    await session.post(
+                    response = await session.post(
                         response_url,
                         json={
                             "response_type": "ephemeral",
@@ -3173,18 +3201,105 @@ class SlackAdapter(BasePlatformAdapter):
                         },
                         timeout=aiohttp.ClientTimeout(total=10),
                     )
+                    update_delivered = response.status == 200
+                    if not update_delivered:
+                        logger.warning(
+                            "[Slack] Private slash-confirm update returned %s",
+                            response.status,
+                        )
             except Exception as exc:
                 logger.warning("[Slack] Failed to update private slash-confirm: %s", exc)
+
+        private_result = None
         if result_text:
-            await self.send_private_notice(
-                chat_id=channel_id,
-                user_id=user_id,
-                content=result_text,
-                reply_to=message.get("thread_ts") or None,
+            for attempt in range(3):
+                try:
+                    private_result = await self.send_private_notice(
+                        chat_id=channel_id,
+                        user_id=user_id,
+                        content=result_text,
+                        reply_to=message.get("thread_ts") or None,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Private slash-confirm result failed: %s",
+                        exc,
+                    )
+                    private_result = SendResult(
+                        success=False,
+                        error=str(exc),
+                        retryable=True,
+                    )
+                if private_result.success:
+                    break
+                if not (
+                    private_result.retryable
+                    or self._is_retryable_error(private_result.error or "")
+                ):
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+
+        result_delivered = bool(private_result and private_result.success)
+        terminal_delivered = result_delivered or (not result_text and update_delivered)
+        failure_notice_delivered = False
+        if not terminal_delivered:
+            failure_text = (
+                "⚠️ Confirmation was resolved, but its result could not be delivered. "
+                "Please run the command again."
             )
+            if response_url:
+                try:
+                    async with aiohttp.ClientSession(trust_env=True) as session:
+                        response = await session.post(
+                            response_url,
+                            json={
+                                "response_type": "ephemeral",
+                                "replace_original": True,
+                                "text": failure_text,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                        failure_notice_delivered = response.status == 200
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Failed to update private slash-confirm failure: %s",
+                        exc,
+                    )
+            if not failure_notice_delivered:
+                try:
+                    notice_result = await self.send_private_notice(
+                        chat_id=channel_id,
+                        user_id=user_id,
+                        content=failure_text,
+                        reply_to=message.get("thread_ts") or None,
+                    )
+                    failure_notice_delivered = notice_result.success
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Private slash-confirm failure notice failed: %s",
+                        exc,
+                    )
+
+        outcome_key = (session_key, confirm_id)
+        while len(self._slash_confirm_outcomes) >= 256:
+            self._slash_confirm_outcomes.pop(next(iter(self._slash_confirm_outcomes)))
+        self._slash_confirm_outcomes[outcome_key] = {
+            "status": (
+                "delivered"
+                if terminal_delivered
+                else "delivery_failed_notified"
+                if failure_notice_delivered
+                else "delivery_failed"
+            ),
+        }
         logger.info(
-            "Slack button resolved slash-confirm for session %s (choice=%s, user=%s)",
-            session_key, choice, user_name,
+            "Slack button resolved slash-confirm for session %s "
+            "(choice=%s, user=%s, status=%s)",
+            session_key,
+            choice,
+            user_name,
+            self._slash_confirm_outcomes[outcome_key]["status"],
         )
 
     async def _handle_approval_action(self, ack, body, action) -> None:

@@ -3932,7 +3932,26 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        self._open_steering()
+        result = None
+        try:
+            result = run_conversation(
+                self,
+                user_message,
+                system_message,
+                conversation_history,
+                task_id,
+                stream_callback,
+                persist_user_message,
+            )
+            return result
+        finally:
+            leftover = self._close_steering()
+            if leftover and isinstance(result, dict):
+                existing = result.get("pending_steer")
+                result["pending_steer"] = (
+                    f"{existing}\n{leftover}" if existing else leftover
+                )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

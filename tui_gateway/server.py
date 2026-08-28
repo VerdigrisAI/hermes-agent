@@ -3027,6 +3027,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if not session.get("running"):
+        return _err(rid, 4009, "session is not running")
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")

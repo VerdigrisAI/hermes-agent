@@ -1970,6 +1970,10 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    def private_reply_user_id(self, chat_id: str) -> Optional[str]:
+        """Return the verified private-reply user for the active invocation."""
+        return None
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.

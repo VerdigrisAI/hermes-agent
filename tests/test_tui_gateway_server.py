@@ -5,7 +5,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tui_gateway import server
 
@@ -2504,7 +2504,7 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
         def interrupt(self, *args, **kwargs):
             calls["interrupt_called"] = True
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    server._sessions["sid"] = _session(agent=_Agent(), running=True)
     try:
         resp = server.handle_request(
             {
@@ -2521,6 +2521,24 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert resp["result"]["text"] == "also check auth.log"
     assert calls["steer_text"] == "also check auth.log"
     assert "interrupt_called" not in calls  # must NOT interrupt
+
+
+def test_session_steer_rejects_idle_session():
+    agent = types.SimpleNamespace(steer=MagicMock(return_value=True))
+    server._sessions["sid"] = _session(agent=agent, running=False)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "do not leak"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["error"]["code"] == 4009
+    agent.steer.assert_not_called()
 
 
 def test_session_steer_rejects_empty_text():
@@ -2543,7 +2561,10 @@ def test_session_steer_rejects_empty_text():
 
 
 def test_session_steer_errors_when_agent_has_no_steer_method():
-    server._sessions["sid"] = _session(agent=types.SimpleNamespace())  # no steer()
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(),
+        running=True,
+    )  # no steer()
     try:
         resp = server.handle_request(
             {

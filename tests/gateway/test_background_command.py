@@ -5,7 +5,9 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+import json
 import os
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -141,6 +143,30 @@ class TestHandleBackgroundCommand:
         assert runner._run_background_task.call_args.kwargs["event_message_id"] == "463"
 
     @pytest.mark.asyncio
+    async def test_slack_slash_background_captures_private_reply_owner(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.private_reply_user_id.return_value = "U_PRIVATE"
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_background_task = AsyncMock()
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            return MagicMock()
+
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            event = _make_event(
+                text="/background private work",
+                platform=Platform.SLACK,
+                user_id="U_PRIVATE",
+                chat_id="C1",
+            )
+            await runner._handle_background_command(event)
+
+        job_state = runner._run_background_task.call_args.kwargs["job_state"]
+        assert job_state["private_user_id"] == "U_PRIVATE"
+
+    @pytest.mark.asyncio
     async def test_prompt_truncated_in_preview(self):
         """Long prompts are truncated to 60 chars in the confirmation message."""
         runner = _make_runner()
@@ -247,6 +273,28 @@ class TestRunBackgroundTask:
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
 
     @pytest.mark.asyncio
+    async def test_no_credentials_preserves_delivered_failure_notice(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="delivery exhausted",
+                failure_notice_delivered=True,
+            )
+        )
+        runner.adapters[Platform.SLACK] = adapter
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": None}):
+            await runner._run_background_task("work", source, "bg_credentials")
+
+        assert (
+            runner._background_task_outcomes["bg_credentials"]["status"]
+            == "delivery_failed_notified"
+        )
+
+    @pytest.mark.asyncio
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
@@ -267,6 +315,12 @@ class TestRunBackgroundTask:
         )
 
         mock_result = {"final_response": "Hello from background!", "messages": []}
+        job_state = {
+            "source": source,
+            "agent": None,
+            "thread_started": threading.Event(),
+            "thread_done": threading.Event(),
+        }
 
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
              patch("run_agent.AIAgent") as MockAgent:
@@ -276,7 +330,12 @@ class TestRunBackgroundTask:
             mock_agent_instance.run_conversation.return_value = mock_result
             MockAgent.return_value = mock_agent_instance
 
-            await runner._run_background_task("say hello", source, "bg_test")
+            await runner._run_background_task(
+                "say hello",
+                source,
+                "bg_test",
+                job_state=job_state,
+            )
 
         # Should have sent the result
         mock_adapter._send_with_retry.assert_awaited_once()
@@ -285,8 +344,108 @@ class TestRunBackgroundTask:
         assert "Background task result" in content
         assert "Hello from background!" in content
         assert runner._background_task_outcomes["bg_test"]["status"] == "success"
+        assert job_state["agent"] is mock_agent_instance
+        assert job_state["thread_started"].is_set()
+        assert job_state["thread_done"].is_set()
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_private_background_completion_never_uses_public_send(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        adapter._send_with_retry = AsyncMock()
+        adapter.extract_media = BasePlatformAdapter.extract_media
+        adapter.extract_images = BasePlatformAdapter.extract_images
+        adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "private result", "messages": []}
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+        job_state = {"source": source, "private_user_id": "U1"}
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task(
+                "work",
+                source,
+                "bg_private",
+                job_state=job_state,
+            )
+
+        adapter.send_private_notice.assert_awaited_once()
+        adapter._send_with_retry.assert_not_awaited()
+        assert runner._background_task_outcomes["bg_private"]["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_private_background_media_is_not_posted_to_channel(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        adapter._send_with_retry = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=(["/tmp/private.pdf"], ""))
+        adapter.extract_images = MagicMock(return_value=([], ""))
+        adapter.extract_local_files = MagicMock(return_value=([], ""))
+        runner.adapters[Platform.SLACK] = adapter
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={"final_response": "MEDIA:/tmp/private.pdf", "messages": []}
+        )
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._deliver_media_from_response = AsyncMock()
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            await runner._run_background_task(
+                "work",
+                source,
+                "bg_private_media",
+                job_state={"source": source, "private_user_id": "U1"},
+            )
+
+        runner._deliver_media_from_response.assert_not_awaited()
+        sent = [call.kwargs["content"] for call in adapter.send_private_notice.await_args_list]
+        assert any("did not post it to the channel" in content for content in sent)
+        assert all("/tmp/private.pdf" not in content for content in sent)
+
+    def test_background_outcomes_are_bounded_and_persisted(self, tmp_path):
+        runner = _make_runner()
+        runner._background_outcomes_path = tmp_path / "outcomes.json"
+        runner._background_task_outcomes = {}
+
+        runner._background_task_outcomes = {
+            f"bg_{index}": {"status": "success"} for index in range(512)
+        }
+        runner._record_background_task_outcome("bg_512", "success")
+
+        assert len(runner._background_task_outcomes) == 512
+        assert "bg_0" not in runner._background_task_outcomes
+        persisted = json.loads(runner._background_outcomes_path.read_text())
+        assert persisted == runner._background_task_outcomes
+        assert runner._load_background_task_outcomes() == persisted
 
     @pytest.mark.asyncio
     async def test_text_completion_uses_retrying_delivery(self):
@@ -445,12 +604,11 @@ class TestRunBackgroundTask:
         assert runner._background_task_outcomes["bg_test"]["status"] == "empty"
 
     @pytest.mark.asyncio
-    async def test_shutdown_notifies_before_cancelling_user_background_job(self):
+    async def test_shutdown_cancels_then_notifies_user_background_job(self):
         runner = _make_runner()
         runner._user_background_jobs = {}
         runner._background_task_outcomes = {}
         adapter = MagicMock()
-        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
         runner.adapters[Platform.SLACK] = adapter
         source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
 
@@ -468,12 +626,89 @@ class TestRunBackgroundTask:
             "event_message_id": "thread-1",
         }
 
+        async def assert_cancelled_before_notice(**_kwargs):
+            assert task.cancelled()
+            return SendResult(success=True)
+
+        adapter._send_with_retry = AsyncMock(side_effect=assert_cancelled_before_notice)
+
         await runner._cancel_user_background_jobs_for_shutdown()
 
         assert task.cancelled()
         adapter._send_with_retry.assert_awaited_once()
         assert "shutting down" in adapter._send_with_retry.await_args.kwargs["content"]
         assert runner._background_task_outcomes["bg_shutdown"]["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_interrupts_agent_before_cancelling_worker(self):
+        runner = _make_runner()
+        runner._user_background_jobs = {}
+        runner._background_task_outcomes = {}
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+        started = asyncio.Event()
+        thread_done = threading.Event()
+        agent = MagicMock()
+
+        async def pending_job():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                thread_done.set()
+
+        task = asyncio.create_task(pending_job())
+        await started.wait()
+        runner._user_background_jobs[task] = {
+            "task_id": "bg_interrupt",
+            "source": source,
+            "event_message_id": None,
+            "agent": agent,
+            "thread_started": threading.Event(),
+            "thread_done": thread_done,
+        }
+        runner._user_background_jobs[task]["thread_started"].set()
+
+        await runner._cancel_user_background_jobs_for_shutdown()
+
+        agent.interrupt.assert_called_once_with("Gateway shutting down")
+        assert thread_done.is_set()
+        assert runner._background_task_outcomes["bg_interrupt"]["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_cancel_job_that_suppresses_cancellation(self):
+        runner = _make_runner()
+        runner._user_background_jobs = {}
+        runner._background_task_outcomes = {}
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+        started = asyncio.Event()
+
+        async def finish_on_cancel():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                runner._record_background_task_outcome("bg_race", "success")
+
+        task = asyncio.create_task(finish_on_cancel())
+        await started.wait()
+        runner._user_background_jobs[task] = {
+            "task_id": "bg_race",
+            "source": source,
+            "event_message_id": None,
+        }
+
+        await runner._cancel_user_background_jobs_for_shutdown()
+
+        assert task.done()
+        assert not task.cancelled()
+        adapter._send_with_retry.assert_not_awaited()
+        assert runner._background_task_outcomes["bg_race"]["status"] == "success"
 
     @pytest.mark.asyncio
     async def test_shutdown_retains_undelivered_cancellation_outcome(self):
@@ -765,6 +1000,31 @@ class TestRunBackgroundTask:
         call_args = mock_adapter._send_with_retry.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "failed" in content.lower()
+
+    @pytest.mark.asyncio
+    async def test_exception_preserves_delivered_failure_notice(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="delivery exhausted",
+                failure_notice_delivered=True,
+            )
+        )
+        runner.adapters[Platform.SLACK] = adapter
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=RuntimeError("boom"),
+        ):
+            await runner._run_background_task("work", source, "bg_exception")
+
+        assert (
+            runner._background_task_outcomes["bg_exception"]["status"]
+            == "delivery_failed_notified"
+        )
 
 
 # ---------------------------------------------------------------------------

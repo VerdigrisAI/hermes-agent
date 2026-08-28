@@ -4262,6 +4262,39 @@ class TestSlashEphemeralAck:
         assert adapter._slash_command_contexts
 
     @pytest.mark.asyncio
+    async def test_slash_confirm_owner_state_is_bounded(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        now = time.monotonic()
+        adapter._slash_confirm_owners = {
+            ("session", str(index)): {"user_id": "U1", "created_at": now}
+            for index in range(256)
+        }
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/confirm",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": now,
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "ephemeral-confirm"}
+        )
+
+        token = _slash_user_id.set("U1")
+        try:
+            result = await adapter.send_slash_confirm(
+                "C1", "Confirm", "Proceed?", "new-session", "new-confirm"
+            )
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        assert len(adapter._slash_confirm_owners) == 256
+        assert ("session", "0") not in adapter._slash_confirm_owners
+        assert ("new-session", "new-confirm") in adapter._slash_confirm_owners
+
+    @pytest.mark.asyncio
     async def test_slash_confirm_keeps_final_answer_private(self, adapter):
         import time
         from gateway.platforms.slack import _slash_user_id
@@ -4314,6 +4347,32 @@ class TestSlashEphemeralAck:
 
         ack.assert_awaited_once()
         resolve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_rejects_expired_owner(self, adapter, monkeypatch):
+        import time
+
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {
+            "user_id": "U1",
+            "created_at": time.monotonic() - adapter._SLASH_CTX_TTL - 1,
+        }
+        resolve = AsyncMock(return_value="done")
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        resolve.assert_not_awaited()
+        assert ("session-1", "confirm-1") not in adapter._slash_confirm_owners
 
     @pytest.mark.asyncio
     async def test_slash_confirm_resolves_only_once(self, adapter, monkeypatch):
@@ -4387,6 +4446,141 @@ class TestSlashEphemeralAck:
         assert "expired or was superseded" in payload["text"]
         assert "Approved" not in payload["text"]
         adapter.send_private_notice.assert_not_awaited()
+        assert adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_retries_private_result(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="completed privately"),
+        )
+        adapter.send_private_notice = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="connection reset", retryable=True),
+                SendResult(success=True, message_id="private-result"),
+            ]
+        )
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert adapter.send_private_notice.await_count == 2
+        assert adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_records_private_delivery_failure_notice(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="completed privately"),
+        )
+        adapter.send_private_notice = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="not_allowed"),
+                SendResult(success=False, error="not_allowed"),
+            ]
+        )
+        failed_update = AsyncMock(status=500)
+        notice_update = AsyncMock(status=200)
+        session = AsyncMock()
+        session.post = AsyncMock(side_effect=[failed_update, notice_update])
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.com/actions/update",
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert session.post.await_count == 2
+        assert "could not be delivered" in session.post.await_args.kwargs["json"]["text"]
+        assert (
+            adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"]
+            == "delivery_failed_notified"
+        )
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_records_private_delivery_exceptions(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="completed privately"),
+        )
+        adapter.send_private_notice = AsyncMock(side_effect=RuntimeError("offline"))
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert adapter.send_private_notice.await_count == 4
+        assert (
+            adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"]
+            == "delivery_failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_outcome_state_is_bounded(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_outcomes = {
+            ("session", str(index)): {"status": "delivered"}
+            for index in range(256)
+        }
+        adapter._slash_confirm_owners[("new-session", "new-confirm")] = {
+            "user_id": "U1"
+        }
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="done"),
+        )
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "new-session|new-confirm",
+        }
+
+        await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert len(adapter._slash_confirm_outcomes) == 256
+        assert ("session", "0") not in adapter._slash_confirm_outcomes
+        assert ("new-session", "new-confirm") in adapter._slash_confirm_outcomes
 
     @pytest.mark.asyncio
     async def test_send_retry_keeps_slash_fallback_private(self, adapter):
