@@ -678,6 +678,45 @@ class TestRunBackgroundTask:
         assert runner._background_task_outcomes["bg_interrupt"]["status"] == "cancelled"
 
     @pytest.mark.asyncio
+    async def test_shutdown_reports_unconfirmed_worker_termination(self):
+        runner = _make_runner()
+        runner._user_background_jobs = {}
+        runner._background_task_outcomes = {}
+        adapter = MagicMock()
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+        started = asyncio.Event()
+        thread_started = threading.Event()
+        thread_started.set()
+
+        async def pending_job():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(pending_job())
+        await started.wait()
+        runner._user_background_jobs[task] = {
+            "task_id": "bg_unconfirmed",
+            "source": source,
+            "event_message_id": None,
+            "agent": MagicMock(),
+            "thread_started": thread_started,
+            "thread_done": threading.Event(),
+        }
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=False)) as wait_call:
+            await runner._cancel_user_background_jobs_for_shutdown()
+
+        wait_call.assert_awaited_once()
+        content = adapter._send_with_retry.await_args.kwargs["content"]
+        assert "termination is not confirmed" in content
+        assert (
+            runner._background_task_outcomes["bg_unconfirmed"]["status"]
+            == "interrupt_unconfirmed_notified"
+        )
+
+    @pytest.mark.asyncio
     async def test_shutdown_does_not_cancel_job_that_suppresses_cancellation(self):
         runner = _make_runner()
         runner._user_background_jobs = {}
