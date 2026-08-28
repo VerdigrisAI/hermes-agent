@@ -44,6 +44,7 @@ from gateway.document_extract import (
     extract_docx_text,
 )
 from gateway.platforms.helpers import MessageDeduplicator
+from utils import atomic_json_write
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -449,7 +450,128 @@ class SlackAdapter(BasePlatformAdapter):
         # overlapping commands from the same user isolated.
         self._slash_command_contexts: Dict[Tuple[str, ...], Dict[str, Any]] = {}
         self._slash_confirm_owners: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        self._slash_confirm_outcomes: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._slash_confirm_outcomes_path = (
+            get_hermes_home() / ".slash_confirm_outcomes.json"
+        )
+        self._slash_confirm_outcomes = self._load_slash_confirm_outcomes()
+
+    def _load_slash_confirm_outcomes(
+        self,
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Load bounded confirmation delivery evidence and retry payloads."""
+        path = getattr(self, "_slash_confirm_outcomes_path", None)
+        if path is None or not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                return {}
+            outcomes: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for item in payload[-256:]:
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                session_key = str(item.pop("session_key", ""))
+                confirm_id = str(item.pop("confirm_id", ""))
+                if session_key and confirm_id:
+                    outcomes[(session_key, confirm_id)] = item
+            return outcomes
+        except Exception as exc:
+            logger.warning("[Slack] Could not load confirmation outcomes: %s", exc)
+            return {}
+
+    def _persist_slash_confirm_outcomes(self) -> None:
+        """Persist bounded confirmation evidence for restart recovery."""
+        path = getattr(self, "_slash_confirm_outcomes_path", None)
+        if path is None:
+            return
+        payload = [
+            {"session_key": key[0], "confirm_id": key[1], **value}
+            for key, value in self._slash_confirm_outcomes.items()
+        ]
+        try:
+            atomic_json_write(path, payload[-256:], indent=2)
+        except Exception as exc:
+            logger.warning("[Slack] Could not persist confirmation outcomes: %s", exc)
+
+    def _record_slash_confirm_outcome(
+        self,
+        session_key: str,
+        confirm_id: str,
+        status: str,
+        *,
+        pending_notice: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record one bounded confirmation outcome and its retry payload."""
+        key = (session_key, confirm_id)
+        self._slash_confirm_outcomes.pop(key, None)
+        outcome: Dict[str, Any] = {
+            "status": status,
+            "updated_at": time.time(),
+        }
+        if pending_notice:
+            outcome["pending_notice"] = pending_notice
+        self._slash_confirm_outcomes[key] = outcome
+        while len(self._slash_confirm_outcomes) > 256:
+            self._slash_confirm_outcomes.pop(next(iter(self._slash_confirm_outcomes)))
+        self._persist_slash_confirm_outcomes()
+
+    async def retry_pending_private_notices(self) -> int:
+        """Retry confirmation notices that failed before a restart."""
+        delivered = 0
+        for key, outcome in list(self._slash_confirm_outcomes.items()):
+            pending = outcome.get("pending_notice")
+            if not isinstance(pending, dict):
+                continue
+            metadata = {}
+            if pending.get("thread_id"):
+                metadata["thread_id"] = pending["thread_id"]
+            if pending.get("team_id"):
+                metadata["team_id"] = pending["team_id"]
+            try:
+                result = await self.send_private_notice(
+                    chat_id=str(pending.get("chat_id") or ""),
+                    user_id=str(pending.get("user_id") or ""),
+                    content=str(pending.get("content") or ""),
+                    metadata=metadata or None,
+                )
+            except Exception as exc:
+                logger.warning("[Slack] Confirmation notice retry failed: %s", exc)
+                continue
+            if result.success:
+                outcome.pop("pending_notice", None)
+                outcome["status"] = "retry_delivered"
+                outcome["updated_at"] = time.time()
+                delivered += 1
+        if delivered:
+            self._persist_slash_confirm_outcomes()
+        return delivered
+
+    def persist_private_notice_retry(
+        self,
+        chat_id: str,
+        user_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist a private notice without retaining a Slack response URL."""
+        if not chat_id or not user_id or not content:
+            return False
+        metadata = metadata or {}
+        notice_id = os.urandom(12).hex()
+        self._record_slash_confirm_outcome(
+            "private-notice",
+            notice_id,
+            "delivery_failed",
+            pending_notice={
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "team_id": metadata.get("team_id"),
+                "thread_id": metadata.get("thread_id") or metadata.get("thread_ts"),
+                "content": content,
+            },
+        )
+        return True
 
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
@@ -1045,9 +1167,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         logger.info("[Slack] Disconnected")
 
-    def _get_client(self, chat_id: str) -> Any:
+    def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
-        team_id = self._channel_team.get(chat_id)
+        team_id = team_id or self._channel_team.get(chat_id)
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
@@ -1103,7 +1225,8 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                team_id = str((metadata or {}).get("team_id") or "") or None
+                last_result = await self._get_client(chat_id, team_id).chat_postMessage(**kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1159,7 +1282,8 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postEphemeral(**kwargs)
+            team_id = str((metadata or {}).get("team_id") or "") or None
+            result = await self._get_client(chat_id, team_id).chat_postEphemeral(**kwargs)
             return SendResult(
                 success=True,
                 message_id=result.get("message_ts") or result.get("ts"),
@@ -3116,26 +3240,89 @@ class SlackAdapter(BasePlatformAdapter):
             return
         session_key, confirm_id = value.split("|", 1)
         owner = self._slash_confirm_owners.get((session_key, confirm_id))
-        owner_created_at = owner.get("created_at") if owner else None
-        if (
-            not owner
-            or (
-                owner_created_at is not None
-                and time.monotonic() - float(owner_created_at) > self._SLASH_CTX_TTL
+        if owner is None and (session_key, confirm_id) in self._slash_confirm_outcomes:
+            logger.info(
+                "[Slack] Ignoring already-resolved slash-confirm for session %s",
+                session_key,
             )
-            or user_id != owner.get("user_id")
-        ):
-            if owner:
+            return
+        owner_created_at = owner.get("created_at") if owner else None
+        if owner and owner.get("claimed"):
+            logger.info(
+                "[Slack] Duplicate slash-confirm click for session %s",
+                session_key,
+            )
+            return
+        owner_expired = bool(
+            owner
+            and owner_created_at is not None
+            and time.monotonic() - float(owner_created_at) > self._SLASH_CTX_TTL
+        )
+        if not owner or owner_expired or user_id != owner.get("user_id"):
+            if owner_expired:
                 self._slash_confirm_owners.pop((session_key, confirm_id), None)
             logger.warning(
                 "[Slack] Slash-confirm actor mismatch for session %s: %s",
                 session_key,
                 user_id,
             )
+            stale_text = "⚠️ This confirmation expired or is no longer active. Run the command again."
+            delivered = False
+            response_url = str(body.get("response_url") or "")
+            if response_url:
+                try:
+                    async with aiohttp.ClientSession(trust_env=True) as session:
+                        response = await session.post(
+                            response_url,
+                            json={
+                                "response_type": "ephemeral",
+                                "replace_original": True,
+                                "text": stale_text,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                        delivered = response.status == 200
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Failed to update stale slash-confirm: %s",
+                        exc,
+                    )
+            team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "")
+            if not delivered and channel_id and user_id:
+                try:
+                    result = await self.send_private_notice(
+                        chat_id=channel_id,
+                        user_id=user_id,
+                        content=stale_text,
+                        reply_to=message.get("thread_ts") or None,
+                        metadata={"team_id": team_id} if team_id else None,
+                    )
+                    delivered = result.success
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Failed to send stale slash-confirm notice: %s",
+                        exc,
+                    )
+            self._record_slash_confirm_outcome(
+                session_key,
+                confirm_id,
+                "expired_notified" if delivered else "expired_undelivered",
+                pending_notice=(
+                    None
+                    if delivered
+                    else {
+                        "chat_id": channel_id,
+                        "user_id": user_id,
+                        "team_id": team_id,
+                        "thread_id": message.get("thread_ts") or None,
+                        "content": stale_text,
+                    }
+                ),
+            )
             return
         # Claim this prompt before the first await below. This prevents two
         # concurrent button deliveries from resolving the same confirmation.
-        self._slash_confirm_owners.pop((session_key, confirm_id), None)
+        owner["claimed"] = True
 
         choice_map = {
             "hermes_confirm_once": "once",
@@ -3211,6 +3398,8 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.warning("[Slack] Failed to update private slash-confirm: %s", exc)
 
         private_result = None
+        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "")
+        private_metadata = {"team_id": team_id} if team_id else None
         if result_text:
             for attempt in range(3):
                 try:
@@ -3219,6 +3408,7 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                         content=result_text,
                         reply_to=message.get("thread_ts") or None,
+                        metadata=private_metadata,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -3273,6 +3463,7 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                         content=failure_text,
                         reply_to=message.get("thread_ts") or None,
+                        metadata=private_metadata,
                     )
                     failure_notice_delivered = notice_result.success
                 except Exception as exc:
@@ -3282,17 +3473,29 @@ class SlackAdapter(BasePlatformAdapter):
                     )
 
         outcome_key = (session_key, confirm_id)
-        while len(self._slash_confirm_outcomes) >= 256:
-            self._slash_confirm_outcomes.pop(next(iter(self._slash_confirm_outcomes)))
-        self._slash_confirm_outcomes[outcome_key] = {
-            "status": (
-                "delivered"
-                if terminal_delivered
-                else "delivery_failed_notified"
-                if failure_notice_delivered
-                else "delivery_failed"
-            ),
-        }
+        outcome_status = (
+            "delivered"
+            if terminal_delivered
+            else "delivery_failed_notified"
+            if failure_notice_delivered
+            else "delivery_failed"
+        )
+        pending_notice = None
+        if outcome_status == "delivery_failed":
+            pending_notice = {
+                "chat_id": channel_id,
+                "user_id": user_id,
+                "team_id": team_id,
+                "thread_id": message.get("thread_ts") or None,
+                "content": result_text or failure_text,
+            }
+        self._record_slash_confirm_outcome(
+            session_key,
+            confirm_id,
+            outcome_status,
+            pending_notice=pending_notice,
+        )
+        self._slash_confirm_owners.pop((session_key, confirm_id), None)
         logger.info(
             "Slack button resolved slash-confirm for session %s "
             "(choice=%s, user=%s, status=%s)",
@@ -3777,11 +3980,16 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
         )
 
+        response_url = command.get("response_url", "")
         event = MessageEvent(
             text=text,
             message_type=MessageType.COMMAND if text.startswith("/") else MessageType.TEXT,
             source=source,
             raw_message=command,
+            private_reply_user_id=(
+                user_id if response_url and text.startswith("/") else None
+            ),
+            platform_team_id=team_id or None,
         )
 
         # Stash the Slack response_url so the first reply for this
@@ -3790,7 +3998,6 @@ class SlackAdapter(BasePlatformAdapter):
         # Only stash for COMMAND events (text starts with "/") — free-form
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
-        response_url = command.get("response_url", "")
         invocation_id = os.urandom(12).hex()
         if response_url and user_id and channel_id and text.startswith("/"):
             self._slash_command_contexts[(channel_id, user_id, invocation_id)] = {

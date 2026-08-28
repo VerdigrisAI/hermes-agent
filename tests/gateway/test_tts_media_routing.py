@@ -309,6 +309,41 @@ async def test_streaming_media_tag_is_not_rediscovered_as_a_bare_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_private_slack_streamed_attachment_never_posts_publicly(tmp_path):
+    artifact = tmp_path / "private-report.pdf"
+    artifact.write_bytes(b"report")
+    event = _slack_event()
+    event.private_reply_user_id = "U1"
+    event.platform_team_id = "T2"
+    adapter = SimpleNamespace(
+        name="slack",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_document=AsyncMock(return_value=SendResult(success=True)),
+        send_multiple_images=AsyncMock(return_value=SendResult(success=True)),
+        send_video=AsyncMock(return_value=SendResult(success=True)),
+        send_voice=AsyncMock(return_value=SendResult(success=True)),
+    )
+    runner = _fake_runner({"thread_id": "thread-1"})
+    runner._send_routed_notice = AsyncMock(return_value=SendResult(success=True))
+
+    delivered = await GatewayRunner._deliver_media_from_response(
+        runner,
+        f"MEDIA:{artifact}",
+        event,
+        adapter,
+    )
+
+    assert delivered is True
+    runner._send_routed_notice.assert_awaited_once()
+    assert runner._send_routed_notice.await_args.kwargs["private_user_id"] == "U1"
+    assert runner._send_routed_notice.await_args.args[3]["team_id"] == "T2"
+    adapter.send_document.assert_not_awaited()
+    adapter.send_multiple_images.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("event", "thread_meta"),
     [
@@ -434,6 +469,28 @@ async def test_streaming_delivery_surfaces_image_batch_failure_in_same_thread():
     notice = adapter.send.await_args.kwargs
     assert notice["metadata"] == {"thread_ts": thread_ts}
     assert "Slack image upload failed" in notice["content"]
+
+
+@pytest.mark.asyncio
+async def test_private_command_attachment_is_replaced_with_private_notice():
+    adapter = _MediaRoutingAdapter()
+    event = _event(thread_id="topic-1")
+    event.private_reply_user_id = "U1"
+    event.platform_team_id = "T2"
+    adapter._message_handler = AsyncMock(return_value="MEDIA:/tmp/private.pdf")
+    adapter.send_document = AsyncMock(return_value=SendResult(success=True))
+    adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.send_document.assert_not_awaited()
+    adapter.send_private_notice.assert_awaited_once()
+    kwargs = adapter.send_private_notice.await_args.kwargs
+    assert kwargs["user_id"] == "U1"
+    assert kwargs["metadata"]["team_id"] == "T2"
+    assert "did not post it to the channel" in kwargs["content"]
+    assert event.delivery_state.reply_failed is False
+    assert event.delivery_state.reply_delivered is True
 
 
 @pytest.mark.asyncio

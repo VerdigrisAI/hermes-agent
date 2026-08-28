@@ -82,12 +82,14 @@ async def test_restart_command_persists_private_slack_owner(tmp_path, monkeypatc
         message_type=MessageType.TEXT,
         source=source,
         message_id="m1",
+        platform_team_id="T2",
     )
 
     await runner._handle_restart_command(event)
 
     data = json.loads((tmp_path / ".restart_notify.json").read_text())
     assert data["private_user_id"] == "U_PRIVATE"
+    assert data["team_id"] == "T2"
 
 
 @pytest.mark.asyncio
@@ -425,6 +427,7 @@ async def test_send_restart_notification_preserves_private_slack_route(
         "platform": "slack",
         "chat_id": "C1",
         "private_user_id": "U1",
+        "team_id": "T2",
     }))
     runner, _adapter = make_restart_runner()
     from gateway.platforms.base import SendResult
@@ -439,6 +442,9 @@ async def test_send_restart_notification_preserves_private_slack_route(
 
     assert delivered_target == ("slack", "C1", None)
     slack.send_private_notice.assert_awaited_once()
+    assert slack.send_private_notice.await_args.kwargs["metadata"] == {
+        "team_id": "T2"
+    }
     slack.send.assert_not_awaited()
     assert not notify_path.exists()
 

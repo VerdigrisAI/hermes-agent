@@ -1492,6 +1492,7 @@ class GatewayRunner:
 
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
+    _BACKGROUND_SHUTDOWN_WAIT_SECONDS = 5.0
     _running_agents_ts: Dict[str, float] = {}
     _busy_input_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -1699,6 +1700,7 @@ class GatewayRunner:
         self._user_background_jobs: Dict[asyncio.Task, Dict[str, Any]] = {}
         self._background_outcomes_path = _hermes_home / ".background_task_outcomes.json"
         self._background_task_outcomes = self._load_background_task_outcomes()
+        self._deferred_delivery_lock = asyncio.Lock()
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -4342,6 +4344,10 @@ class GatewayRunner:
         restart_notification_pending = _restart_notification_pending()
         delivered_restart_target = await self._send_restart_notification()
 
+        # Retry terminal notices that survived a prior transport failure or
+        # process restart. Each record keeps its original private/public route.
+        await self._retry_deferred_deliveries()
+
         # Broadcast a lightweight "gateway is back" message to configured
         # home channels only when this startup is resuming from /restart. If a
         # /restart requester already received a direct completion notice in the
@@ -5715,6 +5721,7 @@ class GatewayRunner:
 
         await asyncio.sleep(10)  # initial delay — let startup finish
         while self._running:
+            await self._retry_deferred_deliveries(include_lifecycle=True)
             if not self._failed_platforms:
                 # Nothing to reconnect — sleep and check again
                 for _ in range(30):
@@ -5770,6 +5777,10 @@ class GatewayRunner:
                             error_message=None,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
+
+                        await self._retry_deferred_deliveries(
+                            include_lifecycle=True,
+                        )
 
                         # Rebuild channel directory with the new adapter
                         try:
@@ -10010,9 +10021,12 @@ class GatewayRunner:
         try:
             adapter = self.adapters.get(event.source.platform)
             private_user_id = (
-                adapter.private_reply_user_id(event.source.chat_id)
-                if adapter is not None
-                else None
+                event.private_reply_user_id
+                or (
+                    adapter.private_reply_user_id(event.source.chat_id)
+                    if adapter is not None
+                    else None
+                )
             )
             notify_data = {
                 "platform": event.source.platform.value if event.source.platform else None,
@@ -10020,6 +10034,8 @@ class GatewayRunner:
             }
             if private_user_id:
                 notify_data["private_user_id"] = private_user_id
+            if event.platform_team_id:
+                notify_data["team_id"] = event.platform_team_id
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
             atomic_json_write(
@@ -11565,6 +11581,40 @@ class GatewayRunner:
                 )
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            if event.platform_team_id:
+                _thread_meta = dict(_thread_meta or {})
+                _thread_meta["team_id"] = event.platform_team_id
+
+            if (
+                event.private_reply_user_id
+                and (media_files or extracted_images or local_files)
+            ):
+                result = await self._send_routed_notice(
+                    adapter,
+                    event.source.chat_id,
+                    "⚠️ This private command produced an attachment. Hermes did not "
+                    "post it to the channel. Run the command in a direct message or "
+                    "request a text result.",
+                    _thread_meta,
+                    private_user_id=event.private_reply_user_id,
+                )
+                delivered = bool(
+                    getattr(result, "success", False)
+                    or getattr(result, "failure_notice_delivered", False)
+                )
+                if not delivered:
+                    adapter.persist_private_notice_retry(
+                        event.source.chat_id,
+                        event.private_reply_user_id,
+                        "⚠️ This private command produced an attachment. Hermes did not "
+                        "post it to the channel. Run the command in a direct message or "
+                        "request a text result.",
+                        _thread_meta,
+                    )
+                if delivered:
+                    for target in _record_reply_attempt(event):
+                        target.delivery_state.reply_delivered = True
+                return delivered
 
             from gateway.platforms.base import should_send_media_as_audio
 
@@ -11755,8 +11805,8 @@ class GatewayRunner:
         media_urls = list(event.media_urls) if event.media_urls else []
         media_types = list(event.media_types) if event.media_types else []
         adapter = self.adapters.get(source.platform)
-        private_user_id = None
-        if adapter is not None:
+        private_user_id = event.private_reply_user_id
+        if not private_user_id and adapter is not None:
             try:
                 private_user_id = adapter.private_reply_user_id(source.chat_id)
             except Exception as exc:
@@ -11769,6 +11819,7 @@ class GatewayRunner:
             "source": source,
             "event_message_id": event_message_id,
             "private_user_id": private_user_id,
+            "team_id": event.platform_team_id,
             "agent": None,
             "thread_started": threading.Event(),
             "thread_done": threading.Event(),
@@ -11818,17 +11869,33 @@ class GatewayRunner:
         status: str,
         *,
         detail: Optional[str] = None,
+        pending_notice: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Retain terminal evidence for user-owned background work."""
         outcomes = getattr(self, "_background_task_outcomes", None)
         if outcomes is None:
             outcomes = self._background_task_outcomes = {}
+        previous = outcomes.get(task_id, {})
         outcomes.pop(task_id, None)
-        outcomes[task_id] = {
+        outcome = {
             "status": status,
             "detail": detail,
             "updated_at": datetime.now().isoformat(),
         }
+        if pending_notice is not None:
+            outcome["pending_notice"] = pending_notice
+        elif (
+            status
+            in {
+                "delivery_failed",
+                "failed_and_undelivered",
+                "cancelled_undelivered",
+                "interrupt_unconfirmed",
+            }
+            and previous.get("pending_notice")
+        ):
+            outcome["pending_notice"] = previous["pending_notice"]
+        outcomes[task_id] = outcome
         while len(outcomes) > 512:
             outcomes.pop(next(iter(outcomes)))
         outcome_path = getattr(self, "_background_outcomes_path", None)
@@ -11843,6 +11910,81 @@ class GatewayRunner:
             status,
             detail or "",
         )
+
+    @staticmethod
+    def _background_pending_notice(
+        job: Dict[str, Any],
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build a JSON-safe retry payload for one background result."""
+        source = job["source"]
+        return {
+            "platform": source.platform.value,
+            "chat_id": source.chat_id,
+            "private_user_id": job.get("private_user_id"),
+            "content": content,
+            "metadata": dict(metadata or {}),
+        }
+
+    async def _retry_background_task_outcomes(self) -> int:
+        """Retry durable background notices through their original route."""
+        delivered = 0
+        outcomes = getattr(self, "_background_task_outcomes", {})
+        for task_id, outcome in list(outcomes.items()):
+            pending = outcome.get("pending_notice")
+            if not isinstance(pending, dict):
+                continue
+            try:
+                platform = Platform(str(pending.get("platform") or ""))
+            except ValueError:
+                continue
+            adapter = self.adapters.get(platform)
+            chat_id = str(pending.get("chat_id") or "")
+            content = str(pending.get("content") or "")
+            if adapter is None or not chat_id or not content:
+                continue
+            result = await self._send_routed_notice(
+                adapter,
+                chat_id,
+                content,
+                pending.get("metadata") or None,
+                private_user_id=pending.get("private_user_id") or None,
+            )
+            if getattr(result, "success", False) or getattr(
+                result,
+                "failure_notice_delivered",
+                False,
+            ):
+                self._record_background_task_outcome(
+                    task_id,
+                    "retry_delivered",
+                    detail=str(outcome.get("detail") or "deferred result"),
+                )
+                delivered += 1
+        return delivered
+
+    async def _retry_deferred_deliveries(
+        self,
+        *,
+        include_lifecycle: bool = False,
+    ) -> None:
+        """Retry durable notices without overlapping startup and reconnect work."""
+        lock = getattr(self, "_deferred_delivery_lock", None)
+        if lock is None:
+            lock = self._deferred_delivery_lock = asyncio.Lock()
+        if lock.locked():
+            return
+        async with lock:
+            for adapter in list(self.adapters.values()):
+                try:
+                    await adapter.retry_pending_private_notices()
+                except Exception as exc:
+                    logger.warning("Private notice retry failed: %s", exc)
+            await self._retry_background_task_outcomes()
+            if include_lifecycle:
+                await self._send_update_notification()
+                await self._send_restart_notification()
 
     async def _send_routed_notice(
         self,
@@ -11955,6 +12097,28 @@ class GatewayRunner:
                 return_exceptions=True,
             )
 
+        # Worker threads do not stop when their asyncio wrappers are
+        # cancelled. Poll all completion events against one shared deadline.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + getattr(
+            self,
+            "_BACKGROUND_SHUTDOWN_WAIT_SECONDS",
+            5.0,
+        )
+        while loop.time() < deadline:
+            unfinished = [
+                job
+                for task, job in cancelled_jobs
+                if task.cancelled()
+                and job.get("thread_started") is not None
+                and job["thread_started"].is_set()
+                and job.get("thread_done") is not None
+                and not job["thread_done"].is_set()
+            ]
+            if not unfinished:
+                break
+            await asyncio.sleep(0.05)
+
         for task, job in cancelled_jobs:
             # A coroutine can suppress CancelledError and complete normally.
             # Do not overwrite its terminal outcome or claim it was stopped.
@@ -11969,7 +12133,7 @@ class GatewayRunner:
                 and thread_started.is_set()
                 and thread_done is not None
             ):
-                thread_stopped = await asyncio.to_thread(thread_done.wait, 5.0)
+                thread_stopped = thread_done.is_set()
             source = job.get("source")
             adapter = self.adapters.get(source.platform) if source else None
             notified = False
@@ -12015,6 +12179,22 @@ class GatewayRunner:
                     else "interrupt_unconfirmed"
                 ),
                 detail="gateway shutdown",
+                pending_notice=(
+                    None
+                    if notified
+                    else self._background_pending_notice(
+                        job,
+                        (
+                            f"⚠️ Background task {task_id} was interrupted for "
+                            "gateway shutdown. Please check its effects before "
+                            "you run it again."
+                        ),
+                        self._thread_metadata_for_source(
+                            job["source"],
+                            job.get("event_message_id"),
+                        ),
+                    )
+                ),
             )
 
     async def _run_background_task(
@@ -12042,16 +12222,33 @@ class GatewayRunner:
                 task_id,
                 "failed_and_undelivered",
                 detail=f"no adapter for {source.platform}",
+                pending_notice=self._background_pending_notice(
+                    job_state,
+                    f"❌ Background task {task_id} failed because its messaging adapter was unavailable.",
+                    None,
+                ),
             )
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        if job_state.get("team_id"):
+            _thread_metadata = dict(_thread_metadata or {})
+            _thread_metadata["team_id"] = job_state["team_id"]
         terminal_status = "running"
 
-        def _mark_outcome(status: str, detail: Optional[str] = None) -> None:
+        def _mark_outcome(
+            status: str,
+            detail: Optional[str] = None,
+            pending_notice: Optional[Dict[str, Any]] = None,
+        ) -> None:
             nonlocal terminal_status
             terminal_status = status
-            self._record_background_task_outcome(task_id, status, detail=detail)
+            self._record_background_task_outcome(
+                task_id,
+                status,
+                detail=detail,
+                pending_notice=pending_notice,
+            )
 
         def _mark_failed_task_outcome(send_result: Any, detail: str) -> None:
             if getattr(send_result, "success", False):
@@ -12083,6 +12280,11 @@ class GatewayRunner:
                     if getattr(send_result, "failure_notice_delivered", False)
                     else "delivery_failed",
                     detail=phase,
+                    pending_notice=self._background_pending_notice(
+                        job_state,
+                        content,
+                        _thread_metadata,
+                    ),
                 )
             return send_result
 
@@ -12243,6 +12445,19 @@ class GatewayRunner:
                                 if background_event.delivery_state.failure_notice_delivered
                                 else "delivery_failed",
                                 detail="media_result",
+                                pending_notice=(
+                                    None
+                                    if background_event.delivery_state.failure_notice_delivered
+                                    else self._background_pending_notice(
+                                        job_state,
+                                        (
+                                            f"⚠️ Background task {task_id} completed, "
+                                            "but its attachment could not be delivered. "
+                                            "Please run the task again."
+                                        ),
+                                        _thread_metadata,
+                                    )
+                                ),
                             )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
@@ -14341,8 +14556,22 @@ class GatewayRunner:
             return t("gateway.update.hermes_cmd_not_found")
 
         pending_path = _hermes_home / ".update_pending.json"
+        claimed_path = _hermes_home / ".update_pending.claimed.json"
+        lock_path = _hermes_home / ".update_request.lock"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        if pending_path.exists() or claimed_path.exists():
+            return "⚠️ A Hermes update is already in progress."
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(lock_fd, datetime.now().isoformat().encode("utf-8"))
+            finally:
+                os.close(lock_fd)
+        except FileExistsError:
+            return "⚠️ A Hermes update is already in progress."
+        except OSError as exc:
+            return t("gateway.update.start_failed", error=exc)
         session_key = self._session_key_for_source(event.source)
         pending = {
             "platform": event.source.platform.value,
@@ -14352,16 +14581,23 @@ class GatewayRunner:
             "timestamp": datetime.now().isoformat(),
         }
         adapter = self.adapters.get(event.source.platform)
-        if adapter is not None:
+        private_user_id = event.private_reply_user_id
+        if not private_user_id and adapter is not None:
             private_user_id = adapter.private_reply_user_id(event.source.chat_id)
-            if private_user_id:
-                pending["private_user_id"] = private_user_id
+        if private_user_id:
+            pending["private_user_id"] = private_user_id
+        if event.platform_team_id:
+            pending["team_id"] = event.platform_team_id
         if event.source.thread_id:
             pending["thread_id"] = event.source.thread_id
-        _tmp_pending = pending_path.with_suffix(".tmp")
-        _tmp_pending.write_text(json.dumps(pending))
-        _tmp_pending.replace(pending_path)
-        exit_code_path.unlink(missing_ok=True)
+        try:
+            _tmp_pending = pending_path.with_suffix(".tmp")
+            _tmp_pending.write_text(json.dumps(pending))
+            _tmp_pending.replace(pending_path)
+            exit_code_path.unlink(missing_ok=True)
+        except Exception as exc:
+            lock_path.unlink(missing_ok=True)
+            return t("gateway.update.start_failed", error=exc)
 
         # Spawn `hermes update --gateway` detached so it survives gateway restart.
         # --gateway enables file-based IPC for interactive prompts (stash
@@ -14450,6 +14686,7 @@ class GatewayRunner:
         except Exception as e:
             pending_path.unlink(missing_ok=True)
             exit_code_path.unlink(missing_ok=True)
+            lock_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
 
         self._schedule_update_notification_watch()
@@ -14487,6 +14724,7 @@ class GatewayRunner:
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
         prompt_path = _hermes_home / ".update_prompt.json"
+        lock_path = _hermes_home / ".update_request.lock"
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -14505,8 +14743,14 @@ class GatewayRunner:
                     chat_id = pending.get("chat_id")
                     session_key = pending.get("session_key")
                     private_user_id = pending.get("private_user_id")
+                    team_id = pending.get("team_id")
                     thread_id = pending.get("thread_id")
-                    metadata = {"thread_id": thread_id} if thread_id else None
+                    metadata = {}
+                    if thread_id:
+                        metadata["thread_id"] = thread_id
+                    if team_id:
+                        metadata["team_id"] = team_id
+                    metadata = metadata or None
                     if platform_str and chat_id:
                         platform = Platform(platform_str)
                         adapter = self.adapters.get(platform)
@@ -14624,7 +14868,7 @@ class GatewayRunner:
 
                 # Cleanup
                 for p in (pending_path, claimed_path, output_path,
-                          exit_code_path, prompt_path):
+                          exit_code_path, prompt_path, lock_path):
                     p.unlink(missing_ok=True)
                 (_hermes_home / ".update_response").unlink(missing_ok=True)
                 self._update_prompt_pending.pop(session_key, None)
@@ -14662,14 +14906,16 @@ class GatewayRunner:
                         sent_buttons = False
                         if getattr(type(adapter), "send_update_prompt", None) is not None:
                             try:
-                                await adapter.send_update_prompt(
+                                prompt_result = await adapter.send_update_prompt(
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
                                     metadata=metadata,
                                 )
-                                sent_buttons = True
+                                sent_buttons = bool(
+                                    getattr(prompt_result, "success", False)
+                                )
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
@@ -14729,7 +14975,7 @@ class GatewayRunner:
             if not output_delivered or not status_delivered:
                 return
             for p in (pending_path, claimed_path, output_path,
-                      exit_code_path, prompt_path):
+                      exit_code_path, prompt_path, lock_path):
                 p.unlink(missing_ok=True)
             (_hermes_home / ".update_response").unlink(missing_ok=True)
             self._update_prompt_pending.pop(session_key, None)
@@ -14748,6 +14994,7 @@ class GatewayRunner:
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        lock_path = _hermes_home / ".update_request.lock"
 
         if not pending_path.exists() and not claimed_path.exists():
             return False
@@ -14769,6 +15016,7 @@ class GatewayRunner:
             chat_id = pending.get("chat_id")
             thread_id = pending.get("thread_id")
             private_user_id = pending.get("private_user_id")
+            team_id = pending.get("team_id")
 
             if not exit_code_path.exists():
                 logger.info("Update notification deferred: update still running")
@@ -14790,7 +15038,12 @@ class GatewayRunner:
             adapter = self.adapters.get(platform)
 
             if adapter and chat_id:
-                metadata = {"thread_id": thread_id} if thread_id else None
+                metadata = {}
+                if thread_id:
+                    metadata["thread_id"] = thread_id
+                if team_id:
+                    metadata["team_id"] = team_id
+                metadata = metadata or None
                 # Strip ANSI escape codes for clean display
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
                 if output:
@@ -14847,6 +15100,7 @@ class GatewayRunner:
                 claimed_path.unlink(missing_ok=True)
                 output_path.unlink(missing_ok=True)
                 exit_code_path.unlink(missing_ok=True)
+                lock_path.unlink(missing_ok=True)
 
         return cleanup
 
@@ -14863,6 +15117,7 @@ class GatewayRunner:
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
             private_user_id = data.get("private_user_id")
+            team_id = data.get("team_id")
 
             if not platform_str or not chat_id:
                 cleanup = True
@@ -14886,7 +15141,12 @@ class GatewayRunner:
                 cleanup = True
                 return None
 
-            metadata = {"thread_id": thread_id} if thread_id else None
+            metadata = {}
+            if thread_id:
+                metadata["thread_id"] = thread_id
+            if team_id:
+                metadata["team_id"] = team_id
+            metadata = metadata or None
             result = await self._send_routed_notice(
                 adapter,
                 str(chat_id),

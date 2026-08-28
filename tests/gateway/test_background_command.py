@@ -448,6 +448,44 @@ class TestRunBackgroundTask:
         assert runner._load_background_task_outcomes() == persisted
 
     @pytest.mark.asyncio
+    async def test_failed_background_result_persists_route_and_retries(self, tmp_path):
+        runner = _make_runner()
+        runner._background_outcomes_path = tmp_path / "outcomes.json"
+        runner._background_task_outcomes = {}
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters[Platform.SLACK] = adapter
+        notice = {
+            "platform": "slack",
+            "chat_id": "C1",
+            "private_user_id": None,
+            "content": "Background task result: done",
+            "metadata": {"thread_id": "thread-1", "team_id": "T2"},
+        }
+
+        runner._record_background_task_outcome(
+            "bg_retry",
+            "delivery_failed",
+            detail="text_result",
+            pending_notice=notice,
+        )
+
+        persisted = json.loads(runner._background_outcomes_path.read_text())
+        assert persisted["bg_retry"]["pending_notice"] == notice
+        restarted = _make_runner()
+        restarted._background_outcomes_path = runner._background_outcomes_path
+        restarted._background_task_outcomes = restarted._load_background_task_outcomes()
+        restarted.adapters[Platform.SLACK] = adapter
+        assert await restarted._retry_background_task_outcomes() == 1
+        adapter.send.assert_awaited_once_with(
+            "C1",
+            "Background task result: done",
+            metadata={"thread_id": "thread-1", "team_id": "T2"},
+        )
+        assert restarted._background_task_outcomes["bg_retry"]["status"] == "retry_delivered"
+        assert "pending_notice" not in restarted._background_task_outcomes["bg_retry"]
+
+    @pytest.mark.asyncio
     async def test_text_completion_uses_retrying_delivery(self):
         """A retryable completion failure reaches the user on retry."""
         runner = _make_runner()
@@ -680,6 +718,7 @@ class TestRunBackgroundTask:
     @pytest.mark.asyncio
     async def test_shutdown_reports_unconfirmed_worker_termination(self):
         runner = _make_runner()
+        runner._BACKGROUND_SHUTDOWN_WAIT_SECONDS = 0
         runner._user_background_jobs = {}
         runner._background_task_outcomes = {}
         adapter = MagicMock()
@@ -705,10 +744,10 @@ class TestRunBackgroundTask:
             "thread_done": threading.Event(),
         }
 
-        with patch("asyncio.to_thread", new=AsyncMock(return_value=False)) as wait_call:
+        with patch("asyncio.to_thread", new=AsyncMock()) as wait_call:
             await runner._cancel_user_background_jobs_for_shutdown()
 
-        wait_call.assert_awaited_once()
+        wait_call.assert_not_awaited()
         content = adapter._send_with_retry.await_args.kwargs["content"]
         assert "termination is not confirmed" in content
         assert (

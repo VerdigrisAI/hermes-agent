@@ -1091,6 +1091,15 @@ class MessageEvent:
     # be normal when streaming or queue handling owns delivery elsewhere.
     expects_reply: bool = False
 
+    # Verified private-delivery identity captured when the platform admits the
+    # event. This survives asynchronous work after transient adapter context is
+    # consumed by the first text reply.
+    private_reply_user_id: Optional[str] = None
+
+    # Stable workspace identity for platforms that can connect more than one
+    # workspace through one adapter.
+    platform_team_id: Optional[str] = None
+
     # Streaming and preview delivery happen inside the gateway handler, outside
     # this adapter's normal send path.  Keep explicit evidence on a shared
     # object so dataclasses.replace() preserves it across rewritten events.
@@ -1973,6 +1982,20 @@ class BasePlatformAdapter(ABC):
     def private_reply_user_id(self, chat_id: str) -> Optional[str]:
         """Return the verified private-reply user for the active invocation."""
         return None
+
+    async def retry_pending_private_notices(self) -> int:
+        """Retry durable private notices after the adapter reconnects."""
+        return 0
+
+    def persist_private_notice_retry(
+        self,
+        chat_id: str,
+        user_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist a private notice for later delivery when supported."""
+        return False
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
@@ -3379,6 +3402,12 @@ class BasePlatformAdapter(ABC):
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        if event.private_reply_user_id or event.platform_team_id:
+            _thread_metadata = dict(_thread_metadata or {})
+            if event.private_reply_user_id:
+                _thread_metadata["private_reply_user_id"] = event.private_reply_user_id
+            if event.platform_team_id:
+                _thread_metadata["team_id"] = event.platform_team_id
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -3561,6 +3590,56 @@ class BasePlatformAdapter(ABC):
                             message_id=result.message_id,
                             ttl_seconds=_ephemeral_ttl,
                         )
+
+                private_media_blocked = bool(
+                    event.private_reply_user_id
+                    and (images or media_files or local_files)
+                )
+                if private_media_blocked:
+                    private_notice = (
+                        "⚠️ This private command produced an attachment. "
+                        "Hermes did not post it to the channel. Run the command "
+                        "in a direct message or request a text result."
+                    )
+                    private_result = SendResult(
+                        success=False,
+                        error="private attachment notice was not delivered",
+                    )
+                    for attempt in range(3):
+                        try:
+                            private_result = await self.send_private_notice(
+                                chat_id=event.source.chat_id,
+                                user_id=event.private_reply_user_id,
+                                content=private_notice,
+                                reply_to=_reply_anchor_for_event(event),
+                                metadata=_thread_metadata,
+                            )
+                        except Exception as exc:
+                            private_result = SendResult(
+                                success=False,
+                                error=str(exc),
+                                retryable=True,
+                            )
+                        if private_result.success:
+                            break
+                        if not (
+                            private_result.retryable
+                            or self._is_retryable_error(private_result.error or "")
+                        ):
+                            break
+                        if attempt < 2:
+                            await asyncio.sleep(2 ** attempt)
+                    if not private_result.success:
+                        self.persist_private_notice_retry(
+                            event.source.chat_id,
+                            event.private_reply_user_id,
+                            private_notice,
+                            _thread_metadata,
+                        )
+                    _record_delivery(private_result)
+                    images = []
+                    media_files = []
+                    local_files = []
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
