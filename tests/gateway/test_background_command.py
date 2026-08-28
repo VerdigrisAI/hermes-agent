@@ -510,6 +510,51 @@ class TestRunBackgroundTask:
         )
 
     @pytest.mark.asyncio
+    async def test_running_task_preserves_recorded_shutdown_outcome_on_cancel(self):
+        runner = _make_runner()
+        runner._background_task_outcomes = {}
+        adapter = MagicMock()
+        runner.adapters[Platform.SLACK] = adapter
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "test-model",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        source = SessionSource(platform=Platform.SLACK, user_id="U1", chat_id="C1")
+        started = asyncio.Event()
+
+        async def wait_for_cancel(_callable):
+            started.set()
+            await asyncio.Event().wait()
+
+        runner._run_in_executor_with_context = AsyncMock(side_effect=wait_for_cancel)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            task = asyncio.create_task(
+                runner._run_background_task("work", source, "bg_cancelled")
+            )
+            await started.wait()
+            runner._record_background_task_outcome(
+                "bg_cancelled",
+                "cancelled_undelivered",
+                detail="gateway shutdown",
+            )
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert (
+            runner._background_task_outcomes["bg_cancelled"]["status"]
+            == "cancelled_undelivered"
+        )
+
+    @pytest.mark.asyncio
     async def test_bare_local_artifact_is_uploaded_without_exposing_path(self, tmp_path):
         runner = _make_runner()
         artifact = tmp_path / "report.pdf"
