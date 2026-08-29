@@ -817,6 +817,8 @@ from gateway.platforms.base import (
     MEDIA_DIRECTIVE_EXTENSION_PATTERN,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
+    SendResult,
     _reply_anchor_for_event,
     media_delivery_correlation_id,
     merge_pending_message_event,
@@ -842,6 +844,62 @@ _TOOL_MEDIA_RE = re.compile(
     rf'MEDIA:((?:/|~\/)\S+\.(?:{MEDIA_DIRECTIVE_EXTENSION_PATTERN}))',
     re.IGNORECASE,
 )
+
+
+def _record_reply_attempt(event: MessageEvent) -> list[MessageEvent]:
+    """Record an attempted reply and return the events that reply serves."""
+    targets = (
+        event.delivery_state.final_response_events
+        or [event, *event.delivery_state.merged_events]
+    )
+    for target in targets:
+        target.delivery_state.reply_attempted = True
+    return targets
+
+
+def _record_confirmed_reply_delivery(event: MessageEvent, agent_result: dict) -> bool:
+    """Record confirmed out-of-band delivery and return whether it occurred."""
+    if not agent_result.get("already_sent") or agent_result.get("failed"):
+        return False
+    for target in _record_reply_attempt(event):
+        target.delivery_state.reply_delivered = True
+    return True
+
+
+def _record_reply_failure(event: MessageEvent) -> None:
+    """Record a terminal reply-delivery failure for every served event."""
+    for target in _record_reply_attempt(event):
+        target.delivery_state.reply_failed = True
+
+
+def _record_send_result_delivery(event: MessageEvent, send_result: Any) -> bool:
+    """Record a direct adapter send only when the adapter confirms success."""
+    delivered = bool(send_result is not None and getattr(send_result, "success", False))
+    for target in _record_reply_attempt(event):
+        if getattr(send_result, "failure_notice_delivered", False):
+            target.delivery_state.failure_notice_delivered = True
+        if delivered:
+            target.delivery_state.reply_delivered = True
+        else:
+            target.delivery_state.reply_failed = True
+    return delivered
+
+
+def _queued_reply_event(event: MessageEvent, text: str) -> MessageEvent:
+    """Create a queued turn that preserves the original reply contract."""
+    event.delivery_state.completion_deferred = True
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=event.source,
+        message_id=event.message_id,
+        channel_prompt=event.channel_prompt,
+        expects_reply=event.expects_reply,
+        private_reply_user_id=event.private_reply_user_id,
+        platform_team_id=event.platform_team_id,
+        delivery_state=event.delivery_state,
+        timestamp=event.timestamp,
+    )
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -1407,6 +1465,25 @@ def _preserve_queued_followup_history_offset(
     return merged
 
 
+def _merge_followup_reply_events(
+    pending_event: MessageEvent | None,
+    followup_result: dict,
+) -> list[MessageEvent]:
+    """Collect reply events without assuming the follow-up has an event.
+
+    Interrupt messages and leftover steers are plain strings. Queued platform
+    messages have a ``MessageEvent`` and can carry merged delivery state.
+    """
+    reply_events = list(followup_result.get("_reply_events", []))
+    if pending_event is not None:
+        reply_events = [
+            pending_event,
+            *pending_event.delivery_state.merged_events,
+            *reply_events,
+        ]
+    return reply_events
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -1417,6 +1494,7 @@ class GatewayRunner:
 
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
+    _BACKGROUND_SHUTDOWN_WAIT_SECONDS = 5.0
     _running_agents_ts: Dict[str, float] = {}
     _busy_input_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -1621,6 +1699,10 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._user_background_jobs: Dict[asyncio.Task, Dict[str, Any]] = {}
+        self._background_outcomes_path = _hermes_home / ".background_task_outcomes.json"
+        self._background_task_outcomes = self._load_background_task_outcomes()
+        self._deferred_delivery_lock = asyncio.Lock()
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -2336,6 +2418,108 @@ class GatewayRunner:
         else:
             pending_slot[session_key] = queued_event
 
+    def _prepend_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+        """Put an event before every currently queued event for a session."""
+        if adapter is None:
+            return
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return
+        existing = pending_slot.get(session_key)
+        if existing is not None:
+            queued_events = getattr(self, "_queued_events", None)
+            if queued_events is None:
+                queued_events = {}
+                self._queued_events = queued_events
+            queued_events.setdefault(session_key, []).insert(0, existing)
+        pending_slot[session_key] = queued_event
+
+    def _merge_pending_events_by_arrival(
+        self,
+        session_key: str,
+        adapter: Any,
+        *events: "MessageEvent",
+    ) -> Optional["MessageEvent"]:
+        """Merge pending events and return the earliest event by arrival time."""
+        if adapter is None:
+            return min(events, key=lambda event: event.timestamp, default=None)
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return min(events, key=lambda event: event.timestamp, default=None)
+        queued_events = getattr(self, "_queued_events", None)
+        if queued_events is None:
+            queued_events = {}
+            self._queued_events = queued_events
+
+        ordered = [event for event in events if event is not None]
+        staged = pending_slot.pop(session_key, None)
+        if staged is not None:
+            ordered.append(staged)
+        ordered.extend(queued_events.pop(session_key, []))
+        ordered.sort(key=lambda event: event.timestamp.timestamp())
+        if not ordered:
+            return None
+
+        first, *remaining = ordered
+        if remaining:
+            pending_slot[session_key] = remaining[0]
+        if len(remaining) > 1:
+            queued_events[session_key] = remaining[1:]
+        return first
+
+    def _remember_steer_event(
+        self,
+        session_key: str,
+        text: str,
+        event: MessageEvent,
+    ) -> None:
+        events = getattr(self, "_steer_reply_events", None)
+        if events is None:
+            events = {}
+            self._steer_reply_events = events
+        events.setdefault(session_key, []).append((text.strip(), event))
+
+    def _take_leftover_steer_event(
+        self,
+        session_key: str,
+        text: str,
+        reply_event: MessageEvent | None,
+    ) -> MessageEvent | None:
+        """Move unconsumed steer owners from the current reply to a queued turn."""
+        entries = getattr(self, "_steer_reply_events", {}).pop(session_key, [])
+        if not entries:
+            return None
+        selected: list[tuple[str, MessageEvent]] = []
+        for entry in reversed(entries):
+            selected.insert(0, entry)
+            if "\n".join(item[0] for item in selected) == text:
+                break
+        else:
+            selected = entries
+
+        selected_events = [item[1] for item in selected]
+        if reply_event is not None:
+            state = reply_event.delivery_state
+            state.final_response_events[:] = [
+                candidate
+                for candidate in state.final_response_events
+                if all(candidate is not event for event in selected_events)
+            ]
+            state.completion_events[:] = [
+                candidate
+                for candidate in state.completion_events
+                if all(candidate is not event for event in selected_events)
+            ]
+
+        queued = _queued_reply_event(selected_events[0], text)
+        for event in selected_events[1:]:
+            if all(
+                candidate is not event
+                for candidate in queued.delivery_state.merged_events
+            ):
+                queued.delivery_state.merged_events.append(event)
+        return queued
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -2378,6 +2562,63 @@ class GatewayRunner:
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
         return depth
+
+    async def _reject_queued_events_after_failed_drain(
+        self,
+        session_key: str,
+        source: SessionSource,
+    ) -> None:
+        """Give every accepted queued turn a terminal result after run failure."""
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return
+        queued_events: list[MessageEvent] = []
+        queued_slot = _dequeue_pending_event(adapter, session_key)
+        if queued_slot is not None:
+            queued_events.append(queued_slot)
+        queued_events.extend(
+            getattr(self, "_queued_events", {}).pop(session_key, [])
+        )
+        for queued_event in queued_events:
+            try:
+                rejection_result = await adapter._send_with_retry(
+                    chat_id=queued_event.source.chat_id,
+                    content=(
+                        f"⏳ Gateway is {self._status_action_gerund()} and cannot "
+                        "accept the queued turn. Please resend after it comes back."
+                    ),
+                    reply_to=self._reply_anchor_for_event(queued_event),
+                    metadata=self._delivery_metadata_for_event(queued_event),
+                )
+                _record_send_result_delivery(
+                    queued_event,
+                    rejection_result,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reject queued turn after drain error: %s",
+                    exc,
+                )
+                _record_reply_attempt(queued_event)
+            completion_events = [
+                queued_event,
+                *queued_event.delivery_state.merged_events,
+                *queued_event.delivery_state.completion_events,
+            ]
+            seen_event_ids: set[int] = set()
+            for completion_event in completion_events:
+                if id(completion_event) in seen_event_ids:
+                    continue
+                seen_event_ids.add(id(completion_event))
+                await adapter._run_processing_hook(
+                    "on_processing_complete",
+                    completion_event,
+                    (
+                        ProcessingOutcome.SUCCESS
+                        if completion_event.delivery_state.reply_delivered
+                        else ProcessingOutcome.FAILURE
+                    ),
+                )
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
@@ -2844,7 +3085,12 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            event,
+            merge_text=True,
+        )
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -2861,6 +3107,11 @@ class GatewayRunner:
                 event.source.platform.value if event.source.platform else "unknown",
                 session_key,
             )
+            event.expects_reply = False
+            adapter = self.adapters.get(event.source.platform)
+            discard = getattr(adapter, "discard_reply_requirement", None)
+            if callable(discard):
+                await discard(event)
             return True  # handled (silently dropped); do not fall through
 
         # --- Draining case (gateway restarting/stopping) ---
@@ -2871,23 +3122,34 @@ class GatewayRunner:
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-            else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+            message = (
+                f"⏳ Gateway is {self._status_action_gerund()} and cannot accept "
+                "another turn. Please resend after it comes back."
+            )
 
-            await adapter._send_with_retry(
-                chat_id=event.source.chat_id,
-                content=message,
-                reply_to=(
-                    reply_anchor
-                    if event.source.platform == Platform.TELEGRAM
-                    and event.source.chat_type == "dm"
-                    and event.source.thread_id
-                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
-                ),
-                metadata=thread_meta,
+            notice_delivered = False
+            try:
+                send_result = await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=message,
+                    reply_to=(
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    metadata=thread_meta,
+                )
+                notice_delivered = _record_send_result_delivery(event, send_result)
+            except Exception as exc:
+                logger.debug("Failed to send draining notice: %s", exc)
+            await adapter._run_processing_hook(
+                "on_processing_complete",
+                event,
+                ProcessingOutcome.SUCCESS
+                if notice_delivered
+                else ProcessingOutcome.FAILURE,
             )
             return True
 
@@ -2904,6 +3166,7 @@ class GatewayRunner:
         # to queue semantics so nothing is lost.
         effective_mode = self._busy_input_mode
         steered = False
+        steer_completion_deferred = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
             can_steer = (
@@ -2921,13 +3184,25 @@ class GatewayRunner:
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
+            else:
+                steer_completion_deferred = adapter.defer_event_to_active_response(
+                    session_key,
+                    event,
+                )
+                if steer_completion_deferred:
+                    self._remember_steer_event(session_key, steer_text, event)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
-            merge_pending_message_event(adapter._pending_messages, session_key, event)
+            merge_pending_message_event(
+                adapter._pending_messages,
+                session_key,
+                event,
+                merge_text=True,
+            )
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -2945,7 +3220,8 @@ class GatewayRunner:
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
+        required_steer_ack = steered and event.expects_reply
+        if not busy_ack_enabled and not required_steer_ack:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
@@ -2954,7 +3230,7 @@ class GatewayRunner:
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
+        if now - last_ack < _BUSY_ACK_COOLDOWN and not required_steer_ack:
             return True  # interrupt sent (if not queue), ack already delivered recently
 
         self._busy_ack_ts[session_key] = now
@@ -3025,8 +3301,9 @@ class GatewayRunner:
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        steer_ack_delivered = False
         try:
-            await adapter._send_with_retry(
+            send_result = await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
                 reply_to=(
@@ -3038,8 +3315,22 @@ class GatewayRunner:
                 ),
                 metadata=thread_meta,
             )
+            if steered and not steer_completion_deferred:
+                steer_ack_delivered = _record_send_result_delivery(
+                    event,
+                    send_result,
+                )
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
+
+        if steered and not steer_completion_deferred:
+            await adapter._run_processing_hook(
+                "on_processing_complete",
+                event,
+                ProcessingOutcome.SUCCESS
+                if steer_ack_delivered
+                else ProcessingOutcome.FAILURE,
+            )
 
         return True
 
@@ -4051,6 +4342,10 @@ class GatewayRunner:
         # Notify the chat that initiated /restart that the gateway is back.
         restart_notification_pending = _restart_notification_pending()
         delivered_restart_target = await self._send_restart_notification()
+
+        # Retry terminal notices that survived a prior transport failure or
+        # process restart. Each record keeps its original private/public route.
+        await self._retry_deferred_deliveries()
 
         # Broadcast a lightweight "gateway is back" message to configured
         # home channels only when this startup is resuming from /restart. If a
@@ -5425,6 +5720,7 @@ class GatewayRunner:
 
         await asyncio.sleep(10)  # initial delay — let startup finish
         while self._running:
+            await self._retry_deferred_deliveries(include_lifecycle=True)
             if not self._failed_platforms:
                 # Nothing to reconnect — sleep and check again
                 for _ in range(30):
@@ -5480,6 +5776,10 @@ class GatewayRunner:
                             error_message=None,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
+
+                        await self._retry_deferred_deliveries(
+                            include_lifecycle=True,
+                        )
 
                         # Rebuild channel directory with the new adapter
                         try:
@@ -5747,6 +6047,8 @@ class GatewayRunner:
                         _entry[0] if isinstance(_entry, tuple) else _entry
                     )
                     self._cleanup_agent_resources(_agent)
+
+            await GatewayRunner._cancel_user_background_jobs_for_shutdown(self)
 
             for platform, adapter in list(self.adapters.items()):
                 _adapter_started_at = time.monotonic()
@@ -6442,6 +6744,13 @@ class GatewayRunner:
         """
         source = event.source
 
+        async def _discard_reply_requirement() -> None:
+            event.expects_reply = False
+            adapter = self.adapters.get(source.platform)
+            discard = getattr(adapter, "discard_reply_requirement", None)
+            if callable(discard):
+                await discard(event)
+
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
@@ -6477,6 +6786,7 @@ class GatewayRunner:
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
+                    await _discard_reply_requirement()
                     return None
                 if _action == "rewrite":
                     _new_text = _result.get("text")
@@ -6498,6 +6808,7 @@ class GatewayRunner:
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                await _discard_reply_requirement()
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
@@ -6508,6 +6819,7 @@ class GatewayRunner:
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
                 if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                    await _discard_reply_requirement()
                     return None
                 code = self.pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
@@ -6515,23 +6827,30 @@ class GatewayRunner:
                 if code:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        await adapter.send(
+                        send_result = await adapter.send(
                             source.chat_id,
                             f"Hi~ I don't recognize you yet!\n\n"
                             f"Here's your pairing code: `{code}`\n\n"
                             f"Ask the bot owner to run:\n"
                             f"`hermes pairing approve {platform_name} {code}`"
                         )
+                        _record_send_result_delivery(event, send_result)
                 else:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        await adapter.send(
+                        send_result = await adapter.send(
                             source.chat_id,
                             "Too many pairing requests right now~ "
                             "Please try again later!"
                         )
+                        _record_send_result_delivery(event, send_result)
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
+            if not (
+                source.chat_type == "dm"
+                and self._get_unauthorized_dm_behavior(source.platform) == "pair"
+            ):
+                await _discard_reply_requirement()
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
@@ -6815,13 +7134,7 @@ class GatewayRunner:
                     return "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    queued_event = MessageEvent(
-                        text=queued_text,
-                        message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        channel_prompt=event.channel_prompt,
-                    )
+                    queued_event = _queued_reply_event(event, queued_text)
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
@@ -6842,14 +7155,11 @@ class GatewayRunner:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        queued_event = MessageEvent(
-                            text=steer_text,
-                            message_type=MessageType.TEXT,
-                            source=event.source,
-                            message_id=event.message_id,
-                            channel_prompt=event.channel_prompt,
+                        self._enqueue_fifo(
+                            _quick_key,
+                            _queued_reply_event(event, steer_text),
+                            adapter,
                         )
-                        adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -6858,20 +7168,35 @@ class GatewayRunner:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
                         return f"⚠️ Steer failed: {exc}"
                     if accepted:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            if adapter.defer_event_to_active_response(
+                                _quick_key,
+                                event,
+                            ):
+                                self._remember_steer_event(
+                                    _quick_key,
+                                    steer_text,
+                                    event,
+                                )
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-                    return "Steer rejected (empty payload)."
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        self._enqueue_fifo(
+                            _quick_key,
+                            _queued_reply_event(event, steer_text),
+                            adapter,
+                        )
+                    return "Agent is finishing — /steer queued for the next turn."
                 # Running agent is missing or lacks steer() — fall back to queue.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    queued_event = MessageEvent(
-                        text=steer_text,
-                        message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        channel_prompt=event.channel_prompt,
+                    self._enqueue_fifo(
+                        _quick_key,
+                        _queued_reply_event(event, steer_text),
+                        adapter,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
@@ -7025,12 +7350,9 @@ class GatewayRunner:
                     )
                 return None
             if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    f"⏳ Gateway is {self._status_action_gerund()} and cannot accept "
+                    "another turn. Please resend after it comes back."
                 )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -7531,10 +7853,16 @@ class GatewayRunner:
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
+                        goal_event = (
+                            event.delivery_state.final_response_events[0]
+                            if event.delivery_state.final_response_events
+                            else event
+                        )
                         await self._post_turn_goal_continuation(
                             session_entry=session_entry,
-                            source=source,
+                            source=goal_event.source,
                             final_response=_final_text,
+                            event=goal_event,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -7778,10 +8106,11 @@ class GatewayRunner:
                 if _ctx_result.blocked:
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        await _adapter.send(
+                        send_result = await _adapter.send(
                             source.chat_id,
                             "\n".join(_ctx_result.warnings) or "Context injection refused.",
                         )
+                        _record_send_result_delivery(event, send_result)
                     return None
                 if _ctx_result.expanded:
                     message_text = _ctx_result.message
@@ -8443,6 +8772,13 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                reply_event=event,
+            )
+            event.delivery_state.completion_events.extend(
+                agent_result.pop("_reply_events", [])
+            )
+            event.delivery_state.final_response_events.extend(
+                agent_result.pop("_final_reply_events", [])
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8787,13 +9123,15 @@ class GatewayRunner:
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
-            if agent_result.get("already_sent") and not agent_result.get("failed"):
+            if _record_confirmed_reply_delivery(event, agent_result):
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
-                        await self._deliver_media_from_response(
+                        media_delivery = await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                        if media_delivery is False:
+                            _record_reply_failure(event)
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
@@ -9686,10 +10024,23 @@ class GatewayRunner:
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
         try:
+            adapter = self.adapters.get(event.source.platform)
+            private_user_id = (
+                event.private_reply_user_id
+                or (
+                    adapter.private_reply_user_id(event.source.chat_id)
+                    if adapter is not None
+                    else None
+                )
+            )
             notify_data = {
                 "platform": event.source.platform.value if event.source.platform else None,
                 "chat_id": event.source.chat_id,
             }
+            if private_user_id:
+                notify_data["private_user_id"] = private_user_id
+            if event.platform_team_id:
+                notify_data["team_id"] = event.platform_team_id
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
             atomic_json_write(
@@ -9698,7 +10049,11 @@ class GatewayRunner:
                 indent=None,
             )
         except Exception as e:
-            logger.debug("Failed to write restart notify file: %s", e)
+            logger.error("Failed to write restart notify file: %s", e)
+            return EphemeralReply(
+                "✗ Restart stopped because Hermes could not save the completion route. "
+                "Please try again."
+            )
 
         # Record the triggering platform + update_id in a dedicated dedup
         # marker.  Unlike .restart_notify.json (which gets unlinked once the
@@ -10493,6 +10848,9 @@ class GatewayRunner:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    expects_reply=True,
+                    private_reply_user_id=event.private_reply_user_id,
+                    platform_team_id=event.platform_team_id,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -10551,7 +10909,12 @@ class GatewayRunner:
         idx = len(mgr.state.subgoals) if mgr.state else 0
         return f"✓ Added subgoal {idx}: {text}"
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
+    async def _send_goal_status_notice(
+        self,
+        source: Any,
+        message: str,
+        event: Optional[MessageEvent] = None,
+    ) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self.adapters.get(source.platform)
         if not adapter:
@@ -10559,7 +10922,10 @@ class GatewayRunner:
             return
 
         try:
-            metadata = self._thread_metadata_for_source(source)
+            metadata = self._merge_event_delivery_metadata(
+                self._thread_metadata_for_source(source),
+                event,
+            )
         except Exception:
             metadata = None
 
@@ -10570,7 +10936,12 @@ class GatewayRunner:
                 getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self,
+        source: Any,
+        message: str,
+        event: Optional[MessageEvent] = None,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The gateway message handler returns the agent response to the platform
@@ -10587,7 +10958,7 @@ class GatewayRunner:
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(source, message, event)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -10619,6 +10990,7 @@ class GatewayRunner:
         session_entry: Any,
         source: Any,
         final_response: str,
+        event: Optional[MessageEvent] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -10656,7 +11028,7 @@ class GatewayRunner:
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            await self._defer_goal_status_notice_after_delivery(source, msg, event)
 
         if not decision.get("should_continue"):
             return
@@ -10677,6 +11049,13 @@ class GatewayRunner:
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    expects_reply=True,
+                    private_reply_user_id=(
+                        event.private_reply_user_id if event is not None else None
+                    ),
+                    platform_team_id=(
+                        event.platform_team_id if event is not None else None
+                    ),
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -11155,7 +11534,7 @@ class GatewayRunner:
         response: str,
         event: MessageEvent,
         adapter,
-    ) -> None:
+    ) -> Optional[bool]:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
         Called after streaming has already sent the text to the user, so the
@@ -11165,24 +11544,39 @@ class GatewayRunner:
         from pathlib import Path
         from urllib.parse import quote as _quote
 
-        async def _report_failure(file_path: str, detail: str) -> None:
-            await report_media_delivery_failure(
+        async def _report_failure(
+            file_path: str,
+            detail: str,
+            *,
+            display_name: str | None = None,
+        ) -> bool:
+            notice_delivered = await report_media_delivery_failure(
                 adapter,
                 chat_id=event.source.chat_id,
                 thread_id=getattr(event.source, "thread_id", None),
                 file_path=file_path,
                 metadata=_thread_meta,
                 detail=detail,
+                display_name=display_name,
             )
+            if notice_delivered:
+                for target in _record_reply_attempt(event):
+                    target.delivery_state.failure_notice_delivered = True
+            return False
 
-        async def _check_result(file_path: str, result) -> None:
+        async def _check_result(
+            file_path: str,
+            result,
+            *,
+            display_name: str | None = None,
+        ) -> bool:
             correlation_id = media_delivery_correlation_id(file_path)
             if not getattr(result, "success", False):
-                await _report_failure(
+                return await _report_failure(
                     file_path,
                     str(getattr(result, "error", None) or "upload returned no success confirmation"),
+                    display_name=display_name,
                 )
-                return
             logger.info(
                 "artifact_delivery correlation_id=%s stage=upload_result "
                 "platform=%s chat_id=%s thread_id=%s filename=%s "
@@ -11194,16 +11588,18 @@ class GatewayRunner:
                 Path(file_path).name,
                 getattr(result, "message_id", None),
             )
+            return True
 
         try:
+            delivery_results: list[bool] = []
             # Capture [[as_document]] before extract_media strips it, so the
             # dispatch partition below can route image-extension files
             # through send_document (preserving bytes) instead of
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            media_files, _ = adapter.extract_media(response)
-            _, cleaned = adapter.extract_images(response)
+            media_files, cleaned = adapter.extract_media(response)
+            extracted_images, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
 
             for file_path, _ in media_files:
@@ -11218,6 +11614,40 @@ class GatewayRunner:
                 )
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            if event.platform_team_id:
+                _thread_meta = dict(_thread_meta or {})
+                _thread_meta["team_id"] = event.platform_team_id
+
+            if (
+                event.private_reply_user_id
+                and (media_files or extracted_images or local_files)
+            ):
+                result = await self._send_routed_notice(
+                    adapter,
+                    event.source.chat_id,
+                    "⚠️ This private command produced an attachment. Hermes did not "
+                    "post it to the channel. Run the command in a direct message or "
+                    "request a text result.",
+                    _thread_meta,
+                    private_user_id=event.private_reply_user_id,
+                )
+                delivered = bool(
+                    getattr(result, "success", False)
+                    or getattr(result, "failure_notice_delivered", False)
+                )
+                if not delivered:
+                    adapter.persist_private_notice_retry(
+                        event.source.chat_id,
+                        event.private_reply_user_id,
+                        "⚠️ This private command produced an attachment. Hermes did not "
+                        "post it to the channel. Run the command in a direct message or "
+                        "request a text result.",
+                        _thread_meta,
+                    )
+                if delivered:
+                    for target in _record_reply_attempt(event):
+                        target.delivery_state.reply_delivered = True
+                return delivered
 
             from gateway.platforms.base import should_send_media_as_audio
 
@@ -11247,16 +11677,35 @@ class GatewayRunner:
                 else:
                     non_image_local.append(file_path)
 
-            if image_paths:
+            if image_paths or extracted_images:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    images = [
+                        *extracted_images,
+                        *((f"file://{_quote(p)}", "") for p in image_paths),
+                    ]
+                    result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    first_image = image_paths[0] if image_paths else extracted_images[0][0]
+                    delivery_results.append(
+                        await _check_result(
+                            first_image,
+                            result,
+                            display_name=f"{len(images)}-image batch",
+                        )
+                    )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    first_image = image_paths[0] if image_paths else extracted_images[0][0]
+                    delivery_results.append(
+                        await _report_failure(
+                            first_image,
+                            str(e),
+                            display_name=f"{len(images)}-image batch",
+                        )
+                    )
 
             for media_path, is_voice in non_image_media:
                 try:
@@ -11279,10 +11728,10 @@ class GatewayRunner:
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
-                    await _check_result(media_path, result)
+                    delivery_results.append(await _check_result(media_path, result))
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
-                    await _report_failure(media_path, str(e))
+                    delivery_results.append(await _report_failure(media_path, str(e)))
 
             for file_path in non_image_local:
                 try:
@@ -11299,13 +11748,16 @@ class GatewayRunner:
                             file_path=file_path,
                             metadata=_thread_meta,
                         )
-                    await _check_result(file_path, result)
+                    delivery_results.append(await _check_result(file_path, result))
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
-                    await _report_failure(file_path, str(e))
+                    delivery_results.append(await _report_failure(file_path, str(e)))
+
+            return all(delivery_results) if delivery_results else None
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+            return False
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
@@ -11385,6 +11837,26 @@ class GatewayRunner:
         # Forward image/audio attachments so the background agent can see them.
         media_urls = list(event.media_urls) if event.media_urls else []
         media_types = list(event.media_types) if event.media_types else []
+        adapter = self.adapters.get(source.platform)
+        private_user_id = event.private_reply_user_id
+        if not private_user_id and adapter is not None:
+            try:
+                private_user_id = adapter.private_reply_user_id(source.chat_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not capture private background reply context: %s",
+                    exc,
+                )
+        job_state: Dict[str, Any] = {
+            "task_id": task_id,
+            "source": source,
+            "event_message_id": event_message_id,
+            "private_user_id": private_user_id,
+            "team_id": event.platform_team_id,
+            "agent": None,
+            "thread_started": threading.Event(),
+            "thread_done": threading.Event(),
+        }
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(
@@ -11395,13 +11867,378 @@ class GatewayRunner:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                job_state=job_state,
             )
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
+        user_jobs = getattr(self, "_user_background_jobs", None)
+        if user_jobs is None:
+            user_jobs = self._user_background_jobs = {}
+        user_jobs[_task] = job_state
+        _task.add_done_callback(lambda completed: user_jobs.pop(completed, None))
+        self._record_background_task_outcome(task_id, "running")
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    def _load_background_task_outcomes(self) -> Dict[str, Dict[str, Any]]:
+        """Load bounded background outcome evidence from the previous process."""
+        path = getattr(self, "_background_outcomes_path", None)
+        if path is None or not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return {}
+            return dict(list(payload.items())[-512:])
+        except Exception as exc:
+            logger.warning("Could not load background task outcomes: %s", exc)
+            return {}
+
+    def _record_background_task_outcome(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        detail: Optional[str] = None,
+        pending_notice: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Retain terminal evidence for user-owned background work."""
+        outcomes = getattr(self, "_background_task_outcomes", None)
+        if outcomes is None:
+            outcomes = self._background_task_outcomes = {}
+        previous = outcomes.get(task_id, {})
+        outcomes.pop(task_id, None)
+        outcome = {
+            "status": status,
+            "detail": detail,
+            "updated_at": datetime.now().isoformat(),
+        }
+        if (
+            status
+            in {
+                "delivery_failed",
+                "delivery_failed_notified",
+                "failed_and_undelivered",
+                "cancelled_undelivered",
+                "interrupt_unconfirmed",
+            }
+            and previous.get("pending_notice")
+        ):
+            outcome["pending_notice"] = previous["pending_notice"]
+        elif pending_notice is not None:
+            outcome["pending_notice"] = pending_notice
+        outcomes[task_id] = outcome
+        while len(outcomes) > 512:
+            outcomes.pop(next(iter(outcomes)))
+        outcome_path = getattr(self, "_background_outcomes_path", None)
+        if outcome_path is not None:
+            try:
+                atomic_json_write(outcome_path, outcomes, indent=2)
+            except Exception as exc:
+                logger.warning("Could not persist background task outcome: %s", exc)
+        logger.info(
+            "background_task_outcome task_id=%s status=%s detail=%s",
+            task_id,
+            status,
+            detail or "",
+        )
+
+    @staticmethod
+    def _background_pending_notice(
+        job: Dict[str, Any],
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build a JSON-safe retry payload for one background result."""
+        source = job["source"]
+        retry_metadata = dict(metadata or {})
+        if job.get("team_id"):
+            retry_metadata["team_id"] = job["team_id"]
+        return {
+            "platform": source.platform.value,
+            "chat_id": source.chat_id,
+            "private_user_id": job.get("private_user_id"),
+            "content": content,
+            "metadata": retry_metadata,
+        }
+
+    async def _retry_background_task_outcomes(self) -> int:
+        """Retry durable background notices through their original route."""
+        delivered = 0
+        outcomes = getattr(self, "_background_task_outcomes", {})
+        for task_id, outcome in list(outcomes.items()):
+            pending = outcome.get("pending_notice")
+            if not isinstance(pending, dict):
+                continue
+            try:
+                platform = Platform(str(pending.get("platform") or ""))
+            except ValueError:
+                continue
+            adapter = self.adapters.get(platform)
+            chat_id = str(pending.get("chat_id") or "")
+            content = str(pending.get("content") or "")
+            if adapter is None or not chat_id or not content:
+                continue
+            result = await self._send_routed_notice(
+                adapter,
+                chat_id,
+                content,
+                pending.get("metadata") or None,
+                private_user_id=pending.get("private_user_id") or None,
+            )
+            if getattr(result, "success", False) or getattr(
+                result,
+                "failure_notice_delivered",
+                False,
+            ):
+                self._record_background_task_outcome(
+                    task_id,
+                    "retry_delivered",
+                    detail=str(outcome.get("detail") or "deferred result"),
+                )
+                delivered += 1
+        return delivered
+
+    async def _retry_deferred_deliveries(
+        self,
+        *,
+        include_lifecycle: bool = False,
+    ) -> None:
+        """Retry durable notices without overlapping startup and reconnect work."""
+        lock = getattr(self, "_deferred_delivery_lock", None)
+        if lock is None:
+            lock = self._deferred_delivery_lock = asyncio.Lock()
+        if lock.locked():
+            return
+        async with lock:
+            for adapter in list(self.adapters.values()):
+                try:
+                    await adapter.retry_pending_private_notices()
+                except Exception as exc:
+                    logger.warning("Private notice retry failed: %s", exc)
+            await self._retry_background_task_outcomes()
+            if include_lifecycle:
+                update_task = getattr(self, "_update_notification_task", None)
+                if update_task is None or update_task.done():
+                    await self._send_update_notification()
+                await self._send_restart_notification()
+
+    async def _send_routed_notice(
+        self,
+        adapter: Any,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        private_user_id: Optional[str] = None,
+    ) -> SendResult:
+        """Send a notice through its original public or private route."""
+        if not private_user_id:
+            result = SendResult(success=False, error="notice delivery failed")
+            for attempt in range(3):
+                try:
+                    result = await adapter.send(
+                        chat_id,
+                        content,
+                        metadata=metadata,
+                    )
+                except Exception as exc:
+                    result = SendResult(success=False, error=str(exc), retryable=True)
+                if getattr(result, "success", False):
+                    return result
+                if not (
+                    getattr(result, "retryable", False)
+                    or adapter._is_retryable_error(getattr(result, "error", "") or "")
+                ):
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+            try:
+                failure = await adapter.send(
+                    chat_id,
+                    "⚠️ A completed operation could not deliver its result. Please try again.",
+                    metadata=metadata,
+                )
+                if getattr(failure, "success", False):
+                    result.failure_notice_delivered = True
+            except Exception:
+                pass
+            return result
+
+        result = SendResult(success=False, error="private background delivery failed")
+        for attempt in range(3):
+            try:
+                result = await adapter.send_private_notice(
+                    chat_id=chat_id,
+                    user_id=private_user_id,
+                    content=content,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                result = SendResult(success=False, error=str(exc), retryable=True)
+            if result.success:
+                return result
+            if not (
+                result.retryable
+                or adapter._is_retryable_error(result.error or "")
+            ):
+                break
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+        return result
+
+    async def _send_background_job_notice(
+        self,
+        adapter: Any,
+        job: Dict[str, Any],
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Send a background result through its original public/private route."""
+        route_metadata = dict(metadata or {})
+        if job.get("team_id"):
+            route_metadata["team_id"] = job["team_id"]
+        if not job.get("private_user_id"):
+            return await adapter._send_with_retry(
+                chat_id=job["source"].chat_id,
+                content=content,
+                metadata=route_metadata or None,
+                persist_failure=False,
+            )
+        return await self._send_routed_notice(
+            adapter,
+            job["source"].chat_id,
+            content,
+            route_metadata or None,
+            private_user_id=job.get("private_user_id"),
+        )
+
+    async def _cancel_user_background_jobs_for_shutdown(self) -> None:
+        """Cancel accepted background jobs, then notify before disconnect."""
+        jobs = list(getattr(self, "_user_background_jobs", {}).items())
+        cancelled_jobs = []
+        for task, job in jobs:
+            if task.done():
+                continue
+            agent = job.get("agent")
+            if agent is not None:
+                try:
+                    agent.interrupt("Gateway shutting down")
+                except Exception as exc:
+                    logger.warning(
+                        "Background agent interrupt failed for %s: %s",
+                        job.get("task_id", "unknown"),
+                        exc,
+                    )
+            if task.cancel():
+                cancelled_jobs.append((task, job))
+        if cancelled_jobs:
+            await asyncio.gather(
+                *(task for task, _job in cancelled_jobs),
+                return_exceptions=True,
+            )
+
+        # Worker threads do not stop when their asyncio wrappers are
+        # cancelled. Poll all completion events against one shared deadline.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + getattr(
+            self,
+            "_BACKGROUND_SHUTDOWN_WAIT_SECONDS",
+            5.0,
+        )
+        while loop.time() < deadline:
+            unfinished = [
+                job
+                for task, job in cancelled_jobs
+                if task.cancelled()
+                and job.get("thread_started") is not None
+                and job["thread_started"].is_set()
+                and job.get("thread_done") is not None
+                and not job["thread_done"].is_set()
+            ]
+            if not unfinished:
+                break
+            await asyncio.sleep(0.05)
+
+        for task, job in cancelled_jobs:
+            # A coroutine can suppress CancelledError and complete normally.
+            # Do not overwrite its terminal outcome or claim it was stopped.
+            if not task.cancelled():
+                continue
+            task_id = str(job.get("task_id") or "unknown")
+            thread_started = job.get("thread_started")
+            thread_done = job.get("thread_done")
+            thread_stopped = True
+            if (
+                thread_started is not None
+                and thread_started.is_set()
+                and thread_done is not None
+            ):
+                thread_stopped = thread_done.is_set()
+            source = job.get("source")
+            adapter = self.adapters.get(source.platform) if source else None
+            notified = False
+            if adapter is not None:
+                try:
+                    result = await self._send_background_job_notice(
+                        adapter,
+                        job,
+                        (
+                            f"⚠️ Background task {task_id} "
+                            + (
+                                "stopped because the gateway is shutting down. "
+                                if thread_stopped
+                                else "was interrupted for gateway shutdown, but "
+                                "termination is not confirmed. "
+                            )
+                            + "Please check its effects before you run it again."
+                        ),
+                        self._thread_metadata_for_source(
+                            source,
+                            job.get("event_message_id"),
+                        ),
+                    )
+                    notified = bool(
+                        getattr(result, "success", False)
+                        or getattr(result, "failure_notice_delivered", False)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Background shutdown notice failed for %s: %s",
+                        task_id,
+                        exc,
+                    )
+            self._record_background_task_outcome(
+                task_id,
+                (
+                    "cancelled"
+                    if notified and thread_stopped
+                    else "cancelled_undelivered"
+                    if thread_stopped
+                    else "interrupt_unconfirmed_notified"
+                    if notified
+                    else "interrupt_unconfirmed"
+                ),
+                detail="gateway shutdown",
+                pending_notice=(
+                    None
+                    if notified
+                    else self._background_pending_notice(
+                        job,
+                        (
+                            f"⚠️ Background task {task_id} was interrupted for "
+                            "gateway shutdown. Please check its effects before "
+                            "you run it again."
+                        ),
+                        self._thread_metadata_for_source(
+                            job["source"],
+                            job.get("event_message_id"),
+                        ),
+                    )
+                ),
+            )
 
     async def _run_background_task(
         self,
@@ -11411,19 +12248,95 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        job_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
 
         media_urls = media_urls or []
         media_types = media_types or []
+        job_state = job_state if job_state is not None else {}
+        job_state.setdefault("source", source)
 
         adapter = self.adapters.get(source.platform)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            self._record_background_task_outcome(
+                task_id,
+                "failed_and_undelivered",
+                detail=f"no adapter for {source.platform}",
+                pending_notice=self._background_pending_notice(
+                    job_state,
+                    f"❌ Background task {task_id} failed because its messaging adapter was unavailable.",
+                    None,
+                ),
+            )
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        if job_state.get("team_id"):
+            _thread_metadata = dict(_thread_metadata or {})
+            _thread_metadata["team_id"] = job_state["team_id"]
+        terminal_status = "running"
+
+        def _mark_outcome(
+            status: str,
+            detail: Optional[str] = None,
+            pending_notice: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            nonlocal terminal_status
+            terminal_status = status
+            self._record_background_task_outcome(
+                task_id,
+                status,
+                detail=detail,
+                pending_notice=pending_notice,
+            )
+
+        def _mark_failed_task_outcome(send_result: Any, detail: str) -> None:
+            if getattr(send_result, "success", False):
+                status = "failed"
+            elif getattr(send_result, "failure_notice_delivered", False):
+                status = "delivery_failed_notified"
+            else:
+                status = "failed_and_undelivered"
+            _mark_outcome(status, detail=detail)
+
+        async def _send_completion(content: str, *, phase: str):
+            send_result = await self._send_background_job_notice(
+                adapter,
+                job_state,
+                content,
+                _thread_metadata,
+            )
+            if not getattr(send_result, "success", False):
+                logger.error(
+                    "background_task task_id=%s phase=%s delivery_success=false "
+                    "failure_notice_delivered=%s error=%s",
+                    task_id,
+                    phase,
+                    bool(getattr(send_result, "failure_notice_delivered", False)),
+                    getattr(send_result, "error", None) or "no success confirmation",
+                )
+                pending_content = content
+                if adapter._is_timeout_error(getattr(send_result, "error", None)):
+                    pending_content = (
+                        "⚠️ Hermes could not confirm whether a background result "
+                        "was delivered. Please check the conversation before you "
+                        "run the task again."
+                    )
+                _mark_outcome(
+                    "delivery_failed_notified"
+                    if getattr(send_result, "failure_notice_delivered", False)
+                    else "delivery_failed",
+                    detail=phase,
+                    pending_notice=self._background_pending_notice(
+                        job_state,
+                        pending_content,
+                        _thread_metadata,
+                    ),
+                )
+            return send_result
 
         try:
             user_config = _load_gateway_config()
@@ -11432,11 +12345,11 @@ class GatewayRunner:
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
+                error_result = await _send_completion(
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                    phase="credentials_error",
                 )
+                _mark_failed_task_outcome(error_result, "no provider credentials")
                 return
 
             platform_key = _platform_config_key(source.platform)
@@ -11471,109 +12384,163 @@ class GatewayRunner:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
-                agent = AIAgent(
-                    model=turn_route["model"],
-                    **turn_route["runtime"],
-                    max_iterations=max_iterations,
-                    quiet_mode=True,
-                    verbose_logging=False,
-                    enabled_toolsets=enabled_toolsets,
-                    disabled_toolsets=disabled_toolsets,
-                    reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
-                    providers_allowed=pr.get("only"),
-                    providers_ignored=pr.get("ignore"),
-                    providers_order=pr.get("order"),
-                    provider_sort=pr.get("sort"),
-                    provider_require_parameters=pr.get("require_parameters", False),
-                    provider_data_collection=pr.get("data_collection"),
-                    session_id=task_id,
-                    platform=platform_key,
-                    user_id=source.user_id,
-                    user_name=source.user_name,
-                    chat_id=source.chat_id,
-                    chat_name=source.chat_name,
-                    chat_type=source.chat_type,
-                    thread_id=source.thread_id,
-                    session_db=self._session_db,
-                    fallback_model=self._fallback_model,
-                )
+                thread_started = job_state.get("thread_started")
+                if thread_started is not None:
+                    thread_started.set()
+                agent = None
                 try:
+                    agent = AIAgent(
+                        model=turn_route["model"],
+                        **turn_route["runtime"],
+                        max_iterations=max_iterations,
+                        quiet_mode=True,
+                        verbose_logging=False,
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
+                        reasoning_config=reasoning_config,
+                        service_tier=self._service_tier,
+                        request_overrides=turn_route.get("request_overrides"),
+                        providers_allowed=pr.get("only"),
+                        providers_ignored=pr.get("ignore"),
+                        providers_order=pr.get("order"),
+                        provider_sort=pr.get("sort"),
+                        provider_require_parameters=pr.get("require_parameters", False),
+                        provider_data_collection=pr.get("data_collection"),
+                        session_id=task_id,
+                        platform=platform_key,
+                        user_id=source.user_id,
+                        user_name=source.user_name,
+                        chat_id=source.chat_id,
+                        chat_name=source.chat_name,
+                        chat_type=source.chat_type,
+                        thread_id=source.thread_id,
+                        session_db=self._session_db,
+                        fallback_model=self._fallback_model,
+                    )
+                    job_state["agent"] = agent
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
                 finally:
-                    self._cleanup_agent_resources(agent)
+                    if agent is not None:
+                        self._cleanup_agent_resources(agent)
+                    thread_done = job_state.get("thread_done")
+                    if thread_done is not None:
+                        thread_done.set()
 
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
+            task_error = str(result.get("error") or "") if result else ""
+            if not response and task_error:
+                response = f"Error: {task_error}"
 
             # Extract media files from the response
             if response:
+                original_response = response
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
+                local_files, text_content = adapter.extract_local_files(text_content)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                if task_error:
+                    header = f'❌ Background task failed\nPrompt: "{preview}"\n\n'
+                else:
+                    header = f'Background task result\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
+                    await _send_completion(header + text_content, phase="text_result")
+                elif not images and not media_files and not local_files:
+                    await _send_completion(
+                        header + "(No response generated)",
+                        phase="empty_result",
                     )
 
-                # Send extracted images
-                for image_url, alt_text in (images or []):
-                    try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
-                            metadata=_thread_metadata,
+                if images or media_files or local_files:
+                    if job_state.get("private_user_id"):
+                        notice_result = await _send_completion(
+                            "⚠️ This private background task produced an attachment. "
+                            "Hermes did not post it to the channel. Run the task in a "
+                            "direct message or request a text result.",
+                            phase="private_media_blocked",
                         )
-                    except Exception:
-                        pass
-
-                # Send media files
-                for media_path, _is_voice in (media_files or []):
-                    try:
-                        await adapter.send_document(
-                            chat_id=source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_metadata,
+                        _mark_outcome(
+                            "delivery_failed_notified"
+                            if getattr(notice_result, "success", False)
+                            or getattr(notice_result, "failure_notice_delivered", False)
+                            else "delivery_failed",
+                            detail="private_media_blocked",
                         )
-                    except Exception:
-                        pass
+                    else:
+                        background_event = MessageEvent(
+                            text=prompt,
+                            source=source,
+                            message_id=event_message_id,
+                        )
+                        media_delivered = await self._deliver_media_from_response(
+                            original_response,
+                            background_event,
+                            adapter,
+                        )
+                        if media_delivered is False:
+                            logger.error(
+                                "background_task task_id=%s phase=media_result "
+                                "delivery_success=false failure_notice_delivered=%s",
+                                task_id,
+                                background_event.delivery_state.failure_notice_delivered,
+                            )
+                            _mark_outcome(
+                                "delivery_failed_notified"
+                                if background_event.delivery_state.failure_notice_delivered
+                                else "delivery_failed",
+                                detail="media_result",
+                                pending_notice=(
+                                    None
+                                    if background_event.delivery_state.failure_notice_delivered
+                                    else self._background_pending_notice(
+                                        job_state,
+                                        (
+                                            f"⚠️ Background task {task_id} completed, "
+                                            "but its attachment could not be delivered. "
+                                            "Please run the task again."
+                                        ),
+                                        _thread_metadata,
+                                    )
+                                ),
+                            )
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                await _send_completion(
+                    f'⚠️ Background task finished without a response\n'
+                    f'Prompt: "{preview}"',
+                    phase="empty_result",
                 )
+                if terminal_status == "running":
+                    _mark_outcome("empty", detail="no response generated")
 
+            if terminal_status == "running":
+                _mark_outcome("failed" if task_error else "success")
+
+        except asyncio.CancelledError:
+            existing_status = (
+                getattr(self, "_background_task_outcomes", {})
+                .get(task_id, {})
+                .get("status")
+            )
+            if not str(existing_status or "").startswith("cancelled"):
+                _mark_outcome("cancelled", detail="task cancelled")
+            raise
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
+                error_result = await _send_completion(
+                    f"❌ Background task {task_id} failed: {e}",
+                    phase="task_exception",
                 )
+                _mark_failed_task_outcome(error_result, str(e))
             except Exception:
-                pass
+                _mark_outcome("failed_and_undelivered", detail=str(e))
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
@@ -13438,6 +14405,36 @@ class GatewayRunner:
         return metadata
 
     @staticmethod
+    def _merge_event_delivery_metadata(
+        metadata: Optional[Dict[str, Any]],
+        event: Optional[MessageEvent],
+    ) -> Optional[Dict[str, Any]]:
+        """Add private user and workspace ownership from an admitted event."""
+        if event is None or not (
+            event.private_reply_user_id or event.platform_team_id
+        ):
+            return metadata
+        merged = dict(metadata or {})
+        if event.private_reply_user_id:
+            merged["private_reply_user_id"] = event.private_reply_user_id
+        if event.platform_team_id:
+            merged["team_id"] = event.platform_team_id
+        return merged
+
+    def _delivery_metadata_for_event(
+        self,
+        event: MessageEvent,
+    ) -> Optional[Dict[str, Any]]:
+        """Build thread and private-route metadata for one event."""
+        return self._merge_event_delivery_metadata(
+            self._thread_metadata_for_source(
+                event.source,
+                self._reply_anchor_for_event(event),
+            ),
+            event,
+        )
+
+    @staticmethod
     def _reply_anchor_for_event(event: MessageEvent) -> Optional[str]:
         """Return the platform-specific reply anchor for GatewayRunner sends."""
         return _reply_anchor_for_event(event)
@@ -13639,8 +14636,36 @@ class GatewayRunner:
             return t("gateway.update.hermes_cmd_not_found")
 
         pending_path = _hermes_home / ".update_pending.json"
+        claimed_path = _hermes_home / ".update_pending.claimed.json"
+        lock_path = _hermes_home / ".update_request.lock"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        if lock_path.exists() and not pending_path.exists() and not claimed_path.exists():
+            # A process can die after it creates the exclusive lock but before
+            # it publishes the route marker. Keep recent locks because another
+            # coroutine in this process can still be publishing its marker.
+            try:
+                lock_age = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                lock_age = 0.0
+            if lock_age >= 60.0:
+                lock_path.unlink(missing_ok=True)
+        if pending_path.exists() or claimed_path.exists():
+            return "⚠️ A Hermes update is already in progress."
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                lock_record = {
+                    "pid": os.getpid(),
+                    "created_at": datetime.now().isoformat(),
+                }
+                os.write(lock_fd, json.dumps(lock_record).encode("utf-8"))
+            finally:
+                os.close(lock_fd)
+        except FileExistsError:
+            return "⚠️ A Hermes update is already in progress."
+        except OSError as exc:
+            return t("gateway.update.start_failed", error=exc)
         session_key = self._session_key_for_source(event.source)
         pending = {
             "platform": event.source.platform.value,
@@ -13649,12 +14674,24 @@ class GatewayRunner:
             "session_key": session_key,
             "timestamp": datetime.now().isoformat(),
         }
+        adapter = self.adapters.get(event.source.platform)
+        private_user_id = event.private_reply_user_id
+        if not private_user_id and adapter is not None:
+            private_user_id = adapter.private_reply_user_id(event.source.chat_id)
+        if private_user_id:
+            pending["private_user_id"] = private_user_id
+        if event.platform_team_id:
+            pending["team_id"] = event.platform_team_id
         if event.source.thread_id:
             pending["thread_id"] = event.source.thread_id
-        _tmp_pending = pending_path.with_suffix(".tmp")
-        _tmp_pending.write_text(json.dumps(pending))
-        _tmp_pending.replace(pending_path)
-        exit_code_path.unlink(missing_ok=True)
+        try:
+            _tmp_pending = pending_path.with_suffix(".tmp")
+            _tmp_pending.write_text(json.dumps(pending))
+            _tmp_pending.replace(pending_path)
+            exit_code_path.unlink(missing_ok=True)
+        except Exception as exc:
+            lock_path.unlink(missing_ok=True)
+            return t("gateway.update.start_failed", error=exc)
 
         # Spawn `hermes update --gateway` detached so it survives gateway restart.
         # --gateway enables file-based IPC for interactive prompts (stash
@@ -13743,6 +14780,7 @@ class GatewayRunner:
         except Exception as e:
             pending_path.unlink(missing_ok=True)
             exit_code_path.unlink(missing_ok=True)
+            lock_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
 
         self._schedule_update_notification_watch()
@@ -13780,6 +14818,7 @@ class GatewayRunner:
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
         prompt_path = _hermes_home / ".update_prompt.json"
+        lock_path = _hermes_home / ".update_request.lock"
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -13789,6 +14828,7 @@ class GatewayRunner:
         chat_id = None
         session_key = None
         metadata = None
+        private_user_id = None
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
@@ -13796,8 +14836,15 @@ class GatewayRunner:
                     platform_str = pending.get("platform")
                     chat_id = pending.get("chat_id")
                     session_key = pending.get("session_key")
+                    private_user_id = pending.get("private_user_id")
+                    team_id = pending.get("team_id")
                     thread_id = pending.get("thread_id")
-                    metadata = {"thread_id": thread_id} if thread_id else None
+                    metadata = {}
+                    if thread_id:
+                        metadata["thread_id"] = thread_id
+                    if team_id:
+                        metadata["team_id"] = team_id
+                    metadata = metadata or None
                     if platform_str and chat_id:
                         platform = Platform(platform_str)
                         adapter = self.adapters.get(platform)
@@ -13828,26 +14875,41 @@ class GatewayRunner:
         last_stream_time = loop.time()
         buffer = ""
 
-        async def _flush_buffer() -> None:
+        async def _flush_buffer() -> bool:
             """Send buffered output to the user."""
             nonlocal buffer, last_stream_time
             if not buffer.strip():
                 buffer = ""
-                return
+                return True
             # Chunk to fit message limits (Telegram: 4096, others: generous)
             clean = _strip_ansi(buffer).strip()
             buffer = ""
             last_stream_time = loop.time()
             if not clean:
-                return
+                return True
             # Split into chunks if too long
             max_chunk = 3500
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
                 try:
-                    await adapter.send(chat_id, f"```\n{chunk}\n```", metadata=metadata)
+                    result = await self._send_routed_notice(
+                        adapter,
+                        chat_id,
+                        f"```\n{chunk}\n```",
+                        metadata,
+                        private_user_id=private_user_id,
+                    )
+                    if not (
+                        getattr(result, "success", False)
+                        or getattr(result, "failure_notice_delivered", False)
+                    ):
+                        buffer = "\n".join(chunks[index:])
+                        return False
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
+                    buffer = "\n".join(chunks[index:])
+                    return False
+            return True
 
         while loop.time() < deadline:
             # Check for completion
@@ -13861,27 +14923,46 @@ class GatewayRunner:
                             bytes_sent = len(content)
                     except OSError:
                         pass
-                await _flush_buffer()
+                output_delivered = await _flush_buffer()
 
                 # Send final status
                 try:
                     exit_code_raw = exit_code_path.read_text().strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
-                        await adapter.send(chat_id, "✅ Hermes update finished.", metadata=metadata)
+                        result = await self._send_routed_notice(
+                            adapter,
+                            chat_id,
+                            "✅ Hermes update finished.",
+                            metadata,
+                            private_user_id=private_user_id,
+                        )
                     else:
-                        await adapter.send(
+                        result = await self._send_routed_notice(
+                            adapter,
                             chat_id,
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=metadata,
+                            metadata,
+                            private_user_id=private_user_id,
                         )
+                    status_delivered = bool(
+                        getattr(result, "success", False)
+                        or getattr(result, "failure_notice_delivered", False)
+                    )
+                    if not output_delivered or not status_delivered:
+                        logger.warning(
+                            "Update terminal notification was not delivered to %s",
+                            session_key,
+                        )
+                        return
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
                     logger.warning("Update final notification failed: %s", e)
+                    return
 
                 # Cleanup
                 for p in (pending_path, claimed_path, output_path,
-                          exit_code_path, prompt_path):
+                          exit_code_path, prompt_path, lock_path):
                     p.unlink(missing_ok=True)
                 (_hermes_home / ".update_response").unlink(missing_ok=True)
                 self._update_prompt_pending.pop(session_key, None)
@@ -13919,34 +15000,47 @@ class GatewayRunner:
                         sent_buttons = False
                         if getattr(type(adapter), "send_update_prompt", None) is not None:
                             try:
-                                await adapter.send_update_prompt(
+                                prompt_result = await adapter.send_update_prompt(
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
                                     metadata=metadata,
                                 )
-                                sent_buttons = True
+                                sent_buttons = bool(
+                                    getattr(prompt_result, "success", False)
+                                )
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
-                            await adapter.send(
+                            result = await self._send_routed_notice(
+                                adapter,
                                 chat_id,
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
                                 f"Reply `/approve` (yes) or `/deny` (no), "
                                 f"or type your answer directly.",
-                                metadata=metadata,
+                                metadata,
+                                private_user_id=private_user_id,
                             )
-                        # Keep the prompt marker on disk until the user
-                        # answers. If the gateway restarts mid-prompt, the
-                        # next watcher can recover by re-forwarding it from
-                        # disk. Duplicate sends in the same process are
-                        # still suppressed by _update_prompt_pending.
-                        self._update_prompt_pending[session_key] = True
-                        # .update_response to continue — it doesn't re-check
-                        logger.info("Forwarded update prompt to %s: %s", session_key, prompt_text[:80])
+                            sent_buttons = bool(
+                                getattr(result, "success", False)
+                                or getattr(result, "failure_notice_delivered", False)
+                            )
+                        if sent_buttons:
+                            # Keep the prompt marker on disk until the user
+                            # answers. If the gateway restarts mid-prompt, the
+                            # next watcher can recover by re-forwarding it from
+                            # disk. Duplicate sends in the same process are
+                            # still suppressed by _update_prompt_pending.
+                            self._update_prompt_pending[session_key] = True
+                            # .update_response to continue — it doesn't re-check
+                            logger.info(
+                                "Forwarded update prompt to %s: %s",
+                                session_key,
+                                prompt_text[:80],
+                            )
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
 
@@ -13956,17 +15050,26 @@ class GatewayRunner:
         if not exit_code_path.exists():
             logger.warning("Update watcher timed out after %.0fs", timeout)
             exit_code_path.write_text("124")
-            await _flush_buffer()
+            output_delivered = await _flush_buffer()
             try:
-                await adapter.send(
+                result = await self._send_routed_notice(
+                    adapter,
                     chat_id,
                     "❌ Hermes update timed out after 30 minutes.",
-                    metadata=metadata,
+                    metadata,
+                    private_user_id=private_user_id,
                 )
-            except Exception:
-                pass
+                status_delivered = bool(
+                    getattr(result, "success", False)
+                    or getattr(result, "failure_notice_delivered", False)
+                )
+            except Exception as exc:
+                logger.warning("Update timeout notification failed: %s", exc)
+                status_delivered = False
+            if not output_delivered or not status_delivered:
+                return
             for p in (pending_path, claimed_path, output_path,
-                      exit_code_path, prompt_path):
+                      exit_code_path, prompt_path, lock_path):
                 p.unlink(missing_ok=True)
             (_hermes_home / ".update_response").unlink(missing_ok=True)
             self._update_prompt_pending.pop(session_key, None)
@@ -13985,6 +15088,7 @@ class GatewayRunner:
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        lock_path = _hermes_home / ".update_request.lock"
 
         if not pending_path.exists() and not claimed_path.exists():
             return False
@@ -14005,6 +15109,8 @@ class GatewayRunner:
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
             thread_id = pending.get("thread_id")
+            private_user_id = pending.get("private_user_id")
+            team_id = pending.get("team_id")
 
             if not exit_code_path.exists():
                 logger.info("Update notification deferred: update still running")
@@ -14026,7 +15132,12 @@ class GatewayRunner:
             adapter = self.adapters.get(platform)
 
             if adapter and chat_id:
-                metadata = {"thread_id": thread_id} if thread_id else None
+                metadata = {}
+                if thread_id:
+                    metadata["thread_id"] = thread_id
+                if team_id:
+                    metadata["team_id"] = team_id
+                metadata = metadata or None
                 # Strip ANSI escape codes for clean display
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
                 if output:
@@ -14040,23 +15151,52 @@ class GatewayRunner:
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(chat_id, msg, metadata=metadata)
+                result = await self._send_routed_notice(
+                    adapter,
+                    chat_id,
+                    msg,
+                    metadata,
+                    private_user_id=private_user_id,
+                )
+                if not (
+                    getattr(result, "success", False)
+                    or getattr(result, "failure_notice_delivered", False)
+                ):
+                    logger.warning(
+                        "Post-update notification to %s:%s was not delivered: %s",
+                        platform_str,
+                        chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    cleanup = False
+                    return False
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
                     platform_str,
                     chat_id,
                     exit_code,
                 )
+            else:
+                logger.warning(
+                    "Post-update notification deferred: adapter unavailable for %s:%s",
+                    platform_str,
+                    chat_id,
+                )
+                cleanup = False
+                return False
         except Exception as e:
             logger.warning("Post-update notification failed: %s", e)
+            cleanup = False
+            return False
         finally:
             if cleanup:
                 active_pending_path.unlink(missing_ok=True)
                 claimed_path.unlink(missing_ok=True)
                 output_path.unlink(missing_ok=True)
                 exit_code_path.unlink(missing_ok=True)
+                lock_path.unlink(missing_ok=True)
 
-        return True
+        return cleanup
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
@@ -14064,13 +15204,17 @@ class GatewayRunner:
         if not notify_path.exists():
             return None
 
+        cleanup = False
         try:
             data = json.loads(notify_path.read_text())
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
+            private_user_id = data.get("private_user_id")
+            team_id = data.get("team_id")
 
             if not platform_str or not chat_id:
+                cleanup = True
                 return None
 
             platform = Platform(platform_str)
@@ -14088,13 +15232,21 @@ class GatewayRunner:
                     "Restart notification suppressed: %s has gateway_restart_notification=false",
                     platform_str,
                 )
+                cleanup = True
                 return None
 
-            metadata = {"thread_id": thread_id} if thread_id else None
-            result = await adapter.send(
+            metadata = {}
+            if thread_id:
+                metadata["thread_id"] = thread_id
+            if team_id:
+                metadata["team_id"] = team_id
+            metadata = metadata or None
+            result = await self._send_routed_notice(
+                adapter,
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",
-                metadata=metadata,
+                metadata,
+                private_user_id=private_user_id,
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
             # and returns SendResult(success=False) rather than raising, so
@@ -14109,6 +15261,7 @@ class GatewayRunner:
                 )
                 return None
 
+            cleanup = True
             logger.info(
                 "Sent restart notification to %s:%s",
                 platform_str,
@@ -14119,7 +15272,8 @@ class GatewayRunner:
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if cleanup:
+                notify_path.unlink(missing_ok=True)
 
     async def _send_home_channel_startup_notifications(
         self,
@@ -15173,6 +16327,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        reply_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -15268,7 +16423,10 @@ class GatewayRunner:
             else bool(_plat_streaming)
         )
 
-        _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        _thread_metadata = self._merge_event_delivery_metadata(
+            self._thread_metadata_for_source(source, event_message_id),
+            reply_event,
+        )
 
         if _streaming_enabled:
             try:
@@ -15461,6 +16619,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        reply_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15485,6 +16644,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                reply_event=reply_event,
             )
 
         from run_agent import AIAgent
@@ -15563,6 +16723,9 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        _interim_delivery_futures: List[Any] = []
+        _interim_delivery_lock = threading.Lock()
+        _delivered_interim_texts: List[str] = []
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -15715,6 +16878,10 @@ class GatewayRunner:
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
+        _progress_metadata = self._merge_event_delivery_metadata(
+            _progress_metadata,
+            reply_event,
+        )
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -16100,6 +17267,10 @@ class GatewayRunner:
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+        _status_thread_metadata = self._merge_event_delivery_metadata(
+            _status_thread_metadata,
+            reply_event,
+        )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -16292,16 +17463,26 @@ class GatewayRunner:
                     return
                 if already_streamed or not _status_adapter or not str(text or "").strip():
                     return
-                safe_schedule_threadsafe(
-                    _status_adapter.send(
+                async def _send_interim_with_evidence() -> Any:
+                    send_result = await _status_adapter.send(
                         _status_chat_id,
                         text,
                         metadata=_status_thread_metadata,
-                    ),
+                    )
+                    if getattr(send_result, "success", False):
+                        with _interim_delivery_lock:
+                            _delivered_interim_texts.append(str(text).strip())
+                    return send_result
+
+                future = safe_schedule_threadsafe(
+                    _send_interim_with_evidence(),
                     _loop_for_step,
                     logger=logger,
                     log_message="interim_assistant_callback scheduling error",
                 )
+                if future is not None:
+                    with _interim_delivery_lock:
+                        _interim_delivery_futures.append(future)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
@@ -16612,14 +17793,23 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_kwargs = {
+                            "chat_id": _status_chat_id,
+                            "command": cmd,
+                            "session_key": _approval_session_key,
+                            "description": desc,
+                            "metadata": _status_thread_metadata,
+                        }
+                        if _status_adapter.platform in {
+                            Platform.DISCORD,
+                            Platform.SLACK,
+                            Platform.TELEGRAM,
+                        }:
+                            _approval_kwargs["approval_id"] = approval_data.get(
+                                "approval_id"
+                            )
                         _approval_fut = safe_schedule_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
+                            _status_adapter.send_exec_approval(**_approval_kwargs),
                             _loop_for_step,
                             logger=logger,
                             log_message="send_exec_approval scheduling error",
@@ -16755,6 +17945,7 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            result = None
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -16789,6 +17980,11 @@ class GatewayRunner:
 
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
             finally:
+                _close_steering = getattr(agent, "_close_steering", None)
+                if callable(_close_steering):
+                    _leftover_steer = _close_steering()
+                    if _leftover_steer and isinstance(result, dict):
+                        result.setdefault("pending_steer", _leftover_steer)
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
@@ -16821,28 +18017,6 @@ class GatewayRunner:
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
-            if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
-                return {
-                    "final_response": error_msg,
-                    "messages": result.get("messages", []),
-                    "api_calls": result.get("api_calls", 0),
-                    "failed": result.get("failed", False),
-                    "partial": result.get("partial", False),
-                    "completed": result.get("completed"),
-                    "interrupted": result.get("interrupted", False),
-                    "interrupt_message": result.get("interrupt_message"),
-                    "error": result.get("error"),
-                    "compression_exhausted": result.get("compression_exhausted", False),
-                    "tools": tools_holder[0] or [],
-                    "history_offset": len(agent_history),
-                    "last_prompt_tokens": _last_prompt_toks,
-                    "input_tokens": _input_toks,
-                    "output_tokens": _output_toks,
-                    "model": _resolved_model,
-                    "context_length": _context_length,
-                }
-            
             # Scan tool results for MEDIA:<path> tags that need to be delivered
             # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
             # in its JSON response, but the model's final text reply usually
@@ -16853,7 +18027,7 @@ class GatewayRunner:
             # Uses path-based deduplication against _history_media_paths (collected
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
-            if "MEDIA:" not in final_response:
+            if "MEDIA:" not in (final_response or ""):
                 media_tags = []
                 has_voice_directive = False
                 for msg in result.get("messages", []):
@@ -16876,7 +18050,35 @@ class GatewayRunner:
                             unique_tags.append(tag)
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+                    prefix = f"{final_response}\n" if final_response else ""
+                    final_response = prefix + "\n".join(unique_tags)
+
+            # Queue handling reads this result after the worker returns.
+            # Keep it synchronized so tool-only MEDIA directives survive.
+            result["final_response"] = final_response
+
+            if not final_response:
+                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                return {
+                    "final_response": error_msg,
+                    "messages": result.get("messages", []),
+                    "api_calls": result.get("api_calls", 0),
+                    "failed": result.get("failed", False),
+                    "partial": result.get("partial", False),
+                    "completed": result.get("completed"),
+                    "interrupted": result.get("interrupted", False),
+                    "interrupt_message": result.get("interrupt_message"),
+                    "pending_steer": result.get("pending_steer"),
+                    "error": result.get("error"),
+                    "compression_exhausted": result.get("compression_exhausted", False),
+                    "tools": tools_holder[0] or [],
+                    "history_offset": len(agent_history),
+                    "last_prompt_tokens": _last_prompt_toks,
+                    "input_tokens": _input_toks,
+                    "output_tokens": _output_toks,
+                    "model": _resolved_model,
+                    "context_length": _context_length,
+                }
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).
@@ -17141,6 +18343,7 @@ class GatewayRunner:
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
+        pending_event: Optional[MessageEvent] = None
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -17253,6 +18456,21 @@ class GatewayRunner:
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
 
+            if not _inactivity_timeout and isinstance(response, dict):
+                with _interim_delivery_lock:
+                    interim_futures = list(_interim_delivery_futures)
+                if interim_futures:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                *(asyncio.wrap_future(future) for future in interim_futures),
+                                return_exceptions=True,
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        for future in interim_futures:
+                            future.cancel()
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
@@ -17340,7 +18558,6 @@ class GatewayRunner:
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
-            pending_event = None
             pending = None
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
@@ -17369,11 +18586,33 @@ class GatewayRunner:
             # (e.g. during the final API call), the agent couldn't inject it
             # and returned it in result["pending_steer"]. Deliver it as the
             # next user turn so it isn't silently dropped.
-            if result and not pending and not pending_event:
+            if result:
                 _leftover_steer = result.get("pending_steer")
                 if _leftover_steer:
-                    pending = _leftover_steer
-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+                    leftover_event = self._take_leftover_steer_event(
+                        session_key,
+                        _leftover_steer,
+                        reply_event,
+                    )
+                    if leftover_event is not None and pending_event is not None:
+                        pending_event = self._merge_pending_events_by_arrival(
+                            session_key,
+                            adapter,
+                            pending_event,
+                            leftover_event,
+                        )
+                        pending = pending_event.text if pending_event else None
+                    elif leftover_event is not None:
+                        pending_event = leftover_event
+                        pending = leftover_event.text
+                    elif not pending and not pending_event:
+                        pending = _leftover_steer
+                    logger.debug(
+                        "Delivering leftover /steer as a later turn: '%s...'",
+                        _leftover_steer[:40],
+                    )
+                else:
+                    getattr(self, "_steer_reply_events", {}).pop(session_key, None)
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
@@ -17398,11 +18637,40 @@ class GatewayRunner:
                         pass
 
             if self._draining and (pending_event or pending):
-                logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
-                    session_key or "?",
-                    self._status_action_label(),
-                )
+                drain_events = [pending_event] if pending_event is not None else []
+                if adapter is not None and session_key:
+                    queued_slot = _dequeue_pending_event(adapter, session_key)
+                    if queued_slot is not None:
+                        drain_events.append(queued_slot)
+                    queued_overflow = getattr(self, "_queued_events", {}).pop(
+                        session_key,
+                        [],
+                    )
+                    drain_events.extend(queued_overflow)
+
+                for drain_event in drain_events:
+                    rejection = (
+                        f"⏳ Gateway is {self._status_action_gerund()} and cannot "
+                        "accept the queued turn. Please resend after it comes back."
+                    )
+                    try:
+                        rejection_result = await adapter._send_with_retry(
+                            chat_id=drain_event.source.chat_id,
+                            content=rejection,
+                            reply_to=self._reply_anchor_for_event(drain_event),
+                            metadata=self._delivery_metadata_for_event(drain_event),
+                        )
+                        _record_send_result_delivery(drain_event, rejection_result)
+                    except Exception as exc:
+                        logger.warning("Failed to reject queued turn during drain: %s", exc)
+                        _record_reply_attempt(drain_event)
+                    reply_events = _merge_followup_reply_events(
+                        drain_event,
+                        result,
+                    )
+                    result["_reply_events"] = reply_events
+                    if isinstance(response, dict):
+                        response["_reply_events"] = reply_events
                 pending_event = None
                 pending = None
 
@@ -17425,7 +18693,7 @@ class GatewayRunner:
                     )
                     adapter = self.adapters.get(source.platform)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._prepend_fifo(session_key, pending_event, adapter)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
@@ -17454,29 +18722,73 @@ class GatewayRunner:
                         or (_sc and getattr(_sc, "final_content_delivered", False))
                     )
                     first_response = result.get("final_response", "")
-                    if first_response and not _already_streamed:
+                    media_files, first_text = adapter.extract_media(first_response)
+                    images, first_text = adapter.extract_images(first_text)
+                    local_files, first_text = adapter.extract_local_files(first_text)
+                    first_text = first_text.replace("[[as_document]]", "").strip()
+                    has_media = bool(media_files or images or local_files)
+                    if first_text and not _already_streamed:
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
+                            if reply_event is not None:
+                                _record_reply_attempt(reply_event)
+                            first_send_result = await adapter._send_with_retry(
+                                chat_id=source.chat_id,
+                                content=first_text,
                                 metadata=_status_thread_metadata,
                             )
+                            if reply_event is not None and _record_send_result_delivery(
+                                    reply_event,
+                                    first_send_result,
+                            ):
+                                result["already_sent"] = True
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
-                    elif first_response:
+                    elif first_text:
+                        if reply_event is not None:
+                            _record_confirmed_reply_delivery(
+                                reply_event,
+                                {"already_sent": True, "failed": False},
+                            )
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
+                    if has_media:
+                        if reply_event is not None:
+                            _record_reply_attempt(reply_event)
+                        media_event = reply_event or MessageEvent(
+                            text=message,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id=event_message_id,
+                        )
+                        media_delivered = await self._deliver_media_from_response(
+                            first_response,
+                            media_event,
+                            adapter,
+                        )
+                        if media_delivered and reply_event is not None:
+                            _record_confirmed_reply_delivery(
+                                reply_event,
+                                {"already_sent": True, "failed": False},
+                            )
+                        elif reply_event is not None:
+                            _record_reply_failure(reply_event)
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
                     # base.py's finally block) and call it.
-                    if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
+                    first_reply_delivered = bool(
+                        reply_event is not None
+                        and reply_event.delivery_state.reply_delivered
+                    )
+                    if first_reply_delivered and getattr(
+                        type(adapter), "pop_post_delivery_callback", None
+                    ) is not None:
                         _bg_cb = adapter.pop_post_delivery_callback(
                             session_key,
                             generation=run_generation,
@@ -17488,7 +18800,9 @@ class GatewayRunner:
                                     await _bg_result
                             except Exception:
                                 pass
-                    elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
+                    elif first_reply_delivered and adapter and hasattr(
+                        adapter, "_post_delivery_callbacks"
+                    ):
                         _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
                         if callable(_bg_cb):
                             try:
@@ -17497,6 +18811,10 @@ class GatewayRunner:
                                     await _bg_result
                             except Exception:
                                 pass
+                    if reply_event is not None:
+                        # The current response has reached a terminal delivery
+                        # outcome. A later queued turn must not rewrite it.
+                        reply_event.delivery_state.final_response_events.clear()
                 # else: interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
@@ -17520,6 +18838,10 @@ class GatewayRunner:
                         history=updated_history,
                     )
                     if next_message is None:
+                        result["_reply_events"] = _merge_followup_reply_events(
+                            pending_event,
+                            result,
+                        )
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -17548,8 +18870,42 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    reply_event=pending_event or reply_event,
+                )
+                if pending_event is not None and not followup_result.get(
+                    "_final_reply_events"
+                ):
+                    followup_result["_final_reply_events"] = [
+                        pending_event,
+                        *pending_event.delivery_state.merged_events,
+                    ]
+                followup_result["_reply_events"] = _merge_followup_reply_events(
+                    pending_event,
+                    followup_result,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
+        except Exception:
+            if pending_event is not None and reply_event is not None:
+                completion_events = reply_event.delivery_state.completion_events
+                if all(existing is not pending_event for existing in completion_events):
+                    completion_events.append(pending_event)
+            if self._draining and session_key:
+                await self._reject_queued_events_after_failed_drain(
+                    session_key,
+                    source,
+                )
+            elif session_key:
+                adapter = self.adapters.get(source.platform)
+                if adapter is not None:
+                    pending_event = _dequeue_pending_event(adapter, session_key)
+                    pending_event = self._promote_queued_event(
+                        session_key,
+                        adapter,
+                        pending_event,
+                    )
+                    if pending_event is not None:
+                        self._prepend_fifo(session_key, pending_event, adapter)
+            raise
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
@@ -17596,6 +18952,7 @@ class GatewayRunner:
                 self._release_running_agent_state(
                     session_key, run_generation=run_generation
                 )
+                getattr(self, "_steer_reply_events", {}).pop(session_key, None)
             if self._draining:
                 self._update_runtime_status("draining")
             
@@ -17624,6 +18981,20 @@ class GatewayRunner:
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
+            with _interim_delivery_lock:
+                direct_preview_delivered = (
+                    str(_final).strip() in _delivered_interim_texts
+                )
+            streamed_commentary = (
+                getattr(_sc, "delivered_commentary_texts", ()) if _sc else ()
+            )
+            response["response_previewed"] = bool(
+                response.get("response_previewed")
+                and (
+                    direct_preview_delivered
+                    or str(_final).strip() in streamed_commentary
+                )
+            )
             _streamed = bool(
                 _sc and getattr(_sc, "final_response_sent", False)
             )

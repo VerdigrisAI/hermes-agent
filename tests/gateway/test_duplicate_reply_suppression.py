@@ -13,6 +13,7 @@ Covers four fix paths:
 """
 
 import asyncio
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,6 +28,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import SessionSource, build_session_key
+from gateway.run import _record_confirmed_reply_delivery, _record_send_result_delivery
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +70,87 @@ def _make_event(text="hello", chat_id="c1", user_id="u1"):
         ),
         message_id="m1",
     )
+
+
+def test_failed_stream_does_not_record_reply_delivery():
+    event = _make_event()
+
+    delivered = _record_confirmed_reply_delivery(
+        event,
+        {"already_sent": True, "failed": True},
+    )
+
+    assert delivered is False
+    assert event.delivery_state.reply_delivered is False
+
+
+def test_direct_send_records_only_confirmed_delivery_across_rewrite():
+    event = _make_event()
+    rewritten = dataclasses.replace(event, text="rewritten")
+
+    assert _record_send_result_delivery(
+        rewritten, SendResult(success=False, error="failed")
+    ) is False
+    assert event.delivery_state.reply_delivered is False
+
+    assert _record_send_result_delivery(
+        rewritten, SendResult(success=True, message_id="reply-1")
+    ) is True
+    assert event.delivery_state.reply_delivered is True
+
+
+def test_final_send_records_only_the_queued_response_target():
+    original = _make_event()
+    queued = _make_event(text="follow up")
+    original.delivery_state.final_response_events.append(queued)
+
+    delivered = _record_send_result_delivery(
+        original,
+        SendResult(success=True, message_id="reply-2"),
+    )
+
+    assert delivered is True
+    assert original.delivery_state.reply_delivered is False
+    assert queued.delivery_state.reply_delivered is True
+
+
+def test_failed_first_send_is_not_hidden_by_queued_success():
+    original = _make_event()
+    queued = _make_event(text="follow up")
+
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=False, error="network down"),
+    ) is False
+    original.delivery_state.final_response_events.append(queued)
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=True, message_id="reply-2"),
+    ) is True
+
+    assert original.delivery_state.reply_attempted is True
+    assert original.delivery_state.reply_delivered is False
+    assert queued.delivery_state.reply_attempted is True
+    assert queued.delivery_state.reply_delivered is True
+
+
+def test_failed_queued_send_is_not_hidden_by_first_success():
+    original = _make_event()
+    queued = _make_event(text="follow up")
+
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=True, message_id="reply-1"),
+    ) is True
+    original.delivery_state.final_response_events.append(queued)
+    assert _record_send_result_delivery(
+        original,
+        SendResult(success=False, error="network down"),
+    ) is False
+
+    assert original.delivery_state.reply_delivered is True
+    assert queued.delivery_state.reply_attempted is True
+    assert queued.delivery_state.reply_delivered is False
 
 
 # ===================================================================

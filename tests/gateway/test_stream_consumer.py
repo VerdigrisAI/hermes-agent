@@ -217,9 +217,10 @@ class TestSendOrEditMediaStripping:
         adapter.MAX_MESSAGE_LENGTH = 4096
 
         consumer = GatewayStreamConsumer(adapter, "chat_123")
-        await consumer._send_or_edit("MEDIA:/tmp/image.png")
+        result = await consumer._send_or_edit("MEDIA:/tmp/image.png")
 
         adapter.send.assert_not_called()
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_cursor_only_update_skips_send(self):
@@ -259,12 +260,12 @@ class TestSendOrEditMediaStripping:
         # No message_id yet (first send) — short text + cursor should be skipped
         assert consumer._message_id is None
         result = await consumer._send_or_edit("I ▉")
-        assert result is True
+        assert result is False
         adapter.send.assert_not_called()
 
         # 3 chars is still under the threshold
         result = await consumer._send_or_edit("Hi! ▉")
-        assert result is True
+        assert result is False
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
@@ -887,7 +888,7 @@ class TestFinalResponseDeliveryGuard:
         )
         adapter.MAX_MESSAGE_LENGTH = 100
         adapter.truncate_message = MagicMock(
-            side_effect=lambda text, limit: [text[:limit], text[limit:]],
+            side_effect=lambda text, limit, **_kwargs: [text[:limit], text[limit:]],
         )
 
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
@@ -897,12 +898,10 @@ class TestFinalResponseDeliveryGuard:
         consumer._already_sent = True
 
         # Long text > MAX_MESSAGE_LENGTH, no existing message id (fresh send path)
-        long_text = "x" * 200
+        long_text = "x" * 700
         consumer.on_delta(long_text)
-        task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.05)
         consumer.finish()
-        await task
+        await consumer.run()
 
         assert consumer._final_response_sent is False, (
             "_already_sent leaked into _final_response_sent — gateway will "
@@ -910,33 +909,53 @@ class TestFinalResponseDeliveryGuard:
         )
 
     @pytest.mark.asyncio
-    async def test_split_overflow_partial_send_marks_final_sent(self):
-        """Split-overflow path: if at least one chunk lands on done frame,
-        we did deliver the final answer — _final_response_sent must be True."""
+    async def test_split_overflow_partial_send_does_not_mark_final_sent(self):
+        """One delivered chunk is not proof that the complete answer arrived."""
         adapter = MagicMock()
         adapter.send = AsyncMock(side_effect=[
             SimpleNamespace(success=True, message_id="msg_1"),
-            SimpleNamespace(success=True, message_id="msg_2"),
+            SimpleNamespace(success=False, error="network down"),
         ])
         adapter.edit_message = AsyncMock(
             return_value=SimpleNamespace(success=True),
         )
         adapter.MAX_MESSAGE_LENGTH = 100
         adapter.truncate_message = MagicMock(
-            side_effect=lambda text, limit: [text[:limit], text[limit:]],
+            side_effect=lambda text, limit, **_kwargs: [text[:limit], text[limit:]],
         )
 
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
 
-        long_text = "x" * 200
+        long_text = "x" * 700
         consumer.on_delta(long_text)
-        task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.05)
         consumer.finish()
-        await task
+        await consumer.run()
 
-        assert consumer._final_response_sent is True
+        assert consumer._final_response_sent is False
+        assert consumer._final_content_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_fallback_partial_send_allows_complete_base_retry(self):
+        """A failed later fallback chunk must not suppress full-response retry."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=False, error="network down"),
+        ])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 600
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+        consumer._message_id = "msg_partial"
+        consumer._last_sent_text = "Working"
+
+        await consumer._send_fallback_final("Working" + " x" * 700)
+
+        assert consumer._already_sent is False
+        assert consumer._final_response_sent is False
+        assert consumer._final_content_delivered is False
 
 
 class TestEditOverflowSplitAndDeliver:
@@ -1014,7 +1033,30 @@ class TestInterimCommentaryMessages:
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         assert sent_texts == ["I'll inspect the repository first.", "Done."]
+        assert consumer.delivered_commentary_texts == (
+            "I'll inspect the repository first.",
+        )
         assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_failed_commentary_is_not_recorded_as_delivered(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None)
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+
+        consumer.on_commentary("You're welcome.")
+        consumer.finish()
+        await consumer.run()
+
+        assert consumer.delivered_commentary_texts == ()
 
     @pytest.mark.asyncio
     async def test_failed_final_send_does_not_mark_final_response_sent(self):
@@ -1780,4 +1822,3 @@ class TestUtf16OverflowDetection:
         # auto-attr mock. Verified indirectly by all the other tests in
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
-

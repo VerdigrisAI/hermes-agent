@@ -125,6 +125,26 @@ class TestTelegramExecApproval:
         assert adapter._approval_state[approval_id] == "my-session-key"
 
     @pytest.mark.asyncio
+    async def test_stores_exact_gateway_approval_id(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 42
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        await adapter.send_exec_approval(
+            chat_id="12345",
+            command="echo test",
+            session_key="my-session-key",
+            approval_id="gateway-approval-2",
+        )
+
+        button_id = next(iter(adapter._approval_state))
+        assert adapter._approval_state[button_id] == (
+            "my-session-key",
+            "gateway-approval-2",
+        )
+
+    @pytest.mark.asyncio
     async def test_sends_in_thread(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()
@@ -270,6 +290,36 @@ class TestTelegramApprovalCallback:
 
         # State should be cleaned up
         assert 1 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_resolves_exact_parallel_approval_on_click(self):
+        adapter = _make_adapter()
+        adapter._approval_state[1] = (
+            "agent:main:telegram:group:12345:99",
+            "gateway-approval-2",
+        )
+        query = AsyncMock()
+        query.data = "ea:deny:1"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.from_user.first_name = "Norbert"
+        query.from_user.id = "12345"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99",
+            "deny",
+            approval_id="gateway-approval-2",
+        )
+        query.edit_message_text.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):

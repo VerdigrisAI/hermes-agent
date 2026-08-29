@@ -44,6 +44,7 @@ from gateway.document_extract import (
     extract_docx_text,
 )
 from gateway.platforms.helpers import MessageDeduplicator
+from utils import atomic_json_write
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -75,6 +76,9 @@ MAX_SLACK_UPLOAD_BYTES = 20 * 1024 * 1024
 # visible in _process_message_background's child task.
 _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_slash_user_id", default=None,
+)
+_slash_invocation_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_slash_invocation_id", default=None,
 )
 
 
@@ -412,9 +416,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
-        # Track pending approval message_ts → resolved flag to prevent
-        # double-clicks on approval buttons.
-        self._approval_resolved: Dict[str, bool] = {}
+        # Track pending approval message_ts → lifecycle state to prevent
+        # concurrent or redelivered button clicks.
+        self._approval_resolved: Dict[str, str] = {}
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -434,14 +438,177 @@ class SlackAdapter(BasePlatformAdapter):
         self._THREAD_CACHE_TTL = 60.0
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
+        # Track every admitted turn that requires a reply. Unmentioned
+        # follow-ups stay quiet on success, but still get a visible failure.
+        self._required_reply_message_ids: set = set()
         # Track active assistant thread status indicators so stop_typing can
         # clear them (chat_id → thread_ts).
         self._active_status_threads: Dict[str, str] = {}
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
-        # (channel_id, user_id) to avoid cross-user collisions.
-        # Each value: {"response_url": str, "ts": float}
-        self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # (channel_id, user_id, invocation_id). The invocation component keeps
+        # overlapping commands from the same user isolated.
+        self._slash_command_contexts: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        self._slash_confirm_owners: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._slash_confirm_outcomes_path = (
+            get_hermes_home() / ".slash_confirm_outcomes.json"
+        )
+        self._slash_confirm_outcomes = self._load_slash_confirm_outcomes()
+
+    def _load_slash_confirm_outcomes(
+        self,
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Load bounded confirmation delivery evidence and retry payloads."""
+        path = getattr(self, "_slash_confirm_outcomes_path", None)
+        if path is None or not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                return {}
+            outcomes: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for item in payload[-256:]:
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                session_key = str(item.pop("session_key", ""))
+                confirm_id = str(item.pop("confirm_id", ""))
+                if session_key and confirm_id:
+                    outcomes[(session_key, confirm_id)] = item
+            return outcomes
+        except Exception as exc:
+            logger.warning("[Slack] Could not load confirmation outcomes: %s", exc)
+            return {}
+
+    def _persist_slash_confirm_outcomes(self) -> None:
+        """Persist bounded confirmation evidence for restart recovery."""
+        path = getattr(self, "_slash_confirm_outcomes_path", None)
+        if path is None:
+            return
+        payload = [
+            {"session_key": key[0], "confirm_id": key[1], **value}
+            for key, value in self._slash_confirm_outcomes.items()
+        ]
+        try:
+            atomic_json_write(path, payload[-256:], indent=2)
+        except Exception as exc:
+            logger.warning("[Slack] Could not persist confirmation outcomes: %s", exc)
+
+    def _record_slash_confirm_outcome(
+        self,
+        session_key: str,
+        confirm_id: str,
+        status: str,
+        *,
+        pending_notice: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record one bounded confirmation outcome and its retry payload."""
+        key = (session_key, confirm_id)
+        self._slash_confirm_outcomes.pop(key, None)
+        outcome: Dict[str, Any] = {
+            "status": status,
+            "updated_at": time.time(),
+        }
+        if pending_notice:
+            outcome["pending_notice"] = pending_notice
+        self._slash_confirm_outcomes[key] = outcome
+        while len(self._slash_confirm_outcomes) > 256:
+            self._slash_confirm_outcomes.pop(next(iter(self._slash_confirm_outcomes)))
+        self._persist_slash_confirm_outcomes()
+
+    async def retry_pending_private_notices(self) -> int:
+        """Retry durable Slack notices that failed before a restart."""
+        delivered = 0
+        for key, outcome in list(self._slash_confirm_outcomes.items()):
+            pending = outcome.get("pending_notice")
+            if not isinstance(pending, dict):
+                continue
+            metadata = {}
+            if pending.get("thread_id"):
+                metadata["thread_id"] = pending["thread_id"]
+            if pending.get("team_id"):
+                metadata["team_id"] = pending["team_id"]
+            try:
+                user_id = str(pending.get("user_id") or "")
+                if user_id:
+                    result = await self.send_private_notice(
+                        chat_id=str(pending.get("chat_id") or ""),
+                        user_id=user_id,
+                        content=str(pending.get("content") or ""),
+                        metadata=metadata or None,
+                    )
+                else:
+                    result = await self.send(
+                        chat_id=str(pending.get("chat_id") or ""),
+                        content=str(pending.get("content") or ""),
+                        reply_to=str(pending.get("reply_to") or "") or None,
+                        metadata=metadata or None,
+                    )
+            except Exception as exc:
+                logger.warning("[Slack] Confirmation notice retry failed: %s", exc)
+                continue
+            if result.success:
+                outcome.pop("pending_notice", None)
+                outcome["status"] = "retry_delivered"
+                outcome["updated_at"] = time.time()
+                delivered += 1
+        if delivered:
+            self._persist_slash_confirm_outcomes()
+        return delivered
+
+    def persist_private_notice_retry(
+        self,
+        chat_id: str,
+        user_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist a private notice without retaining a Slack response URL."""
+        if not chat_id or not user_id or not content:
+            return False
+        metadata = metadata or {}
+        notice_id = os.urandom(12).hex()
+        self._record_slash_confirm_outcome(
+            "private-notice",
+            notice_id,
+            "delivery_failed",
+            pending_notice={
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "team_id": metadata.get("team_id"),
+                "thread_id": metadata.get("thread_id") or metadata.get("thread_ts"),
+                "content": content,
+            },
+        )
+        return True
+
+    def persist_delivery_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist a failed public or private Slack delivery."""
+        if not chat_id or not content:
+            return False
+        metadata = metadata or {}
+        private_user_id = str(metadata.get("private_reply_user_id") or "")
+        notice_id = os.urandom(12).hex()
+        self._record_slash_confirm_outcome(
+            "delivery-retry",
+            notice_id,
+            "delivery_failed",
+            pending_notice={
+                "chat_id": chat_id,
+                "user_id": private_user_id or None,
+                "team_id": metadata.get("team_id"),
+                "thread_id": metadata.get("thread_id") or metadata.get("thread_ts"),
+                "reply_to": reply_to,
+                "content": content,
+            },
+        )
+        return True
 
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
@@ -469,7 +636,7 @@ class SlackAdapter(BasePlatformAdapter):
             return f"Slack attachment access failed for {file_label} because the bot does not have permission ({error}). Check workspace permissions/scopes and reinstall if needed."
         return None
 
-    def _describe_slack_download_failure(self, exc: Exception, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    def _describe_slack_download_failure(self, exc: Exception, *, file_obj: Optional[Dict[str, Any]] = None) -> str:
         """Translate Slack download exceptions into user-facing attachment diagnostics."""
         file_label = str((file_obj or {}).get("name") or (file_obj or {}).get("id") or "this attachment")
 
@@ -498,7 +665,10 @@ class SlackAdapter(BasePlatformAdapter):
                 f"Slack attachment access failed for {file_label}: Slack returned an HTML/login or non-media response. "
                 "This usually means a scope, auth, or file-permission problem."
             )
-        return None
+        return (
+            f"Slack attachment {file_label} could not be downloaded after retries "
+            f"({type(exc).__name__})."
+        )
 
     async def _resolve_slack_file_object(
         self,
@@ -639,16 +809,14 @@ class SlackAdapter(BasePlatformAdapter):
     # Slash-command ephemeral helpers
     # ------------------------------------------------------------------
 
-    _SLASH_CTX_TTL = 120.0  # seconds — response_url is valid for 30 min;
-    # we use a much shorter TTL to avoid routing unrelated messages
-    # as ephemeral if the command handler was slow or dropped.
+    _SLASH_CTX_TTL = 30 * 60.0  # Slack response_url validity window.
 
-    def _pop_slash_context(
-        self, chat_id: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Return and remove the slash-command context for *chat_id*, if fresh.
+    def _slash_context_key(self, chat_id: str) -> Optional[Tuple[str, ...]]:
+        """Return the matching fresh slash-command context key.
 
-        Contexts older than ``_SLASH_CTX_TTL`` seconds are silently discarded.
+        Unbound contexts older than ``_SLASH_CTX_TTL`` are discarded. The
+        exact context bound to the active task remains usable for a delayed
+        private fallback.
 
         Uses the ``_slash_user_id`` ContextVar (set in ``_handle_slash_command``)
         to match the exact ``(channel_id, user_id)`` key.  This prevents a
@@ -658,29 +826,64 @@ class SlackAdapter(BasePlatformAdapter):
         from a non-slash code path — should not match anything).
         """
         now = time.monotonic()
+        invocation_id = _slash_invocation_id.get()
+        uid = _slash_user_id.get()
+        bound_key = (
+            (chat_id, uid, invocation_id)
+            if uid and invocation_id
+            else None
+        )
         # Clean up stale entries on every lookup — dict is small.
         stale_keys = [
             k for k, v in self._slash_command_contexts.items()
-            if now - v["ts"] > self._SLASH_CTX_TTL
+            if k != bound_key and now - v["ts"] > self._SLASH_CTX_TTL
         ]
         for k in stale_keys:
             self._slash_command_contexts.pop(k, None)
 
         # Precise match: (channel_id, user_id) from ContextVar.
-        uid = _slash_user_id.get()
-        if uid:
-            return self._slash_command_contexts.pop((chat_id, uid), None)
+        if bound_key is not None:
+            return bound_key if bound_key in self._slash_command_contexts else None
 
-        # Fallback: channel-only scan (only reachable when ContextVar is
-        # unset, i.e. send() called outside a slash-command async context).
-        match_key = None
-        for key in list(self._slash_command_contexts):
-            if key[0] == chat_id:
-                match_key = key
-                break
-        if match_key is None:
-            return None
-        return self._slash_command_contexts.pop(match_key)
+        # Compatibility for callers/tests that bind only the user. Accept a
+        # match only when it is unambiguous.
+        if uid:
+            matches = [
+                key for key in self._slash_command_contexts
+                if len(key) >= 2 and key[:2] == (chat_id, uid)
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        # A send without the verified slash caller context must never claim a
+        # pending private reply. Another user's ordinary channel response may
+        # use the same chat_id.
+        return None
+
+    def _pop_slash_context(
+        self, chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return and remove the slash-command context for *chat_id*, if fresh."""
+        key = self._slash_context_key(chat_id)
+        return self._slash_command_contexts.pop(key, None) if key else None
+
+    def _peek_slash_context(
+        self, chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a fresh slash context without consuming it."""
+        key = self._slash_context_key(chat_id)
+        return self._slash_command_contexts.get(key) if key else None
+
+    def _discard_slash_context(self, ctx: Dict[str, Any]) -> None:
+        """Consume *ctx* after confirmed private delivery."""
+        for key, candidate in list(self._slash_command_contexts.items()):
+            if candidate is ctx:
+                self._slash_command_contexts.pop(key, None)
+                return
+
+    def private_reply_user_id(self, chat_id: str) -> Optional[str]:
+        """Return the verified user bound to the active slash invocation."""
+        ctx = self._peek_slash_context(chat_id)
+        return str(ctx.get("user_id") or "") if ctx else None
 
     async def _send_slash_ephemeral(
         self,
@@ -694,43 +897,82 @@ class SlackAdapter(BasePlatformAdapter):
         lets us swap the "Running /cmd…" placeholder with the real reply,
         and the message stays ephemeral ("Only visible to you").
 
-        Falls back to a simple ``True`` SendResult if the POST fails —
-        the user already saw the initial ack, so a delivery failure here
-        is non-critical.
+        Falls back to a second ephemeral message if replacement fails.
         """
         formatted = self.format_message(content)
         # Slack's response_url has the same ~40k char limit as chat_postMessage.
-        # Truncate to MAX_MESSAGE_LENGTH and use only the first chunk — the
-        # response_url replaces a single ephemeral ack, so multi-chunk isn't
-        # possible.  Long responses are rare for command replies.
+        # The response_url replaces one ephemeral ack. Deliver any remaining
+        # chunks as private follow-up messages to the same verified user.
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         text = chunks[0] if chunks else formatted
+        if ctx.get("delivery_mode") == "uncertain":
+            return SendResult(
+                success=False,
+                error="response_url delivery timed out",
+            )
+        if ctx.get("delivery_content") != content:
+            ctx["delivery_content"] = content
+            ctx["delivery_mode"] = None
+            ctx["next_chunk_index"] = 0
         payload = {
             "response_type": "ephemeral",
             "replace_original": True,
             "text": text,
         }
-        try:
-            async with aiohttp.ClientSession(trust_env=True) as session:
-                async with session.post(
-                    ctx["response_url"],
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status == 200:
-                        return SendResult(success=True, message_id=None)
-                    body = await resp.text()
-                    logger.warning(
-                        "[Slack] response_url POST returned %s: %s",
-                        resp.status,
-                        body[:200],
-                    )
-        except Exception as e:
-            logger.warning(
-                "[Slack] response_url POST failed: %s", e,
+        if ctx.get("delivery_mode") is None:
+            try:
+                async with aiohttp.ClientSession(trust_env=True) as session:
+                    async with session.post(
+                        ctx["response_url"],
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status == 200:
+                            ctx["delivery_mode"] = "response_url"
+                            ctx["next_chunk_index"] = 1
+                        else:
+                            body = await resp.text()
+                            logger.warning(
+                                "[Slack] response_url POST returned %s: %s",
+                                resp.status,
+                                body[:200],
+                            )
+                            ctx["delivery_mode"] = "ephemeral"
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "[Slack] response_url POST delivery is uncertain: %s",
+                    e,
+                )
+                ctx["delivery_mode"] = "uncertain"
+                return SendResult(
+                    success=False,
+                    error="response_url delivery timed out",
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Slack] response_url POST failed: %s", e,
+                )
+                ctx["delivery_mode"] = "ephemeral"
+
+        last_result = SendResult(success=False, error="private slash delivery failed")
+        delivery_chunks = chunks or [formatted]
+        for index in range(int(ctx.get("next_chunk_index", 0)), len(delivery_chunks)):
+            chunk = delivery_chunks[index]
+            last_result = await self.send_private_notice(
+                chat_id=str(ctx.get("channel_id") or ""),
+                user_id=str(ctx.get("user_id") or ""),
+                content=chunk,
+                already_formatted=True,
             )
-        # Non-fatal — the user saw the initial ack already.
-        return SendResult(success=True, message_id=None)
+            if not last_result.success:
+                # Retrying an ephemeral replacement cannot leak private command
+                # output or create a public duplicate.
+                last_result.retryable = True
+                return last_result
+            ctx["next_chunk_index"] = index + 1
+        if ctx.get("delivery_mode") == "response_url" and len(delivery_chunks) == 1:
+            return SendResult(success=True, message_id=None)
+        return last_result
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -977,9 +1219,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         logger.info("[Slack] Disconnected")
 
-    def _get_client(self, chat_id: str) -> Any:
+    def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
-        team_id = self._channel_team.get(chat_id)
+        team_id = team_id or self._channel_team.get(chat_id)
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
@@ -1001,10 +1243,25 @@ class SlackAdapter(BasePlatformAdapter):
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id)
+            slash_ctx = self._peek_slash_context(chat_id)
             if slash_ctx:
-                return await self._send_slash_ephemeral(
+                result = await self._send_slash_ephemeral(
                     slash_ctx, content,
+                )
+                if result.success:
+                    self._discard_slash_context(slash_ctx)
+                return result
+
+            private_user_id = str(
+                (metadata or {}).get("private_reply_user_id") or ""
+            )
+            if private_user_id:
+                return await self.send_private_notice(
+                    chat_id=chat_id,
+                    user_id=private_user_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=metadata,
                 )
 
             # Convert standard markdown → Slack mrkdwn
@@ -1032,7 +1289,8 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                team_id = str((metadata or {}).get("team_id") or "") or None
+                last_result = await self._get_client(chat_id, team_id).chat_postMessage(**kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1068,6 +1326,7 @@ class SlackAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        already_formatted: bool = False,
     ) -> SendResult:
         """Send a Slack ephemeral message visible only to one user."""
         if not self._app:
@@ -1076,7 +1335,7 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="chat_id and user_id are required")
 
         try:
-            formatted = self.format_message(content)
+            formatted = content if already_formatted else self.format_message(content)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             kwargs = {
                 "channel": chat_id,
@@ -1087,7 +1346,8 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postEphemeral(**kwargs)
+            team_id = str((metadata or {}).get("team_id") or "") or None
+            result = await self._get_client(chat_id, team_id).chat_postEphemeral(**kwargs)
             return SendResult(
                 success=True,
                 message_id=result.get("message_ts") or result.get("ts"),
@@ -1412,7 +1672,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -1423,23 +1683,29 @@ class SlackAdapter(BasePlatformAdapter):
         The batch limit is 10 file uploads per call (Slack server-side cap).
         """
         if not self._app:
-            return
+            return SendResult(success=False, error="Slack app is not connected")
         if not images:
-            return
+            return SendResult(success=False, error="no images to deliver")
 
         try:
             import httpx as _httpx
             from urllib.parse import unquote as _unquote
             from tools.url_safety import is_safe_url as _is_safe_url
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id,
+                images,
+                metadata,
+                human_delay,
+            )
 
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        all_delivered = True
+        last_error: Optional[str] = None
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -1456,11 +1722,15 @@ class SlackAdapter(BasePlatformAdapter):
                             local_path = _unquote(image_url[7:])
                             try:
                                 local_path, local_bytes = self._prepare_local_upload(local_path)
-                            except (FileNotFoundError, _SlackUploadPolicyError) as exc:
+                            except FileNotFoundError as exc:
+                                logger.warning("[Slack] Skipping missing local image: %s", exc)
+                                all_delivered = False
+                                last_error = f"File not found: {os.path.basename(local_path)}"
+                                continue
+                            except _SlackUploadPolicyError as exc:
                                 logger.warning("[Slack] Skipping disallowed local image: %s", exc)
-                                initial_comment_parts.append(
-                                    "⚠️ One local image was not attached because it failed the Slack artifact policy."
-                                )
+                                all_delivered = False
+                                last_error = str(exc)
                                 continue
                             file_uploads.append({
                                 "content": local_bytes,
@@ -1469,6 +1739,8 @@ class SlackAdapter(BasePlatformAdapter):
                         else:
                             if not _is_safe_url(image_url):
                                 logger.warning("[Slack] Blocked unsafe image URL in batch")
+                                all_delivered = False
+                                last_error = "unsafe image URL was blocked"
                                 continue
                             try:
                                 response = await http_client.get(image_url)
@@ -1490,15 +1762,11 @@ class SlackAdapter(BasePlatformAdapter):
                                     "[Slack] Download failed for %s: %s",
                                     safe_url_for_log(image_url), dl_err,
                                 )
+                                all_delivered = False
+                                last_error = str(dl_err)
                                 continue
 
                 if not file_uploads:
-                    if initial_comment_parts:
-                        await self.send(
-                            chat_id,
-                            "\n".join(initial_comment_parts),
-                            metadata=metadata,
-                        )
                     continue
 
                 initial_comment = "\n".join(initial_comment_parts) if initial_comment_parts else ""
@@ -1521,7 +1789,21 @@ class SlackAdapter(BasePlatformAdapter):
                     chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback_result = await super().send_multiple_images(
+                    chat_id,
+                    chunk,
+                    metadata,
+                    human_delay=human_delay,
+                )
+                if not fallback_result.success:
+                    all_delivered = False
+                    last_error = str(
+                        fallback_result.error or "image upload fallback failed"
+                    )
+        return SendResult(
+            success=all_delivered,
+            error=None if all_delivered else (last_error or "an image was not delivered"),
+        )
 
     def _record_uploaded_file_thread(self, chat_id: str, thread_ts: Optional[str]) -> None:
         """Treat successful file uploads as bot participation in a thread."""
@@ -1703,6 +1985,18 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    async def discard_reply_requirement(self, event: MessageEvent) -> None:
+        """Clear lifecycle state for a Slack event that must stay silent."""
+        await super().discard_reply_requirement(event)
+        ts = getattr(event, "message_id", None)
+        if ts:
+            if ts in self._reacting_message_ids:
+                channel_id = getattr(event.source, "chat_id", None)
+                if channel_id:
+                    await self._remove_reaction(channel_id, ts, "eyes")
+            self._reacting_message_ids.discard(ts)
+            self._required_reply_message_ids.discard(ts)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
@@ -1716,20 +2010,56 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
-        if not self._reactions_enabled():
-            return
         ts = getattr(event, "message_id", None)
-        if not ts or ts not in self._reacting_message_ids:
+        if not ts:
+            return
+        was_reacting = ts in self._reacting_message_ids
+        required_reply = ts in self._required_reply_message_ids
+        if not was_reacting and not required_reply:
             return
         self._reacting_message_ids.discard(ts)
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes")
-        if outcome == ProcessingOutcome.SUCCESS:
+        reactions_enabled = self._reactions_enabled()
+        if reactions_enabled and was_reacting:
+            await self._remove_reaction(channel_id, ts, "eyes")
+        failure_signaled = False
+        if reactions_enabled and outcome == ProcessingOutcome.SUCCESS and was_reacting:
             await self._add_reaction(channel_id, ts, "white_check_mark")
-        elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(channel_id, ts, "x")
+        elif reactions_enabled and outcome == ProcessingOutcome.FAILURE:
+            failure_signaled = await self._add_reaction(channel_id, ts, "x")
+        reply_terminally_delivered = (
+            event.delivery_state.reply_delivered
+            and not event.delivery_state.reply_failed
+        )
+        terminal_signal_delivered = (
+            outcome in {ProcessingOutcome.SUCCESS, ProcessingOutcome.CANCELLED}
+            or failure_signaled
+            or reply_terminally_delivered
+            or event.delivery_state.failure_notice_delivered
+        )
+        if (
+            outcome == ProcessingOutcome.FAILURE
+            and required_reply
+            and not failure_signaled
+            and not reply_terminally_delivered
+            and not event.delivery_state.failure_notice_delivered
+        ):
+            fallback_result = await self._send_with_retry(
+                chat_id=channel_id,
+                content="⚠️ I could not complete this request. Please try again.",
+                reply_to=ts,
+                metadata={"thread_id": event.source.thread_id or ts},
+            )
+            terminal_signal_delivered = bool(fallback_result.success)
+        if not terminal_signal_delivered:
+            logger.error(
+                "[Slack] Exhausted terminal reply delivery for message %s in channel %s",
+                ts,
+                channel_id,
+            )
+        self._required_reply_message_ids.discard(ts)
 
     # ----- User identity resolution -----
 
@@ -1775,7 +2105,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             return await self._upload_file(chat_id, image_path, caption, reply_to, metadata)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Image file not found: {image_path}")
+            return SendResult(
+                success=False,
+                error=f"Image file not found: {os.path.basename(image_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1786,10 +2119,10 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            text = f"🖼️ Image: {image_path}"
-            if caption:
-                text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            return SendResult(
+                success=False,
+                error=f"Slack image upload failed ({type(e).__name__}).",
+            )
 
     async def send_image(
         self,
@@ -1869,7 +2202,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             return await self._upload_file(chat_id, audio_path, caption, reply_to, metadata)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+            return SendResult(
+                success=False,
+                error=f"Audio file not found: {os.path.basename(audio_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1879,7 +2215,10 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return SendResult(success=False, error=str(e))
+            return SendResult(
+                success=False,
+                error=f"Slack audio upload failed ({type(e).__name__}).",
+            )
 
     async def send_video(
         self,
@@ -1896,7 +2235,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             video_path, video_bytes = self._prepare_local_upload(video_path)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"Video file not found: {video_path}")
+            return SendResult(
+                success=False,
+                error=f"Video file not found: {os.path.basename(video_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
 
@@ -1937,10 +2279,10 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            text = f"🎬 Video: {video_path}"
-            if caption:
-                text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            return SendResult(
+                success=False,
+                error=f"Slack video upload failed ({type(e).__name__}).",
+            )
 
     async def send_document(
         self,
@@ -1958,7 +2300,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             file_path, file_bytes = self._prepare_local_upload(file_path)
         except FileNotFoundError:
-            return SendResult(success=False, error=f"File not found: {file_path}")
+            return SendResult(
+                success=False,
+                error=f"File not found: {os.path.basename(file_path)}",
+            )
         except _SlackUploadPolicyError as exc:
             return SendResult(success=False, error=str(exc))
 
@@ -2085,10 +2430,15 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return SendResult(
-                success=False,
-                error=f"Slack document upload failed: {e}",
+            error_detail = str(e)
+            safe_verification_errors = (
+                "Slack upload response did not include a file ID",
+                "Slack confirmed the wrong file type",
+                "Slack accepted the upload but its file metadata could not be verified",
             )
+            if not error_detail.startswith(safe_verification_errors):
+                error_detail = f"Slack document upload failed ({type(e).__name__})."
+            return SendResult(success=False, error=error_detail)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""
@@ -2536,6 +2886,12 @@ class SlackAdapter(BasePlatformAdapter):
 
             mimetype = f.get("mimetype", "unknown")
             url = f.get("url_private_download") or f.get("url_private", "")
+            if not url:
+                attachment_notices.append(
+                    "Slack attachment "
+                    f"{f.get('name') or f.get('id') or 'unknown'} has no authorized download URL."
+                )
+                continue
             if mimetype.startswith("image/") and url:
                 try:
                     ext = "." + mimetype.split("/")[-1].split(";")[0]
@@ -2567,6 +2923,11 @@ class SlackAdapter(BasePlatformAdapter):
                         logger.warning("[Slack] %s", detail)
                     else:
                         logger.warning("[Slack] Failed to cache audio from %s: %s", url, e, exc_info=True)
+            elif mimetype.startswith("video/"):
+                attachment_notices.append(
+                    "Slack video attachment "
+                    f"{f.get('name') or f.get('id') or 'unknown'} is not supported."
+                )
             elif (
                 (url and not mimetype.startswith(("image/", "audio/", "video/")))
                 or mimetype in SUPPORTED_DOCUMENT_TYPES.values()
@@ -2730,7 +3091,13 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            platform_team_id=team_id or None,
+            # Every Slack message that passes the admission rules represents
+            # a user turn that requires a visible answer. This includes
+            # unmentioned follow-ups in an active or previously mentioned thread.
+            expects_reply=True,
         )
+        self._required_reply_message_ids.add(ts)
 
         # Only react when bot is directly addressed (DM or @mention).
         # In listen-all channels (require_mention=false), reacting to every
@@ -2747,6 +3114,7 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """Send a Block Kit approval prompt with interactive buttons.
 
@@ -2760,6 +3128,12 @@ class SlackAdapter(BasePlatformAdapter):
             cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
             thread_ts = self._resolve_thread_ts(None, metadata)
 
+            button_value = session_key
+            if approval_id:
+                button_value = json.dumps(
+                    {"session_key": session_key, "approval_id": approval_id},
+                    separators=(",", ":"),
+                )
             blocks = [
                 {
                     "type": "section",
@@ -2780,26 +3154,26 @@ class SlackAdapter(BasePlatformAdapter):
                             "text": {"type": "plain_text", "text": "Allow Once"},
                             "style": "primary",
                             "action_id": "hermes_approve_once",
-                            "value": session_key,
+                            "value": button_value,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Allow Session"},
                             "action_id": "hermes_approve_session",
-                            "value": session_key,
+                            "value": button_value,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Always Allow"},
                             "action_id": "hermes_approve_always",
-                            "value": session_key,
+                            "value": button_value,
                         },
                         {
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Deny"},
                             "style": "danger",
                             "action_id": "hermes_deny",
-                            "value": session_key,
+                            "value": button_value,
                         },
                     ],
                 },
@@ -2816,7 +3190,7 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self._get_client(chat_id).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
-                self._approval_resolved[msg_ts] = False
+                self._approval_resolved[msg_ts] = "pending"
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
@@ -2832,6 +3206,12 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            slash_ctx = self._peek_slash_context(chat_id)
+            if not slash_ctx:
+                return SendResult(
+                    success=False,
+                    error="No verified private slash context",
+                )
             body = message[:2900] + "..." if len(message) > 2900 else message
             thread_ts = self._resolve_thread_ts(None, metadata)
             # Encode session_key and confirm_id into the button value so the
@@ -2875,14 +3255,30 @@ class SlackAdapter(BasePlatformAdapter):
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
+                "user": str(slash_ctx.get("user_id") or ""),
                 "text": f"{title or 'Confirm'}: {body[:100]}",
                 "blocks": blocks,
             }
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
-            return SendResult(success=True, message_id=result.get("ts", ""), raw_response=result)
+            result = await self._get_client(chat_id).chat_postEphemeral(**kwargs)
+            msg_ts = result.get("message_ts") or result.get("ts", "")
+            now = time.monotonic()
+            stale_owner_keys = [
+                key
+                for key, owner in self._slash_confirm_owners.items()
+                if now - float(owner.get("created_at", 0)) > self._SLASH_CTX_TTL
+            ]
+            for key in stale_owner_keys:
+                self._slash_confirm_owners.pop(key, None)
+            while len(self._slash_confirm_owners) >= 256:
+                self._slash_confirm_owners.pop(next(iter(self._slash_confirm_owners)))
+            self._slash_confirm_owners[(session_key, confirm_id)] = {
+                "user_id": str(slash_ctx.get("user_id") or ""),
+                "created_at": now,
+            }
+            return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
@@ -2894,12 +3290,12 @@ class SlackAdapter(BasePlatformAdapter):
         action_id = action.get("action_id", "")
         value = action.get("value", "")
         message = body.get("message", {})
-        msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        # Authorization — reuse the exec-approval allowlist.
+        # Authorization — require both the allowlist and the exact initiating
+        # user. Another allowed channel member cannot approve this session.
         allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
         if allowed_csv:
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
@@ -2915,6 +3311,90 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Malformed slash-confirm value: %s", value)
             return
         session_key, confirm_id = value.split("|", 1)
+        owner = self._slash_confirm_owners.get((session_key, confirm_id))
+        if owner is None and (session_key, confirm_id) in self._slash_confirm_outcomes:
+            logger.info(
+                "[Slack] Ignoring already-resolved slash-confirm for session %s",
+                session_key,
+            )
+            return
+        owner_created_at = owner.get("created_at") if owner else None
+        if owner and owner.get("claimed"):
+            logger.info(
+                "[Slack] Duplicate slash-confirm click for session %s",
+                session_key,
+            )
+            return
+        owner_expired = bool(
+            owner
+            and owner_created_at is not None
+            and time.monotonic() - float(owner_created_at) > self._SLASH_CTX_TTL
+        )
+        if not owner or owner_expired or user_id != owner.get("user_id"):
+            if owner_expired:
+                self._slash_confirm_owners.pop((session_key, confirm_id), None)
+            logger.warning(
+                "[Slack] Slash-confirm actor mismatch for session %s: %s",
+                session_key,
+                user_id,
+            )
+            stale_text = "⚠️ This confirmation expired or is no longer active. Run the command again."
+            delivered = False
+            response_url = str(body.get("response_url") or "")
+            if response_url:
+                try:
+                    async with aiohttp.ClientSession(trust_env=True) as session:
+                        response = await session.post(
+                            response_url,
+                            json={
+                                "response_type": "ephemeral",
+                                "replace_original": True,
+                                "text": stale_text,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                        delivered = response.status == 200
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Failed to update stale slash-confirm: %s",
+                        exc,
+                    )
+            team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "")
+            if not delivered and channel_id and user_id:
+                try:
+                    result = await self.send_private_notice(
+                        chat_id=channel_id,
+                        user_id=user_id,
+                        content=stale_text,
+                        reply_to=message.get("thread_ts") or None,
+                        metadata={"team_id": team_id} if team_id else None,
+                    )
+                    delivered = result.success
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Failed to send stale slash-confirm notice: %s",
+                        exc,
+                    )
+            self._record_slash_confirm_outcome(
+                session_key,
+                confirm_id,
+                "expired_notified" if delivered else "expired_undelivered",
+                pending_notice=(
+                    None
+                    if delivered
+                    else {
+                        "chat_id": channel_id,
+                        "user_id": user_id,
+                        "team_id": team_id,
+                        "thread_id": message.get("thread_ts") or None,
+                        "content": stale_text,
+                    }
+                ),
+            )
+            return
+        # Claim this prompt before the first await below. This prevents two
+        # concurrent button deliveries from resolving the same confirmation.
+        owner["claimed"] = True
 
         choice_map = {
             "hermes_confirm_once": "once",
@@ -2923,13 +3403,6 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "cancel")
 
-        label_map = {
-            "once": f"✅ Approved once by {user_name}",
-            "always": f"🔒 Always approved by {user_name}",
-            "cancel": f"❌ Cancelled by {user_name}",
-        }
-        decision_text = label_map.get(choice, f"Resolved by {user_name}")
-
         # Pull original prompt body out of the section block so we can show
         # the decision inline without losing context.
         original_text = ""
@@ -2937,6 +3410,27 @@ class SlackAdapter(BasePlatformAdapter):
             if block.get("type") == "section":
                 original_text = block.get("text", {}).get("text", "")
                 break
+
+        # Resolve before rendering approval. A stale or failed confirmation
+        # must never display a successful decision.
+        try:
+            from tools import slash_confirm as _slash_confirm_mod
+            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
+        except Exception as exc:
+            logger.error("Failed to resolve slash-confirm from Slack button: %s", exc, exc_info=True)
+            result_text = f"❌ Confirmation failed: {exc}"
+
+        if result_text is None:
+            decision_text = "⚠️ This confirmation expired or was superseded."
+        elif result_text.startswith("❌ Error") or result_text.startswith("❌ Confirmation failed"):
+            decision_text = f"❌ Confirmation failed for {user_name}"
+        else:
+            label_map = {
+                "once": f"✅ Approved once by {user_name}",
+                "always": f"🔒 Always approved by {user_name}",
+                "cancel": f"❌ Cancelled by {user_name}",
+            }
+            decision_text = label_map.get(choice, f"Resolved by {user_name}")
 
         updated_blocks = [
             {
@@ -2948,49 +3442,156 @@ class SlackAdapter(BasePlatformAdapter):
             },
             {
                 "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": decision_text},
-                ],
+                "elements": [{"type": "mrkdwn", "text": decision_text}],
             },
         ]
+        response_url = str(body.get("response_url") or "")
+        update_delivered = False
+        if response_url:
+            try:
+                async with aiohttp.ClientSession(trust_env=True) as session:
+                    response = await session.post(
+                        response_url,
+                        json={
+                            "response_type": "ephemeral",
+                            "replace_original": True,
+                            "text": decision_text,
+                            "blocks": updated_blocks,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    )
+                    update_delivered = response.status == 200
+                    if not update_delivered:
+                        logger.warning(
+                            "[Slack] Private slash-confirm update returned %s",
+                            response.status,
+                        )
+            except Exception as exc:
+                logger.warning("[Slack] Failed to update private slash-confirm: %s", exc)
 
-        try:
-            await self._get_client(channel_id).chat_update(
-                channel=channel_id,
-                ts=msg_ts,
-                text=decision_text,
-                blocks=updated_blocks,
-            )
-        except Exception as e:
-            logger.warning("[Slack] Failed to update slash-confirm message: %s", e)
+        private_result = None
+        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "")
+        private_metadata = {"team_id": team_id} if team_id else None
+        if result_text:
+            for attempt in range(3):
+                try:
+                    private_result = await self.send_private_notice(
+                        chat_id=channel_id,
+                        user_id=user_id,
+                        content=result_text,
+                        reply_to=message.get("thread_ts") or None,
+                        metadata=private_metadata,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Private slash-confirm result failed: %s",
+                        exc,
+                    )
+                    private_result = SendResult(
+                        success=False,
+                        error=str(exc),
+                        retryable=True,
+                    )
+                if private_result.success:
+                    break
+                if not (
+                    private_result.retryable
+                    or self._is_retryable_error(private_result.error or "")
+                ):
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
 
-        # Resolve via the module-level primitive and post any follow-up.
-        try:
-            from tools import slash_confirm as _slash_confirm_mod
-            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
-            if result_text:
-                post_kwargs: Dict[str, Any] = {
-                    "channel": channel_id,
-                    "text": result_text,
-                }
-                # Inherit the thread so the reply stays in the same place.
-                thread_ts = message.get("thread_ts") or msg_ts
-                if thread_ts:
-                    post_kwargs["thread_ts"] = thread_ts
-                await self._get_client(channel_id).chat_postMessage(**post_kwargs)
-            logger.info(
-                "Slack button resolved slash-confirm for session %s (choice=%s, user=%s)",
-                session_key, choice, user_name,
+        result_delivered = bool(private_result and private_result.success)
+        terminal_delivered = result_delivered or (not result_text and update_delivered)
+        failure_notice_delivered = False
+        if not terminal_delivered:
+            failure_text = (
+                "⚠️ Confirmation was resolved, but its result could not be delivered. "
+                "Please run the command again."
             )
-        except Exception as exc:
-            logger.error("Failed to resolve slash-confirm from Slack button: %s", exc, exc_info=True)
+            if response_url:
+                try:
+                    async with aiohttp.ClientSession(trust_env=True) as session:
+                        response = await session.post(
+                            response_url,
+                            json={
+                                "response_type": "ephemeral",
+                                "replace_original": True,
+                                "text": failure_text,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                        failure_notice_delivered = response.status == 200
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Failed to update private slash-confirm failure: %s",
+                        exc,
+                    )
+            if not failure_notice_delivered:
+                try:
+                    notice_result = await self.send_private_notice(
+                        chat_id=channel_id,
+                        user_id=user_id,
+                        content=failure_text,
+                        reply_to=message.get("thread_ts") or None,
+                        metadata=private_metadata,
+                    )
+                    failure_notice_delivered = notice_result.success
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] Private slash-confirm failure notice failed: %s",
+                        exc,
+                    )
+
+        outcome_key = (session_key, confirm_id)
+        outcome_status = (
+            "delivered"
+            if terminal_delivered
+            else "delivery_failed_notified"
+            if failure_notice_delivered
+            else "delivery_failed"
+        )
+        pending_notice = None
+        if outcome_status == "delivery_failed":
+            pending_notice = {
+                "chat_id": channel_id,
+                "user_id": user_id,
+                "team_id": team_id,
+                "thread_id": message.get("thread_ts") or None,
+                "content": result_text or failure_text,
+            }
+        self._record_slash_confirm_outcome(
+            session_key,
+            confirm_id,
+            outcome_status,
+            pending_notice=pending_notice,
+        )
+        self._slash_confirm_owners.pop((session_key, confirm_id), None)
+        logger.info(
+            "Slack button resolved slash-confirm for session %s "
+            "(choice=%s, user=%s, status=%s)",
+            session_key,
+            choice,
+            user_name,
+            self._slash_confirm_outcomes[outcome_key]["status"],
+        )
 
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
         await ack()
 
         action_id = action.get("action_id", "")
-        session_key = action.get("value", "")
+        action_value = action.get("value", "")
+        session_key = action_value
+        approval_id = None
+        try:
+            decoded_value = json.loads(action_value)
+            if isinstance(decoded_value, dict):
+                session_key = str(decoded_value.get("session_key") or "")
+                approval_id = str(decoded_value.get("approval_id") or "") or None
+        except (TypeError, ValueError):
+            pass
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
@@ -3019,9 +3620,73 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "deny")
 
-        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default)
-        if self._approval_resolved.pop(msg_ts, True):
+        async def _send_expired_notice() -> None:
+            stale_text = (
+                "⚠️ This approval request expired or is no longer active. "
+                "Run the command again to request a new approval."
+            )
+            team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "")
+            metadata = {"team_id": team_id} if team_id else {}
+            thread_ts = message.get("thread_ts")
+            if thread_ts:
+                metadata["thread_id"] = thread_ts
+            try:
+                stale_result = await self.send_private_notice(
+                    chat_id=channel_id,
+                    user_id=user_id,
+                    content=stale_text,
+                    reply_to=thread_ts or None,
+                    metadata=metadata or None,
+                )
+            except Exception:
+                stale_result = SendResult(success=False, error="stale notice failed")
+            if not stale_result.success:
+                self.persist_private_notice_retry(
+                    channel_id,
+                    user_id,
+                    stale_text,
+                    metadata or None,
+                )
+
+        # Prevent double-clicks. Missing state means the gateway restarted or
+        # the prompt expired, so tell the clicker instead of acknowledging
+        # silently.
+        approval_state = self._approval_resolved.get(msg_ts)
+        if approval_state is None:
+            await _send_expired_notice()
             return
+        if approval_state in {"claimed", "resolved"}:
+            return
+        self._approval_resolved[msg_ts] = "claimed"
+
+        # Resolve before publishing the decision. A zero count means the
+        # underlying request expired, so an Approved label would be false.
+        try:
+            from tools.approval import resolve_gateway_approval
+            if approval_id:
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    approval_id=approval_id,
+                )
+            else:
+                count = resolve_gateway_approval(session_key, choice)
+        except Exception as exc:
+            logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
+            self._approval_resolved.pop(msg_ts, None)
+            await _send_expired_notice()
+            return
+        if count <= 0:
+            logger.warning(
+                "Slack approval was no longer active for session %s (choice=%s, user=%s)",
+                session_key,
+                choice,
+                user_name,
+            )
+            self._approval_resolved.pop(msg_ts, None)
+            await _send_expired_notice()
+            return
+        self._approval_resolved[msg_ts] = "resolved"
 
         # Update the message to show the decision and remove buttons
         label_map = {
@@ -3065,18 +3730,13 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
 
-        # Resolve the approval — this unblocks the agent thread
-        try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
-            logger.info(
-                "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                count, session_key, choice, user_name,
-            )
-        except Exception as exc:
-            logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
+        logger.info(
+            "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+            count, session_key, choice, user_name,
+        )
 
-        # (approval state already consumed by atomic pop above)
+        # Keep the resolved state so concurrent or redelivered clicks remain
+        # distinguishable from prompts lost across a process restart.
 
     # ----- Thread context fetching -----
 
@@ -3460,11 +4120,17 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
         )
 
+        response_url = command.get("response_url", "")
         event = MessageEvent(
             text=text,
             message_type=MessageType.COMMAND if text.startswith("/") else MessageType.TEXT,
             source=source,
             raw_message=command,
+            expects_reply=bool(response_url and text.startswith("/")),
+            private_reply_user_id=(
+                user_id if response_url and text.startswith("/") else None
+            ),
+            platform_team_id=team_id or None,
         )
 
         # Stash the Slack response_url so the first reply for this
@@ -3473,19 +4139,24 @@ class SlackAdapter(BasePlatformAdapter):
         # Only stash for COMMAND events (text starts with "/") — free-form
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
-        response_url = command.get("response_url", "")
+        invocation_id = os.urandom(12).hex()
         if response_url and user_id and channel_id and text.startswith("/"):
-            self._slash_command_contexts[(channel_id, user_id)] = {
+            self._slash_command_contexts[(channel_id, user_id, invocation_id)] = {
                 "response_url": response_url,
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "invocation_id": invocation_id,
                 "ts": time.monotonic(),
             }
 
         # Set the ContextVar so send() can match the correct stashed
         # response_url even when multiple users slash concurrently.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
+        _slash_invocation_token = _slash_invocation_id.set(invocation_id)
         try:
             await self.handle_message(event)
         finally:
+            _slash_invocation_id.reset(_slash_invocation_token)
             _slash_user_id.reset(_slash_user_id_token)
 
     def _has_active_session_for_thread(

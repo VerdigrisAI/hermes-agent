@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
@@ -80,19 +80,43 @@ class TestBaseDefaultLoop:
             ("file:///tmp/foo.png", "local"),
             ("https://x.com/c.gif", ""),
         ]
-        _run(a.send_multiple_images("chat1", images))
+        result = _run(a.send_multiple_images("chat1", images))
         # 2 URL images + 1 animation + 1 local file
         assert len(a.sent_images) == 2
         assert len(a.sent_animations) == 1
         assert len(a.sent_files) == 1
         assert a.sent_files[0][1] == "/tmp/foo.png"
+        assert result.success is True
 
     def test_empty_batch_is_noop(self):
         a = _StubAdapter()
-        _run(a.send_multiple_images("chat1", []))
+        result = _run(a.send_multiple_images("chat1", []))
         assert a.sent_images == []
         assert a.sent_animations == []
         assert a.sent_files == []
+        assert result.success is False
+
+    def test_one_failed_image_makes_batch_fail(self):
+        a = _StubAdapter()
+        a.send_image = AsyncMock(
+            side_effect=[
+                SendResult(success=True, message_id="one"),
+                SendResult(success=False, error="upload failed"),
+            ]
+        )
+
+        result = _run(
+            a.send_multiple_images(
+                "chat1",
+                [
+                    ("https://x.com/a.png", "first"),
+                    ("https://x.com/b.png", "second"),
+                ],
+            )
+        )
+
+        assert result.success is False
+        assert result.error == "upload failed"
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +159,13 @@ class TestTelegramMultiImage:
         # Make InputMediaPhoto a concrete class that records its args
         telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media, "caption": caption})
 
-        _run(adapter.send_multiple_images("12345", images))
+        result = _run(adapter.send_multiple_images("12345", images))
 
         adapter._bot.send_media_group.assert_awaited_once()
         call_kwargs = adapter._bot.send_media_group.call_args.kwargs
         assert call_kwargs["chat_id"] == 12345
         assert len(call_kwargs["media"]) == 3
+        assert result.success is True
 
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""
@@ -153,6 +178,25 @@ class TestTelegramMultiImage:
         assert adapter._bot.send_media_group.await_count == 2
         sizes = [len(c.kwargs["media"]) for c in adapter._bot.send_media_group.await_args_list]
         assert sizes == [10, 5]
+
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        import telegram
+
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption}
+        )
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+
+        result = _run(
+            adapter.send_multiple_images(
+                "12345",
+                [(f"file://{valid}", "valid"), (f"file://{tmp_path}/missing.png", "missing")],
+            )
+        )
+
+        assert result.success is False
+        adapter._bot.send_media_group.assert_awaited_once()
 
     def test_animations_routed_to_send_animation(self, adapter):
         """GIFs are peeled off and sent individually via send_animation."""
@@ -236,10 +280,11 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=False)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("67890", images))
+        result = _run(adapter.send_multiple_images("67890", images))
 
         mock_channel.send.assert_awaited_once()
         assert len(mock_channel.send.call_args.kwargs["files"]) == 3
+        assert result.success is True
 
     def test_batch_over_10_chunks_into_two_messages(self, adapter, tmp_path):
         """15 local images → two channel.send calls (10 + 5)."""
@@ -261,6 +306,24 @@ class TestDiscordMultiImage:
         sizes = [len(c.kwargs["files"]) for c in mock_channel.send.await_args_list]
         assert sizes == [10, 5]
 
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        result = _run(
+            adapter.send_multiple_images(
+                "67890",
+                [(f"file://{valid}", "valid"), (f"file://{tmp_path}/missing.png", "missing")],
+            )
+        )
+
+        assert result.success is False
+        mock_channel.send.assert_awaited_once()
+
     def test_empty_noop(self, adapter):
         adapter._client = MagicMock()
         _run(adapter.send_multiple_images("67890", []))
@@ -271,9 +334,17 @@ class TestDiscordMultiImage:
 # ---------------------------------------------------------------------------
 
 
+_slack_mocked_modules = []
+
+
 def _ensure_slack_mock():
-    if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
+    try:
+        __import__("slack_bolt")
+        __import__("slack_sdk")
         return
+    except ImportError:
+        pass
+
     slack_mod = MagicMock()
     for name in (
         "slack_bolt", "slack_bolt.app", "slack_bolt.app.async_app",
@@ -282,12 +353,21 @@ def _ensure_slack_mock():
         "slack_sdk", "slack_sdk.web", "slack_sdk.web.async_client",
         "slack_sdk.errors",
     ):
-        sys.modules.setdefault(name, slack_mod)
+        if name not in sys.modules:
+            sys.modules[name] = slack_mod
+            _slack_mocked_modules.append(name)
 
 
 _ensure_slack_mock()
 
 from gateway.platforms.slack import SlackAdapter  # noqa: E402
+
+# Keep the class reference for these tests, but do not leak fake dependencies
+# or the resulting adapter module into tests collected later in the process.
+if _slack_mocked_modules:
+    for _module_name in _slack_mocked_modules:
+        sys.modules.pop(_module_name, None)
+    sys.modules.pop("gateway.platforms.slack", None)
 
 
 class TestSlackMultiImage:
@@ -314,10 +394,11 @@ class TestSlackMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("C12345", images))
+        result = _run(adapter.send_multiple_images("C12345", images))
 
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_awaited_once()
+        assert result.success is True
         kwargs = client.files_upload_v2.await_args.kwargs
         assert len(kwargs["file_uploads"]) == 3
 
@@ -336,21 +417,49 @@ class TestSlackMultiImage:
         sizes = [len(c.kwargs["file_uploads"]) for c in client.files_upload_v2.await_args_list]
         assert sizes == [10, 2]
 
+    def test_partial_chunk_failure_returns_failure(self, adapter, tmp_path):
+        paths = []
+        for i in range(12):
+            path = tmp_path / f"partial_{i}.png"
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 5)
+            paths.append(path)
+        client = adapter._get_client("C12345")
+        client.files_upload_v2.side_effect = [
+            {"ok": True},
+            RuntimeError("second chunk failed"),
+        ]
+
+        with patch.object(
+            BasePlatformAdapter,
+            "send_multiple_images",
+            new=AsyncMock(
+                return_value=SendResult(success=False, error="fallback failed")
+            ),
+        ):
+            result = _run(
+                adapter.send_multiple_images(
+                    "C12345",
+                    [(f"file://{path}", "") for path in paths],
+                )
+            )
+
+        assert result.success is False
+        assert result.error == "fallback failed"
+
     def test_empty_noop(self, adapter):
         _run(adapter.send_multiple_images("C12345", []))
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_not_called()
 
     def test_all_policy_denied_images_emit_visible_notice(self, adapter):
-        _run(adapter.send_multiple_images(
+        result = _run(adapter.send_multiple_images(
             "C12345", [("file:///etc/hosts", "requested image")]
         ))
 
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_not_called()
-        adapter.send.assert_awaited_once()
-        notice = adapter.send.await_args.args[1]
-        assert "failed the Slack artifact policy" in notice
+        adapter.send.assert_not_awaited()
+        assert result.success is False
 
 
 # ---------------------------------------------------------------------------
@@ -384,13 +493,14 @@ class TestMattermostMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("channel123", images))
+        result = _run(adapter.send_multiple_images("channel123", images))
 
         assert adapter._upload_file.await_count == 3
         adapter._api_post.assert_awaited_once()
         payload = adapter._api_post.await_args.args[1]
         assert payload["channel_id"] == "channel123"
         assert len(payload["file_ids"]) == 3
+        assert result.success is True
 
     def test_batch_over_5_chunks(self, adapter, tmp_path):
         """7 images → 2 posts (5 + 2)."""
@@ -406,6 +516,20 @@ class TestMattermostMultiImage:
         assert adapter._api_post.await_count == 2
         sizes = [len(c.args[1]["file_ids"]) for c in adapter._api_post.await_args_list]
         assert sizes == [5, 2]
+
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+
+        result = _run(
+            adapter.send_multiple_images(
+                "channel123",
+                [(f"file://{valid}", "valid"), (f"file://{tmp_path}/missing.png", "missing")],
+            )
+        )
+
+        assert result.success is False
+        adapter._api_post.assert_awaited_once()
 
     def test_empty_noop(self, adapter):
         _run(adapter.send_multiple_images("channel123", []))
@@ -429,6 +553,7 @@ class TestEmailMultiImage:
         a._smtp_host = "smtp.example.com"
         a._smtp_port = 587
         a._thread_context = {}
+        a.platform = Platform.EMAIL
         return a
 
     def test_local_files_attached_in_single_email(self, adapter, tmp_path):
@@ -444,13 +569,14 @@ class TestEmailMultiImage:
         with patch.object(
             adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
         ) as mock_send:
-            _run(adapter.send_multiple_images("user@example.com", images))
+            result = _run(adapter.send_multiple_images("user@example.com", images))
 
         mock_send.assert_called_once()
         to_addr, body, file_paths = mock_send.call_args.args
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
+        assert result.success is True
 
     def test_remote_urls_linked_in_body(self, adapter, tmp_path):
         """Remote URL images get their URL appended to the body, no attachment."""
@@ -468,6 +594,72 @@ class TestEmailMultiImage:
         assert file_paths == []
         assert "https://x.com/a.png" in body
         assert "https://x.com/b.png" in body
+
+    def test_missing_local_image_makes_partial_batch_fail(self, adapter, tmp_path):
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"image")
+        images = [
+            (f"file://{valid}", "valid"),
+            (f"file://{tmp_path}/missing.png", "missing"),
+        ]
+        with patch.object(
+            adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
+        ):
+            result = _run(adapter.send_multiple_images("user@example.com", images))
+
+        assert result.success is False
+
+    def test_attachment_read_failure_uses_per_image_fallback(self, adapter, tmp_path):
+        import builtins
+
+        image = tmp_path / "unreadable.png"
+        image.write_bytes(b"image")
+        adapter.send_image_file = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
+
+        real_open = builtins.open
+
+        def fail_image_read(path, *args, **kwargs):
+            if os.fspath(path) == os.fspath(image):
+                raise OSError("read failed")
+            return real_open(path, *args, **kwargs)
+
+        with (
+            patch("builtins.open", side_effect=fail_image_read),
+            patch("gateway.platforms.email.smtplib.SMTP"),
+        ):
+            result = _run(
+                adapter.send_multiple_images(
+                    "user@example.com",
+                    [(f"file://{image}", "image")],
+                )
+            )
+
+        assert result.success is True
+        adapter.send_image_file.assert_awaited_once()
+
+    def test_local_image_fallback_uses_attachment_sender(self, adapter):
+        adapter.send_document = AsyncMock(
+            return_value=SendResult(success=True, message_id="attachment")
+        )
+
+        result = _run(
+            adapter.send_image_file(
+                "user@example.com",
+                "/tmp/chart.png",
+                caption="chart",
+            )
+        )
+
+        assert result.success is True
+        adapter.send_document.assert_awaited_once_with(
+            chat_id="user@example.com",
+            file_path="/tmp/chart.png",
+            caption="chart",
+            reply_to=None,
+            metadata=None,
+        )
 
     def test_empty_noop(self, adapter):
         with patch.object(

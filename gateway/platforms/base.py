@@ -59,12 +59,13 @@ async def report_media_delivery_failure(
     file_path: str,
     metadata: dict | None,
     detail: str,
-) -> None:
+    display_name: str | None = None,
+) -> bool:
     """Log a structured artifact failure and make it visible to the user."""
     from agent.redact import redact_sensitive_text
 
     correlation_id = media_delivery_correlation_id(file_path)
-    filename = Path(file_path).name or "generated artifact"
+    filename = display_name or Path(file_path).name or "generated artifact"
     safe_detail = redact_sensitive_text(str(detail or "upload failed"), force=True)
     safe_detail = " ".join(safe_detail.split())[:300]
     logger.error(
@@ -78,14 +79,32 @@ async def report_media_delivery_failure(
         safe_detail,
     )
     try:
-        await adapter.send(
-            chat_id=chat_id,
-            content=(
+        send_kwargs = {
+            "chat_id": chat_id,
+            "content": (
                 f"⚠️ I created `{filename}`, but it was not attached: "
                 f"{safe_detail} (reference `{correlation_id}`)."
             ),
-            metadata=metadata,
+            "metadata": metadata,
+        }
+        send_with_retry = getattr(adapter, "_send_with_retry", None)
+        result = (
+            await send_with_retry(**send_kwargs)
+            if callable(send_with_retry)
+            else await adapter.send(**send_kwargs)
         )
+        delivered = bool(
+            getattr(result, "success", False)
+            or getattr(result, "failure_notice_delivered", False)
+        )
+        if not delivered:
+            logger.error(
+                "artifact_delivery correlation_id=%s stage=user_notice "
+                "success=false detail=%s",
+                correlation_id,
+                getattr(result, "error", None) or "notice returned no success confirmation",
+            )
+        return delivered
     except Exception as notice_error:
         logger.error(
             "artifact_delivery correlation_id=%s stage=user_notice "
@@ -93,6 +112,7 @@ async def report_media_delivery_failure(
             correlation_id,
             notice_error,
         )
+        return False
 
 
 def _platform_name(platform) -> str:
@@ -147,6 +167,21 @@ def _reply_anchor_for_event(event) -> str | None:
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
+
+
+def _delivery_metadata_for_event(event: "MessageEvent") -> dict | None:
+    """Build thread and private-route metadata for one admitted event."""
+    metadata = _thread_metadata_for_source(
+        event.source,
+        _reply_anchor_for_event(event),
+    )
+    if event.private_reply_user_id or event.platform_team_id:
+        metadata = dict(metadata or {})
+        if event.private_reply_user_id:
+            metadata["private_reply_user_id"] = event.private_reply_user_id
+        if event.platform_team_id:
+            metadata["team_id"] = event.platform_team_id
+    return metadata or None
 
 
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
@@ -999,6 +1034,20 @@ class ProcessingOutcome(Enum):
 
 
 @dataclass
+class MessageDeliveryState:
+    """Delivery evidence shared across copies of one inbound event."""
+
+    reply_delivered: bool = False
+    reply_attempted: bool = False
+    reply_failed: bool = False
+    failure_notice_delivered: bool = False
+    merged_events: List[Any] = field(default_factory=list)
+    completion_events: List[Any] = field(default_factory=list)
+    final_response_events: List[Any] = field(default_factory=list)
+    completion_deferred: bool = False
+
+
+@dataclass
 class MessageEvent:
     """
     Incoming message from a platform.
@@ -1051,6 +1100,25 @@ class MessageEvent:
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
+
+    # True when the platform admitted a message that requires a visible reply.
+    # An empty handler result is a failure for these events, even though it can
+    # be normal when streaming or queue handling owns delivery elsewhere.
+    expects_reply: bool = False
+
+    # Verified private-delivery identity captured when the platform admits the
+    # event. This survives asynchronous work after transient adapter context is
+    # consumed by the first text reply.
+    private_reply_user_id: Optional[str] = None
+
+    # Stable workspace identity for platforms that can connect more than one
+    # workspace through one adapter.
+    platform_team_id: Optional[str] = None
+
+    # Streaming and preview delivery happen inside the gateway handler, outside
+    # this adapter's normal send path.  Keep explicit evidence on a shared
+    # object so dataclasses.replace() preserves it across rewritten events.
+    delivery_state: MessageDeliveryState = field(default_factory=MessageDeliveryState)
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -1127,6 +1195,10 @@ class SendResult:
     error: Optional[str] = None
     raw_response: Any = None
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # True only when the requested payload failed but a user-visible failure
+    # notice reached the destination.  This remains a failed delivery while
+    # preventing lifecycle hooks from sending a duplicate terminal notice.
+    failure_notice_delivered: bool = False
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
     # ``message_id`` is the LAST visible message id (so subsequent edits target
@@ -1195,6 +1267,11 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        # A merged event must retain the strongest reply contract. Otherwise,
+        # a later optional fragment can hide an earlier direct mention or DM.
+        existing.expects_reply = existing.expects_reply or event.expects_reply
+        existing.delivery_state.merged_events.append(event)
+        existing.delivery_state.merged_events.extend(event.delivery_state.merged_events)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -1358,6 +1435,10 @@ class BasePlatformAdapter(ABC):
     - Sending messages/responses
     - Handling media
     """
+
+    async def discard_reply_requirement(self, event: MessageEvent) -> None:
+        """Mark an admitted event as intentionally silent."""
+        event.expects_reply = False
     
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
@@ -1379,6 +1460,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._active_message_events: Dict[str, MessageEvent] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -1912,6 +1994,46 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    def private_reply_user_id(self, chat_id: str) -> Optional[str]:
+        """Return the verified private-reply user for the active invocation."""
+        return None
+
+    async def retry_pending_private_notices(self) -> int:
+        """Retry durable private notices after the adapter reconnects."""
+        return 0
+
+    def persist_private_notice_retry(
+        self,
+        chat_id: str,
+        user_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist a private notice for later delivery when supported."""
+        return False
+
+    def persist_delivery_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Persist an exhausted delivery for a later adapter retry."""
+        private_user_id = str((metadata or {}).get("private_reply_user_id") or "")
+        if not private_user_id:
+            return False
+        retry_metadata = dict(metadata or {})
+        retry_metadata.pop("private_reply_user_id", None)
+        if reply_to and "thread_id" not in retry_metadata:
+            retry_metadata["thread_id"] = reply_to
+        return self.persist_private_notice_retry(
+            chat_id,
+            private_user_id,
+            content,
+            retry_metadata or None,
+        )
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
@@ -1935,7 +2057,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -1950,6 +2072,8 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        all_delivered = bool(images)
+        last_error: Optional[str] = None
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -1983,8 +2107,16 @@ class BasePlatformAdapter(ABC):
                     )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                    all_delivered = False
+                    last_error = str(img_result.error or "image upload failed")
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                all_delivered = False
+                last_error = str(img_err)
+        return SendResult(
+            success=all_delivered,
+            error=None if all_delivered else (last_error or "an image was not delivered"),
+        )
 
     async def send_image(
         self,
@@ -2588,6 +2720,7 @@ class BasePlatformAdapter(ABC):
         metadata: Any = None,
         max_retries: int = 2,
         base_delay: float = 2.0,
+        persist_failure: bool = True,
     ) -> "SendResult":
         """
         Send a message with automatic retry for transient network errors.
@@ -2597,6 +2730,23 @@ class BasePlatformAdapter(ABC):
         network errors, sends the user a brief delivery-failure notice so they
         know to retry rather than waiting indefinitely.
         """
+
+        def _persist_failure(retry_content: str = content) -> None:
+            if not persist_failure:
+                return
+            try:
+                self.persist_delivery_retry(
+                    chat_id,
+                    retry_content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            except Exception as persist_error:
+                logger.warning(
+                    "[%s] Could not persist failed delivery: %s",
+                    self.name,
+                    persist_error,
+                )
 
         result = await self.send(
             chat_id=chat_id,
@@ -2612,8 +2762,14 @@ class BasePlatformAdapter(ABC):
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been
-        # delivered) and not formatting errors — return the failure as-is.
+        # delivered) and not formatting errors. Persist a distinct uncertain
+        # notice instead of retrying the original payload and risking a
+        # duplicate.
         if not is_network and self._is_timeout_error(error_str):
+            _persist_failure(
+                "⚠️ Hermes could not confirm whether the previous response was "
+                "delivered. Please check the conversation before you retry."
+            )
             return result
 
         if is_network:
@@ -2645,9 +2801,18 @@ class BasePlatformAdapter(ABC):
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    notice_result = await self.send(
+                        chat_id=chat_id,
+                        content=notice,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                    if notice_result.success:
+                        result.failure_notice_delivered = True
+                        return result
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
+                _persist_failure()
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
@@ -2660,7 +2825,51 @@ class BasePlatformAdapter(ABC):
         )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
+            _persist_failure()
         return fallback_result
+
+    async def _send_terminal_error_notice(
+        self,
+        event: "MessageEvent",
+        error: Exception,
+    ) -> "SendResult":
+        """Send and persist a routed terminal error for an admitted event."""
+        error_type = type(error).__name__
+        error_detail = str(error)[:300] if str(error) else "no details available"
+        content = (
+            f"Sorry, I encountered an error ({error_type}).\n"
+            f"{error_detail}\n"
+            "Try again or use /reset to start a fresh session."
+        )
+        metadata = _delivery_metadata_for_event(event)
+        try:
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=content,
+                reply_to=_reply_anchor_for_event(event),
+                metadata=metadata,
+            )
+            return result or SendResult(success=False, error="no send result")
+        except Exception as send_error:
+            logger.warning(
+                "[%s] Could not send terminal error notice: %s",
+                self.name,
+                send_error,
+            )
+            try:
+                self.persist_delivery_retry(
+                    event.source.chat_id,
+                    content,
+                    reply_to=_reply_anchor_for_event(event),
+                    metadata=metadata,
+                )
+            except Exception as persist_error:
+                logger.warning(
+                    "[%s] Could not persist terminal error notice: %s",
+                    self.name,
+                    persist_error,
+                )
+            return SendResult(success=False, error=str(send_error))
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
@@ -2705,6 +2914,7 @@ class BasePlatformAdapter(ABC):
         if guard is not None and current_guard is not guard:
             return
         del self._active_sessions[session_key]
+        self._active_message_events.pop(session_key, None)
 
     def _session_task_is_stale(self, session_key: str) -> bool:
         """Return True if the owner task for ``session_key`` is done/cancelled.
@@ -2765,6 +2975,7 @@ class BasePlatformAdapter(ABC):
         """
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
+        self._active_message_events[session_key] = event
 
         task = asyncio.create_task(self._process_message_background(event, session_key))
         self._session_tasks[session_key] = task
@@ -2774,11 +2985,34 @@ class BasePlatformAdapter(ABC):
             # Tests stub create_task() with lightweight sentinels that are not
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
+            self._active_message_events.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+        return True
+
+    def defer_event_to_active_response(
+        self,
+        session_key: str,
+        event: MessageEvent,
+    ) -> bool:
+        """Attach an accepted input to the active turn's final reply."""
+        active_event = getattr(self, "_active_message_events", {}).get(session_key)
+        if active_event is None:
+            return False
+        state = active_event.delivery_state
+        if not state.final_response_events:
+            state.final_response_events.extend(
+                [active_event, *active_event.delivery_state.merged_events]
+            )
+        for deferred_event in [event, *event.delivery_state.merged_events]:
+            if all(existing is not deferred_event for existing in state.completion_events):
+                state.completion_events.append(deferred_event)
+            if all(existing is not deferred_event for existing in state.final_response_events):
+                state.final_response_events.append(deferred_event)
+        event.delivery_state.completion_deferred = True
         return True
 
     async def cancel_session_processing(
@@ -2853,7 +3087,7 @@ class BasePlatformAdapter(ABC):
         event: MessageEvent,
         session_key: str,
         cmd: str,
-    ) -> None:
+    ) -> bool:
         """Dispatch a reset-like bypass command while preserving guard ordering.
 
         /stop, /new, and /reset must:
@@ -2876,7 +3110,8 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
-        thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        thread_meta = _delivery_metadata_for_event(event)
+        delivered = not event.expects_reply
 
         try:
             response = await self._message_handler(event)
@@ -2887,6 +3122,7 @@ class BasePlatformAdapter(ABC):
             # after cancel_session_processing, which could silently drop the
             # "/new" confirmation when an agent was actively running.
             if _text:
+                event.delivery_state.reply_attempted = True
                 logger.info(
                     "[%s] Sending command '/%s' response (%d chars) to %s",
                     self.name,
@@ -2900,6 +3136,13 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=thread_meta,
                 )
+                delivered = bool(_r and _r.success)
+                if delivered:
+                    event.delivery_state.reply_delivered = True
+                else:
+                    event.delivery_state.reply_failed = True
+                if _r and getattr(_r, "failure_notice_delivered", False):
+                    event.delivery_state.failure_notice_delivered = True
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -2924,6 +3167,7 @@ class BasePlatformAdapter(ABC):
             raise
 
         await self._drain_pending_after_session_command(session_key, command_guard)
+        return delivered
 
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -2974,12 +3218,32 @@ class BasePlatformAdapter(ABC):
                 # cancellation + runner response + pending drain.
                 if cmd in {"stop", "new", "reset"}:
                     try:
-                        await self._dispatch_active_session_command(event, session_key, cmd)
+                        _delivered = await self._dispatch_active_session_command(
+                            event,
+                            session_key,
+                            cmd,
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
+                        error_result = await self._send_terminal_error_notice(event, e)
+                        _delivered = bool(error_result.success)
+                        event.delivery_state.reply_attempted = True
+                        if _delivered:
+                            event.delivery_state.reply_delivered = True
+                        else:
+                            event.delivery_state.reply_failed = True
+                        if error_result.failure_notice_delivered:
+                            event.delivery_state.failure_notice_delivered = True
+                    await self._run_processing_hook(
+                        "on_processing_complete",
+                        event,
+                        ProcessingOutcome.SUCCESS
+                        if _delivered
+                        else ProcessingOutcome.FAILURE,
+                    )
                     return
 
                 # Other bypass commands (/approve, /deny, /status,
@@ -2990,16 +3254,27 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    _thread_meta = _delivery_metadata_for_event(event)
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
+                    _delivered = not event.expects_reply and not bool(_text)
                     if _text:
+                        if not event.delivery_state.completion_deferred:
+                            event.delivery_state.reply_attempted = True
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_thread_meta,
                         )
+                        _delivered = bool(_r and _r.success)
+                        if not event.delivery_state.completion_deferred:
+                            if _delivered:
+                                event.delivery_state.reply_delivered = True
+                            else:
+                                event.delivery_state.reply_failed = True
+                            if _r and getattr(_r, "failure_notice_delivered", False):
+                                event.delivery_state.failure_notice_delivered = True
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -3008,6 +3283,24 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                    error_result = await self._send_terminal_error_notice(event, e)
+                    _delivered = bool(error_result.success)
+                    if not event.delivery_state.completion_deferred:
+                        event.delivery_state.reply_attempted = True
+                        if _delivered:
+                            event.delivery_state.reply_delivered = True
+                        else:
+                            event.delivery_state.reply_failed = True
+                        if error_result.failure_notice_delivered:
+                            event.delivery_state.failure_notice_delivered = True
+                if not event.delivery_state.completion_deferred:
+                    await self._run_processing_hook(
+                        "on_processing_complete",
+                        event,
+                        ProcessingOutcome.SUCCESS
+                        if _delivered
+                        else ProcessingOutcome.FAILURE,
+                    )
                 return
 
             # Clarify text-capture bypass: if the agent is blocked on a
@@ -3037,18 +3330,33 @@ class BasePlatformAdapter(ABC):
                         self.name, session_key,
                     )
                     try:
-                        _thread_meta = _thread_metadata_for_source(
-                            event.source, _reply_anchor_for_event(event)
-                        )
+                        _thread_meta = _delivery_metadata_for_event(event)
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        deferred = self.defer_event_to_active_response(
+                            session_key,
+                            event,
+                        )
+                        if not _text and event.expects_reply and not deferred:
+                            _text = "Thanks — I’ll continue with that."
+                        _delivered = not event.expects_reply and not bool(_text)
                         if _text:
+                            if not deferred:
+                                event.delivery_state.reply_attempted = True
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_thread_meta,
                             )
+                            _delivered = bool(_r and _r.success)
+                            if not deferred:
+                                if _delivered:
+                                    event.delivery_state.reply_delivered = True
+                                else:
+                                    event.delivery_state.reply_failed = True
+                                if _r and getattr(_r, "failure_notice_delivered", False):
+                                    event.delivery_state.failure_notice_delivered = True
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
@@ -3059,6 +3367,15 @@ class BasePlatformAdapter(ABC):
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
+                        )
+                        _delivered = False
+                    if not event.delivery_state.completion_deferred:
+                        await self._run_processing_hook(
+                            "on_processing_complete",
+                            event,
+                            ProcessingOutcome.SUCCESS
+                            if _delivered
+                            else ProcessingOutcome.FAILURE,
                         )
                     return
 
@@ -3138,17 +3455,65 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
-        # Track delivery outcomes for the processing-complete hook
-        delivery_attempted = False
-        delivery_succeeded = False
-
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
             if result is None:
                 return
-            delivery_attempted = True
+            delivery_targets = (
+                event.delivery_state.final_response_events
+                or [event, *event.delivery_state.merged_events]
+            )
+            for delivery_event in delivery_targets:
+                delivery_event.delivery_state.reply_attempted = True
+                if getattr(result, "failure_notice_delivered", False):
+                    delivery_event.delivery_state.failure_notice_delivered = True
             if getattr(result, "success", False):
-                delivery_succeeded = True
+                for delivery_event in delivery_targets:
+                    delivery_event.delivery_state.reply_delivered = True
+            else:
+                for delivery_event in delivery_targets:
+                    delivery_event.delivery_state.reply_failed = True
+
+        async def _complete_delivery_events(
+            default_outcome: ProcessingOutcome,
+        ) -> None:
+            pending_completion_events = [
+                event,
+                *event.delivery_state.merged_events,
+                *event.delivery_state.completion_events,
+            ]
+            seen_event_ids: set[int] = set()
+            while pending_completion_events:
+                completion_event = pending_completion_events.pop(0)
+                if id(completion_event) in seen_event_ids:
+                    continue
+                seen_event_ids.add(id(completion_event))
+                pending_completion_events.extend(
+                    completion_event.delivery_state.merged_events
+                )
+                pending_completion_events.extend(
+                    completion_event.delivery_state.completion_events
+                )
+                delivery_state = completion_event.delivery_state
+                if default_outcome != ProcessingOutcome.SUCCESS:
+                    outcome = default_outcome
+                elif delivery_state.reply_attempted or completion_event.expects_reply:
+                    outcome = (
+                        ProcessingOutcome.SUCCESS
+                        if (
+                            delivery_state.reply_delivered
+                            and not delivery_state.reply_failed
+                        )
+                        else ProcessingOutcome.FAILURE
+                    )
+                else:
+                    outcome = default_outcome
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    completion_event,
+                    outcome,
+                )
+
+        self._active_message_events[session_key] = event
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -3157,7 +3522,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        _thread_metadata = _delivery_metadata_for_event(event)
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -3187,6 +3552,14 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+
+            # A recursive queued turn can own the final response even though
+            # this outer adapter task started for an earlier event. Route the
+            # terminal payload through that queued event's private/workspace
+            # contract.
+            final_route_events = event.delivery_state.final_response_events
+            delivery_event = final_route_events[0] if final_route_events else event
+            _thread_metadata = _delivery_metadata_for_event(delivery_event)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -3288,6 +3661,14 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        if getattr(tts_result, "success", False):
+                            _record_delivery(tts_result)
+                    except Exception as tts_send_err:
+                        logger.warning(
+                            "[%s] Auto-TTS delivery failed: %s",
+                            self.name,
+                            tts_send_err,
+                        )
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -3297,7 +3678,7 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content and not _tts_caption_delivered:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    _reply_anchor = _reply_anchor_for_event(event)
+                    _reply_anchor = _reply_anchor_for_event(delivery_event)
                     # Mark final response messages for notification delivery.
                     # Platform adapters that support per-message notification
                     # control (e.g. Telegram's disable_notification) use this
@@ -3333,6 +3714,56 @@ class BasePlatformAdapter(ABC):
                             ttl_seconds=_ephemeral_ttl,
                         )
 
+                private_media_blocked = bool(
+                    delivery_event.private_reply_user_id
+                    and (images or media_files or local_files)
+                )
+                if private_media_blocked:
+                    private_notice = (
+                        "⚠️ This private command produced an attachment. "
+                        "Hermes did not post it to the channel. Run the command "
+                        "in a direct message or request a text result."
+                    )
+                    private_result = SendResult(
+                        success=False,
+                        error="private attachment notice was not delivered",
+                    )
+                    for attempt in range(3):
+                        try:
+                            private_result = await self.send_private_notice(
+                                chat_id=delivery_event.source.chat_id,
+                                user_id=delivery_event.private_reply_user_id,
+                                content=private_notice,
+                                reply_to=_reply_anchor_for_event(delivery_event),
+                                metadata=_thread_metadata,
+                            )
+                        except Exception as exc:
+                            private_result = SendResult(
+                                success=False,
+                                error=str(exc),
+                                retryable=True,
+                            )
+                        if private_result.success:
+                            break
+                        if not (
+                            private_result.retryable
+                            or self._is_retryable_error(private_result.error or "")
+                        ):
+                            break
+                        if attempt < 2:
+                            await asyncio.sleep(2 ** attempt)
+                    if not private_result.success:
+                        self.persist_private_notice_retry(
+                            delivery_event.source.chat_id,
+                            delivery_event.private_reply_user_id,
+                            private_notice,
+                            _thread_metadata,
+                        )
+                    _record_delivery(private_result)
+                    images = []
+                    media_files = []
+                    local_files = []
+
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
@@ -3340,14 +3771,45 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        if image_result.success:
+                            _record_delivery(image_result)
+                        else:
+                            notice_delivered = await report_media_delivery_failure(
+                                self,
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                file_path=images[0][0],
+                                metadata=_thread_metadata,
+                                detail=str(image_result.error or "upload returned no success confirmation"),
+                                display_name=f"{len(images)}-image batch",
+                            )
+                            _record_delivery(SendResult(
+                                success=False,
+                                error=image_result.error,
+                                failure_notice_delivered=notice_delivered,
+                            ))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        notice_delivered = await report_media_delivery_failure(
+                            self,
+                            chat_id=event.source.chat_id,
+                            thread_id=getattr(event.source, "thread_id", None),
+                            file_path=images[0][0],
+                            metadata=_thread_metadata,
+                            detail=str(batch_err),
+                            display_name=f"{len(images)}-image batch",
+                        )
+                        _record_delivery(SendResult(
+                            success=False,
+                            error=str(batch_err),
+                            failure_notice_delivered=notice_delivered,
+                        ))
 
 
                 # Send extracted media files — route by file type
@@ -3382,14 +3844,45 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        if image_result.success:
+                            _record_delivery(image_result)
+                        else:
+                            notice_delivered = await report_media_delivery_failure(
+                                self,
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                file_path=_image_paths[0],
+                                metadata=_thread_metadata,
+                                detail=str(image_result.error or "upload returned no success confirmation"),
+                                display_name=f"{len(_image_paths)}-image batch",
+                            )
+                            _record_delivery(SendResult(
+                                success=False,
+                                error=image_result.error,
+                                failure_notice_delivered=notice_delivered,
+                            ))
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        notice_delivered = await report_media_delivery_failure(
+                            self,
+                            chat_id=event.source.chat_id,
+                            thread_id=getattr(event.source, "thread_id", None),
+                            file_path=_image_paths[0],
+                            metadata=_thread_metadata,
+                            detail=str(batch_err),
+                            display_name=f"{len(_image_paths)}-image batch",
+                        )
+                        _record_delivery(SendResult(
+                            success=False,
+                            error=str(batch_err),
+                            failure_notice_delivered=notice_delivered,
+                        ))
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
@@ -3415,9 +3908,11 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
 
-                        if not media_result.success:
+                        if media_result.success:
+                            _record_delivery(media_result)
+                        else:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await report_media_delivery_failure(
+                            notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
                                 thread_id=getattr(event.source, "thread_id", None),
@@ -3425,9 +3920,14 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(media_result.error or "upload returned no success confirmation"),
                             )
+                            _record_delivery(SendResult(
+                                success=False,
+                                error=media_result.error,
+                                failure_notice_delivered=notice_delivered,
+                            ))
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
-                        await report_media_delivery_failure(
+                        notice_delivered = await report_media_delivery_failure(
                             self,
                             chat_id=event.source.chat_id,
                             thread_id=getattr(event.source, "thread_id", None),
@@ -3435,6 +3935,11 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(media_err),
                         )
+                        _record_delivery(SendResult(
+                            success=False,
+                            error=str(media_err),
+                            failure_notice_delivered=notice_delivered,
+                        ))
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -3454,8 +3959,10 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
-                        if not file_result.success:
-                            await report_media_delivery_failure(
+                        if file_result.success:
+                            _record_delivery(file_result)
+                        else:
+                            notice_delivered = await report_media_delivery_failure(
                                 self,
                                 chat_id=event.source.chat_id,
                                 thread_id=getattr(event.source, "thread_id", None),
@@ -3463,9 +3970,14 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                                 detail=str(file_result.error or "upload returned no success confirmation"),
                             )
+                            _record_delivery(SendResult(
+                                success=False,
+                                error=file_result.error,
+                                failure_notice_delivered=notice_delivered,
+                            ))
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
-                        await report_media_delivery_failure(
+                        notice_delivered = await report_media_delivery_failure(
                             self,
                             chat_id=event.source.chat_id,
                             thread_id=getattr(event.source, "thread_id", None),
@@ -3473,14 +3985,14 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_metadata,
                             detail=str(file_err),
                         )
+                        _record_delivery(SendResult(
+                            success=False,
+                            error=str(file_err),
+                            failure_notice_delivered=notice_delivered,
+                        ))
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
-            await self._run_processing_hook(
-                "on_processing_complete",
-                event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
-            )
+            await _complete_delivery_events(ProcessingOutcome.SUCCESS)
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
@@ -3510,6 +4022,7 @@ class BasePlatformAdapter(ABC):
                 drain_task = asyncio.create_task(
                     self._process_message_background(pending_event, session_key)
                 )
+                self._active_message_events[session_key] = pending_event
                 # Hand ownership of the session to the drain task so
                 # stale-lock detection keeps working while it runs.
                 self._session_tasks[session_key] = drain_task
@@ -3526,27 +4039,14 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
-            await self._run_processing_hook("on_processing_complete", event, outcome)
+            await _complete_delivery_events(outcome)
             raise
         except Exception as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception:
-                pass  # Last resort — don't let error reporting crash the handler
+            error_result = await self._send_terminal_error_notice(event, e)
+            _record_delivery(error_result)
+            await _complete_delivery_events(ProcessingOutcome.FAILURE)
         finally:
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
@@ -3571,7 +4071,13 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
+            callback_routes = event.delivery_state.final_response_events
+            callback_event = callback_routes[0] if callback_routes else event
+            primary_delivery_confirmed = (
+                callback_event.delivery_state.reply_delivered
+                and not callback_event.delivery_state.reply_failed
+            )
+            if callable(_post_cb) and primary_delivery_confirmed:
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
@@ -3622,6 +4128,7 @@ class BasePlatformAdapter(ABC):
                     drain_task = asyncio.create_task(
                         self._process_message_background(late_pending, session_key)
                     )
+                    self._active_message_events[session_key] = late_pending
                     # Hand ownership of the session to the drain task so stale-lock
                     # detection keeps working while it runs.
                     self._session_tasks[session_key] = drain_task
@@ -3654,6 +4161,8 @@ class BasePlatformAdapter(ABC):
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     del self._session_tasks[session_key]
+                    if self._active_message_events.get(session_key) is event:
+                        del self._active_message_events[session_key]
                     self._release_session_guard(session_key, guard=interrupt_event)
     
     async def cancel_background_tasks(self) -> None:

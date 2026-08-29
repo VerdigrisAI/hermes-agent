@@ -179,6 +179,43 @@ def test_circuit_breaker_reopens_on_probe_failure(monkeypatch, tmp_path):
         _cleanup(mcp_tool, "srv")
 
 
+def test_tool_errors_do_not_trip_server_circuit_breaker(monkeypatch, tmp_path):
+    """A valid MCP error result proves that the server remains reachable."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    calls = {"n": 0}
+
+    async def _call_tool_error(*_args, **_kwargs):
+        calls["n"] += 1
+        result = MagicMock()
+        result.isError = True
+        block = MagicMock()
+        block.text = '{"error":"permission_denied"}'
+        result.content = [block]
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+        if hasattr(mcp_tool, "_server_breaker_opened_at"):
+            mcp_tool._server_breaker_opened_at["srv"] = 123.0
+
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            assert "error" in json.loads(handler({}))
+
+        assert calls["n"] == mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+        assert "srv" not in mcp_tool._server_breaker_opened_at
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
     """When the auth-recovery path successfully reconnects the server,
     the breaker should be cleared so subsequent calls aren't gated on a
@@ -250,3 +287,39 @@ def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
         )
     finally:
         _cleanup(mcp_tool, "srv")
+
+
+def test_auth_reconnect_returns_application_error_without_reauth(monkeypatch, tmp_path):
+    """A completed retry can return a tool error without a transport failure."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from mcp.client.auth import OAuthFlowError
+    from tools import mcp_tool
+    from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+
+    async def _call_tool_unused(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("session.call_tool should not be reached")
+
+    _install_stub_server(mcp_tool, "srv-app-error", _call_tool_unused)
+    mcp_tool._ensure_mcp_loop()
+    manager = get_manager()
+
+    async def _handle_401(_name, token=None):
+        return True
+
+    monkeypatch.setattr(manager, "handle_401", _handle_401)
+    application_error = json.dumps({"error": "invalid tool argument"})
+
+    try:
+        result = mcp_tool._handle_auth_error_and_retry(
+            "srv-app-error",
+            OAuthFlowError("initial"),
+            lambda: application_error,
+            "tools/call test",
+        )
+        assert result == application_error
+        assert mcp_tool._server_error_counts.get("srv-app-error", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv-app-error")

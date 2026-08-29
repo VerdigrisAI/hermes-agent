@@ -155,6 +155,7 @@ class GatewayStreamConsumer:
         # streaming, even if the final edit (cursor removal etc.)
         # subsequently failed.
         self._final_content_delivered = False
+        self._delivered_commentary_texts: list[str] = []
         # Cache adapter lifecycle capability: only platforms that need an
         # explicit finalize call (e.g. DingTalk AI Cards) force us to make
         # a redundant final edit.  Everyone else keeps the fast path.
@@ -197,6 +198,11 @@ class GatewayStreamConsumer:
         """True when the final response content reached the user, even if
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
+
+    @property
+    def delivered_commentary_texts(self) -> tuple[str, ...]:
+        """Return exact interim messages confirmed by the adapter."""
+        return tuple(self._delivered_commentary_texts)
 
     async def _edit_message(
         self,
@@ -480,12 +486,12 @@ class GatewayStreamConsumer:
                         chunks = self.adapter.truncate_message(
                             self._accumulated, _safe_limit, len_fn=_len_fn,
                         )
-                        chunks_delivered = False
+                        all_chunks_delivered = bool(chunks)
                         reply_to = self._message_id or self._initial_reply_to_id
                         for chunk in chunks:
                             new_id = await self._send_new_chunk(chunk, reply_to)
-                            if new_id is not None and new_id != reply_to:
-                                chunks_delivered = True
+                            if new_id is None or new_id == reply_to:
+                                all_chunks_delivered = False
                         self._accumulated = ""
                         self._last_sent_text = ""
                         self._last_edit_time = time.monotonic()
@@ -494,8 +500,8 @@ class GatewayStreamConsumer:
                             # landed.  ``_already_sent`` may be True from prior
                             # tool-progress edits or fallback-mode promotion (#10748)
                             # — that doesn't mean the final answer reached the user.
-                            self._final_response_sent = chunks_delivered
-                            if chunks_delivered:
+                            self._final_response_sent = all_chunks_delivered
+                            if all_chunks_delivered:
                                 self._final_content_delivered = True
                             return
                         if got_segment_break:
@@ -786,7 +792,6 @@ class GatewayStreamConsumer:
 
         stale_message_id = self._message_id  # partial message to clean up
         last_message_id: Optional[str] = None
-        last_successful_chunk = ""
         sent_any_chunk = False
         for chunk in chunks:
             # Try sending with one retry on flood-control errors.
@@ -809,13 +814,14 @@ class GatewayStreamConsumer:
 
             if not result or not result.success:
                 if sent_any_chunk:
-                    # Some continuation text already reached the user. Suppress
-                    # the base gateway final-send path so we don't resend the
-                    # full response and create another duplicate.
-                    self._already_sent = True
-                    self._final_response_sent = True
-                    self._message_id = last_message_id
-                    self._last_sent_text = last_successful_chunk
+                    # A partial answer is not successful delivery. Let the base
+                    # path retry the complete response. This can repeat a prefix,
+                    # but it never checkmarks a truncated answer.
+                    self._already_sent = False
+                    self._final_response_sent = False
+                    self._final_content_delivered = False
+                    self._message_id = None
+                    self._last_sent_text = ""
                     self._fallback_prefix = ""
                     return
                 # No fallback chunk reached the user — allow the normal gateway
@@ -826,7 +832,6 @@ class GatewayStreamConsumer:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
-            last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
             # Each fallback chunk is a fresh platform message — notify
             # so any stale tool-progress bubble gets closed off.
@@ -1013,6 +1018,7 @@ class GatewayStreamConsumer:
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
             if result.success:
+                self._delivered_commentary_texts.append(text.strip())
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
@@ -1118,9 +1124,9 @@ class GatewayStreamConsumer:
             visible_without_cursor = visible_without_cursor.replace(self.cfg.cursor, "")
         _visible_stripped = visible_without_cursor.strip()
         if not _visible_stripped:
-            return True  # cursor-only / whitespace-only update
+            return False  # no user-visible content was delivered
         if not text.strip():
-            return True  # nothing to send is "success"
+            return False
         # Guard: do not create a brand-new standalone message when the only
         # visible content is a handful of characters alongside the streaming
         # cursor.  During rapid tool-calling the model often emits 1-2 tokens
@@ -1133,9 +1139,9 @@ class GatewayStreamConsumer:
         _MIN_NEW_MSG_CHARS = 4
         if (self._message_id is None
                 and self.cfg.cursor
-                and self.cfg.cursor in text
-                and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
-            return True  # too short for a standalone message — accumulate more
+            and self.cfg.cursor in text
+            and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
+            return False  # too short for a standalone message — accumulate more
 
         # Native draft streaming: route mid-stream frames through send_draft.
         # The final answer is delivered via the regular sendMessage path

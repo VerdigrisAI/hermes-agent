@@ -5,13 +5,21 @@ import importlib
 import sys
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.config import GatewayConfig, Platform, PlatformConfig, StreamingConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
+from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -638,6 +646,234 @@ class QueuedCommentaryAgent:
         }
 
 
+class EveryTurnCommentaryAgent(QueuedCommentaryAgent):
+    calls = 0
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback(
+                f"private commentary {type(self).calls}",
+                already_streamed=False,
+            )
+        return {
+            "final_response": f"final response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class EarlyReturnSteerAgent:
+    """Simulate a runtime branch that returns before the loop-level drain."""
+
+    calls = 0
+    messages = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        type(self).messages.append(message)
+        return {
+            "final_response": f"final response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+    def _close_steering(self):
+        if type(self).calls == 1:
+            return "late steer"
+        return None
+
+
+class EmptyEarlyReturnSteerAgent(EarlyReturnSteerAgent):
+    """Return no text before a late steer becomes a second turn."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        type(self).messages.append(message)
+        return {
+            "final_response": "" if type(self).calls == 1 else "steer response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class MediaOnlyAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "",
+            "messages": [
+                {
+                    "role": "tool",
+                    "content": '{"artifact": "MEDIA:/tmp/report.pdf"}',
+                }
+            ],
+            "api_calls": 1,
+        }
+
+
+class QueuedMediaAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return {
+                "final_response": "",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "content": '{"artifact": "MEDIA:/tmp/queued-report.pdf"}',
+                    }
+                ],
+                "api_calls": 1,
+            }
+        return {
+            "final_response": "queued response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class QueuedMarkdownImageAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "![chart](https://example.com/chart.png)"
+                if type(self).calls == 1
+                else "queued response"
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class QueuedFailedMediaAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "Report attached.\nMEDIA:/tmp/report.pdf"
+                if type(self).calls == 1
+                else "queued response"
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class QueuedFailedImageBatchAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": (
+                "Charts attached.\n"
+                "![first](https://example.com/first.png)\n"
+                "![second](https://example.com/second.png)"
+                if type(self).calls == 1
+                else "queued response"
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class SecondCallRaisingAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 2:
+            raise RuntimeError("queued agent failed")
+        return {
+            "final_response": "first response",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class ImageCaptureAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.image_batches = []
+
+    async def send_multiple_images(
+        self,
+        chat_id,
+        images,
+        reply_to=None,
+        metadata=None,
+        human_delay=0.0,
+    ):
+        self.image_batches.append(images)
+        return SendResult(success=True, message_id="image-1")
+
+
+class FailedMediaNoticeAdapter(ProgressCaptureAdapter):
+    async def send_document(self, chat_id, file_path, reply_to=None, metadata=None):
+        return SendResult(success=False, error="upload failed")
+
+    async def _send_with_retry(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        if content.startswith("⚠️"):
+            return SendResult(success=False, error="notice failed")
+        return SendResult(success=True, message_id="text-1")
+
+
+class FailedImageBatchAdapter(ProgressCaptureAdapter):
+    async def send_multiple_images(
+        self,
+        chat_id,
+        images,
+        reply_to=None,
+        metadata=None,
+        human_delay=0.0,
+    ):
+        return SendResult(success=False, error="one image failed")
+
+
+class RaisingAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        raise RuntimeError("agent failed")
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -687,6 +923,12 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    reply_event=None,
+    pending_event=None,
+    overflow_events=None,
+    steer_events=None,
+    draining=False,
+    interrupt_depth=0,
 ):
     if config_data:
         import yaml
@@ -703,6 +945,8 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    adapter._test_runner = runner
+    runner._draining = draining
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -717,13 +961,19 @@ async def _run_with_agent(
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
-    if pending_text is not None:
+    if pending_event is not None:
+        adapter._pending_messages[session_key] = pending_event
+    elif pending_text is not None:
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
             source=source,
             message_id="queued-1",
         )
+    if overflow_events:
+        runner._queued_events = {session_key: list(overflow_events)}
+    if steer_events:
+        runner._steer_reply_events = {session_key: list(steer_events)}
 
     result = await runner._run_agent(
         message="hello",
@@ -732,6 +982,8 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        reply_event=reply_event,
+        _interrupt_depth=interrupt_depth,
     )
     return adapter, result
 
@@ -961,6 +1213,884 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
 
 
 @pytest.mark.asyncio
+async def test_recursive_private_queue_routes_interim_to_private_workspace(
+    monkeypatch, tmp_path
+):
+    EveryTurnCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        chat_type="group",
+        thread_id="root-1",
+    )
+    original = MessageEvent(
+        text="active public turn",
+        source=source,
+        message_id="root-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="private queued turn",
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+        private_reply_user_id="U_PRIVATE",
+        platform_team_id="T_SECONDARY",
+    )
+
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EveryTurnCommentaryAgent,
+        session_id="sess-private-queue-route",
+        platform=Platform.SLACK,
+        chat_id="C1",
+        chat_type="group",
+        thread_id="root-1",
+        reply_event=original,
+        pending_event=queued,
+        config_data={"display": {"interim_assistant_messages": True}},
+    )
+
+    second_commentary = next(
+        call for call in adapter.sent if call["content"] == "private commentary 2"
+    )
+    assert second_commentary["metadata"] == {
+        "thread_id": "root-1",
+        "private_reply_user_id": "U_PRIVATE",
+        "team_id": "T_SECONDARY",
+    }
+
+
+@pytest.mark.asyncio
+async def test_queued_turn_does_not_rewrite_first_response_targets(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    original = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    deferred = MessageEvent(
+        text="clarification",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="clarify-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+    )
+    original.delivery_state.final_response_events.extend([original, deferred])
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queued-reply-targets",
+        reply_event=original,
+        pending_event=queued,
+    )
+
+    assert original.delivery_state.reply_delivered is True
+    assert deferred.delivery_state.reply_delivered is True
+    assert original.delivery_state.final_response_events == []
+    assert result["_final_reply_events"] == [queued]
+
+
+@pytest.mark.asyncio
+async def test_queue_accepted_before_drain_gets_a_terminal_reply(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = MessageEvent(
+        text="queued before restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-before-drain",
+        expects_reply=True,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queue-before-drain",
+        pending_event=queued,
+        draining=True,
+    )
+
+    assert any("resend" in call["content"] for call in adapter.sent)
+    assert queued.delivery_state.reply_delivered is True
+    assert any(item is queued for item in result["_reply_events"])
+
+
+@pytest.mark.asyncio
+async def test_drain_rejects_every_accepted_queued_turn(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"queued-{index}",
+            expects_reply=True,
+        )
+        for index in range(3)
+    ]
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-all-queue-before-drain",
+        pending_event=queued[0],
+        overflow_events=queued[1:],
+        draining=True,
+    )
+
+    rejections = [call for call in adapter.sent if "resend" in call["content"]]
+    assert len(rejections) == 3
+    assert all(event.delivery_state.reply_delivered for event in queued)
+    assert all(any(item is event for item in result["_reply_events"]) for event in queued)
+
+
+@pytest.mark.asyncio
+async def test_failed_agent_drain_rejects_every_accepted_queued_turn(
+    monkeypatch, tmp_path
+):
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"failed-queued-{index}",
+            expects_reply=True,
+        )
+        for index in range(3)
+    ]
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    runner._draining = True
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._pending_messages[session_key] = queued[0]
+    runner._queued_events = {session_key: queued[1:]}
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RaisingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    with pytest.raises(RuntimeError, match="agent failed"):
+        await runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-failed-drain",
+            session_key=session_key,
+        )
+
+    rejections = [call for call in adapter.sent if "resend" in call["content"]]
+    assert len(rejections) == 3
+    assert all(event.delivery_state.reply_delivered for event in queued)
+    assert session_key not in adapter._pending_messages
+    assert session_key not in runner._queued_events
+
+
+@pytest.mark.asyncio
+async def test_failed_drain_completes_each_queued_delivery_outcome():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"outcome-{index}",
+            expects_reply=True,
+        )
+        for index in range(3)
+    ]
+    merged = MessageEvent(
+        text="merged",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="outcome-merged",
+        expects_reply=True,
+    )
+    queued[0].delivery_state.merged_events.append(merged)
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    adapter._send_with_retry = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="ok"),
+            SendResult(success=False, error="rejected"),
+            RuntimeError("send failed"),
+        ]
+    )
+    adapter.on_processing_complete = AsyncMock()
+    runner = _make_runner(adapter)
+    runner._draining = True
+    runner._restart_requested = True
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._pending_messages[session_key] = queued[0]
+    runner._queued_events = {session_key: queued[1:]}
+
+    await runner._reject_queued_events_after_failed_drain(session_key, source)
+
+    outcomes = [call.args[1] for call in adapter.on_processing_complete.await_args_list]
+    assert outcomes == [
+        ProcessingOutcome.SUCCESS,
+        ProcessingOutcome.SUCCESS,
+        ProcessingOutcome.FAILURE,
+        ProcessingOutcome.FAILURE,
+    ]
+    assert queued[0].delivery_state.reply_delivered is True
+    assert merged.delivery_state.reply_delivered is True
+    assert queued[1].delivery_state.reply_delivered is False
+    assert queued[2].delivery_state.reply_delivered is False
+
+
+def test_pending_event_order_accepts_mixed_timezone_timestamps():
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    aware = MessageEvent(
+        text="aware first",
+        message_type=MessageType.TEXT,
+        source=source,
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    naive = MessageEvent(
+        text="naive second",
+        message_type=MessageType.TEXT,
+        source=source,
+        timestamp=datetime(2026, 1, 1, 0, 0, 1),
+    )
+
+    first = runner._merge_pending_events_by_arrival(
+        "session",
+        adapter,
+        naive,
+        aware,
+    )
+
+    assert first is aware
+    assert adapter._pending_messages["session"] is naive
+
+
+@pytest.mark.asyncio
+async def test_repeated_run_failures_promote_every_overflow_turn(monkeypatch, tmp_path):
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = [
+        MessageEvent(
+            text=f"queued {index}",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"failure-chain-{index}",
+            expects_reply=True,
+        )
+        for index in range(2)
+    ]
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._pending_messages[session_key] = queued[0]
+    runner._queued_events = {session_key: [queued[1]]}
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RaisingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    for expected in queued:
+        with pytest.raises(RuntimeError, match="agent failed"):
+            await runner._run_agent(
+                message="hello",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="sess-repeated-failure",
+                session_key=session_key,
+            )
+        assert adapter._pending_messages.pop(session_key) is expected
+
+    assert session_key not in runner._queued_events
+
+
+@pytest.mark.asyncio
+async def test_early_return_preserves_a_late_steer_as_the_next_turn(
+    monkeypatch,
+    tmp_path,
+):
+    EarlyReturnSteerAgent.calls = 0
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-early-return-steer",
+    )
+
+    assert EarlyReturnSteerAgent.calls == 2
+    assert result["final_response"] == "final response 2"
+
+
+@pytest.mark.asyncio
+async def test_empty_early_return_preserves_a_late_steer(monkeypatch, tmp_path):
+    EmptyEarlyReturnSteerAgent.calls = 0
+    EmptyEarlyReturnSteerAgent.messages = []
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EmptyEarlyReturnSteerAgent,
+        session_id="sess-empty-early-return-steer",
+    )
+
+    assert EmptyEarlyReturnSteerAgent.messages == ["hello", "late steer"]
+    assert result["final_response"] == "steer response"
+
+
+@pytest.mark.asyncio
+async def test_late_steer_runs_before_later_queued_turn(monkeypatch, tmp_path):
+    EarlyReturnSteerAgent.calls = 0
+    EarlyReturnSteerAgent.messages = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = MessageEvent(
+        text="queued follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-after-steer",
+        expects_reply=True,
+        timestamp=datetime(2026, 1, 1, 0, 0, 1),
+    )
+    steer = MessageEvent(
+        text="/steer late steer",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="late-steer",
+        expects_reply=True,
+        timestamp=datetime(2026, 1, 1, 0, 0, 0),
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-steer-before-queue",
+        pending_event=queued,
+        steer_events=[("late steer", steer)],
+    )
+
+    assert EarlyReturnSteerAgent.messages == ["hello", "late steer", "queued follow-up"]
+    assert result["final_response"] == "final response 3"
+
+
+@pytest.mark.asyncio
+async def test_late_steer_runs_after_earlier_queued_turn(monkeypatch, tmp_path):
+    EarlyReturnSteerAgent.calls = 0
+    EarlyReturnSteerAgent.messages = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    queued = MessageEvent(
+        text="queued follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-before-steer",
+        expects_reply=True,
+        timestamp=datetime(2026, 1, 1, 0, 0, 0),
+    )
+    steer = MessageEvent(
+        text="/steer late steer",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="late-steer",
+        expects_reply=True,
+        timestamp=datetime(2026, 1, 1, 0, 0, 1),
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-queue-before-steer",
+        pending_event=queued,
+        steer_events=[("late steer", steer)],
+    )
+
+    assert EarlyReturnSteerAgent.messages == ["hello", "queued follow-up", "late steer"]
+    assert result["final_response"] == "final response 3"
+
+
+@pytest.mark.asyncio
+async def test_recursion_limit_preserves_current_turn_before_staged_queue(
+    monkeypatch, tmp_path
+):
+    EarlyReturnSteerAgent.calls = 0
+    EarlyReturnSteerAgent.messages = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    first = MessageEvent(
+        text="first queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-first",
+    )
+    second = MessageEvent(
+        text="second queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-second",
+    )
+
+    adapter, _result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EarlyReturnSteerAgent,
+        session_id="sess-depth-queue",
+        pending_event=first,
+        overflow_events=[second],
+        interrupt_depth=100,
+    )
+
+    session_key = "agent:main:telegram:group:-1001:17585"
+    assert adapter._pending_messages[session_key] is first
+    assert adapter._test_runner._queued_events[session_key] == [second]
+
+
+@pytest.mark.asyncio
+async def test_media_only_result_is_not_replaced_by_empty_response(monkeypatch, tmp_path):
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MediaOnlyAgent,
+        session_id="sess-media-only",
+    )
+
+    assert result["final_response"] == "MEDIA:/tmp/report.pdf"
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_delivers_first_turn_tool_media(monkeypatch, tmp_path):
+    QueuedMediaAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="media-owner",
+        expects_reply=True,
+    )
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedMediaAgent,
+        session_id="sess-queued-media",
+        pending_text="queued follow-up",
+        reply_event=owner,
+    )
+
+    assert result["final_response"] == "queued response"
+    assert any(
+        call["content"] == "📎 File: /tmp/queued-report.pdf"
+        for call in adapter.sent
+    )
+    assert all("MEDIA:" not in call["content"] for call in adapter.sent)
+    assert owner.delivery_state.reply_attempted is True
+    assert owner.delivery_state.reply_delivered is True
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_delivers_first_turn_markdown_image(monkeypatch, tmp_path):
+    QueuedMarkdownImageAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="image-owner",
+        expects_reply=True,
+    )
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedMarkdownImageAgent,
+        session_id="sess-queued-markdown-image",
+        pending_text="queued follow-up",
+        reply_event=owner,
+        adapter_cls=ImageCaptureAdapter,
+    )
+
+    assert result["final_response"] == "queued response"
+    assert adapter.image_batches == [
+        [("https://example.com/chart.png", "chart")]
+    ]
+    assert owner.delivery_state.reply_delivered is True
+    assert owner.delivery_state.reply_failed is False
+
+
+@pytest.mark.asyncio
+async def test_queued_media_and_notice_failure_mark_owner_failed(monkeypatch, tmp_path):
+    QueuedFailedMediaAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="failed-media-owner",
+        expects_reply=True,
+    )
+
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedFailedMediaAgent,
+        session_id="sess-queued-failed-media",
+        pending_text="queued follow-up",
+        reply_event=owner,
+        adapter_cls=FailedMediaNoticeAdapter,
+    )
+
+    assert result["final_response"] == "queued response"
+    assert owner.delivery_state.reply_delivered is True
+    assert owner.delivery_state.reply_failed is True
+
+
+@pytest.mark.asyncio
+async def test_queued_image_batch_failure_uses_generic_batch_name(monkeypatch, tmp_path):
+    QueuedFailedImageBatchAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    owner = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="failed-image-batch-owner",
+        expects_reply=True,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedFailedImageBatchAgent,
+        session_id="sess-queued-failed-image-batch",
+        pending_text="queued follow-up",
+        reply_event=owner,
+        adapter_cls=FailedImageBatchAdapter,
+    )
+
+    assert result["final_response"] == "queued response"
+    notice = next(item["content"] for item in adapter.sent if "was not attached" in item["content"])
+    assert "2-image batch" in notice
+    assert "first.png" not in notice
+    assert owner.delivery_state.reply_failed is True
+    assert owner.delivery_state.failure_notice_delivered is True
+
+
+@pytest.mark.asyncio
+async def test_recursive_queued_failure_preserves_each_reply_owner(monkeypatch, tmp_path):
+    SecondCallRaisingAgent.calls = 0
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    original = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-owner",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-owner",
+        expects_reply=True,
+    )
+
+    with pytest.raises(RuntimeError, match="queued agent failed"):
+        await _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            SecondCallRaisingAgent,
+            session_id="sess-recursive-failure-owner",
+            pending_event=queued,
+            reply_event=original,
+        )
+
+    assert queued in original.delivery_state.completion_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_queued_owner", [False, True])
+async def test_real_handler_propagates_queued_owners_and_streamed_delivery(
+    monkeypatch,
+    with_queued_owner,
+):
+    """Exercise the production bridge from runner metadata to event state."""
+    from gateway.run import GatewayRunner
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    event = MessageEvent(
+        text="original",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+    )
+    session_key = build_session_key(source)
+    created = datetime.now()
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-real-handler",
+        created_at=created,
+        updated_at=created + timedelta(seconds=1),
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+
+    adapter = ProgressCaptureAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")
+        }
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._show_reasoning = False
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._cache_session_source = MagicMock()
+    runner._is_telegram_topic_lane = MagicMock(return_value=False)
+    runner._set_session_env = MagicMock(return_value=())
+    runner._clear_session_env = MagicMock()
+    runner._prepare_inbound_message_text = AsyncMock(return_value=event.text)
+    runner._bind_adapter_run_generation = MagicMock()
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._clear_restart_failure_count = MagicMock()
+    runner._should_send_voice_reply = MagicMock(return_value=False)
+    runner._deliver_media_from_response = AsyncMock()
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "streamed answer",
+            "messages": [],
+            "api_calls": 1,
+            "already_sent": True,
+            "failed": False,
+            "_reply_events": [queued] if with_queued_owner else [],
+            "_final_reply_events": [queued] if with_queued_owner else [],
+        }
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        run_generation=1,
+    )
+
+    assert response is None
+    if with_queued_owner:
+        assert event.delivery_state.reply_delivered is False
+        assert event.delivery_state.reply_failed is False
+        assert queued.delivery_state.reply_delivered is True
+        assert queued.delivery_state.reply_failed is False
+        assert queued in event.delivery_state.completion_events
+        assert queued in event.delivery_state.final_response_events
+    else:
+        assert event.delivery_state.reply_delivered is True
+        assert event.delivery_state.reply_failed is False
+        assert queued.delivery_state.reply_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_streamed_media_and_notice_failure_marks_reply_failed(monkeypatch):
+    """A streamed text fragment cannot hide a failed attachment outcome."""
+    from gateway.run import GatewayRunner
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="group",
+        thread_id="thread-1",
+    )
+    event = MessageEvent(
+        text="original",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    session_key = build_session_key(source)
+    created = datetime.now()
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-streamed-media-failure",
+        created_at=created,
+        updated_at=created + timedelta(seconds=1),
+        platform=Platform.SLACK,
+        chat_type="group",
+    )
+
+    adapter = ProgressCaptureAdapter(platform=Platform.SLACK)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.adapters = {Platform.SLACK: adapter}
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_any_sessions.return_value = True
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._show_reasoning = False
+    runner._recover_telegram_topic_thread_id = MagicMock(return_value=None)
+    runner._cache_session_source = MagicMock()
+    runner._is_telegram_topic_lane = MagicMock(return_value=False)
+    runner._set_session_env = MagicMock(return_value=())
+    runner._clear_session_env = MagicMock()
+    runner._prepare_inbound_message_text = AsyncMock(return_value=event.text)
+    runner._bind_adapter_run_generation = MagicMock()
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._clear_restart_failure_count = MagicMock()
+    runner._should_send_voice_reply = MagicMock(return_value=False)
+    runner._deliver_media_from_response = AsyncMock(return_value=False)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Report attached.\nMEDIA:/tmp/report.pdf",
+            "messages": [],
+            "api_calls": 1,
+            "already_sent": True,
+            "failed": False,
+        }
+    )
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        session_key,
+        run_generation=1,
+    )
+
+    assert response is None
+    assert event.delivery_state.reply_delivered is True
+    assert event.delivery_state.reply_failed is True
+
+
+@pytest.mark.asyncio
 async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1017,6 +2147,80 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
 
     sent_texts = [call["content"] for call in adapter.sent]
     assert sent_texts == ["done", "💾 Skill 'prospect-scanner' created."]
+    assert released == [True]
+
+
+@pytest.mark.asyncio
+async def test_base_processing_drops_post_delivery_callback_when_main_send_fails():
+    adapter = ProgressCaptureAdapter()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=False, error="ReadTimeout")
+    )
+    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="done"))
+    released = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg-1",
+        expects_reply=True,
+    )
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._post_delivery_callbacks[session_key] = lambda: released.append(True)
+
+    await adapter._process_message_background(event, session_key)
+
+    assert released == []
+    assert session_key not in adapter._post_delivery_callbacks
+    assert event.delivery_state.reply_failed is True
+
+
+@pytest.mark.asyncio
+async def test_base_processing_releases_callback_for_delivered_queued_owner():
+    adapter = ProgressCaptureAdapter()
+    released = []
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="channel-1",
+        chat_type="group",
+    )
+    event = MessageEvent(
+        text="original",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="original-1",
+        expects_reply=True,
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-1",
+        expects_reply=True,
+        private_reply_user_id="U1",
+        platform_team_id="T2",
+    )
+
+    async def _handler(owner):
+        owner.delivery_state.final_response_events.append(queued)
+        return "queued answer"
+
+    adapter.set_message_handler(_handler)
+    session_key = build_session_key(source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._post_delivery_callbacks[session_key] = lambda: released.append(True)
+
+    await adapter._process_message_background(event, session_key)
+
+    assert event.delivery_state.reply_delivered is False
+    assert queued.delivery_state.reply_delivered is True
     assert released == [True]
 
 

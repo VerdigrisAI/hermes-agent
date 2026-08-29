@@ -4,6 +4,7 @@ Tests both the _handle_update_command handler (spawns update process) and
 the _send_update_notification startup hook (sends results after restart).
 """
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -242,6 +243,86 @@ class TestHandleUpdateCommand:
 
         data = json.loads((hermes_home / ".update_pending.json").read_text())
         assert data["thread_id"] == "777"
+
+    @pytest.mark.asyncio
+    async def test_writes_private_reply_owner_for_slack_slash(self, tmp_path):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.private_reply_user_id.return_value = "U_PRIVATE"
+        runner.adapters[Platform.SLACK] = adapter
+        runner._schedule_update_notification_watch = MagicMock()
+        event = _make_event(platform=Platform.SLACK, user_id="U_PRIVATE", chat_id="C1")
+        event.platform_team_id = "T2"
+        fake_root = tmp_path / "project"
+        (fake_root / ".git").mkdir(parents=True)
+        (fake_root / "gateway").mkdir()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        (fake_root / "gateway" / "run.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", fake_file), \
+             patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+             patch("subprocess.Popen"):
+            await runner._handle_update_command(event)
+
+        pending = json.loads((hermes_home / ".update_pending.json").read_text())
+        assert pending["private_user_id"] == "U_PRIVATE"
+        assert pending["team_id"] == "T2"
+
+    @pytest.mark.asyncio
+    async def test_rejects_second_update_without_overwriting_route(self, tmp_path):
+        runner = _make_runner()
+        event = _make_event(platform=Platform.SLACK, user_id="U2", chat_id="C2")
+        fake_root = tmp_path / "project"
+        (fake_root / ".git").mkdir(parents=True)
+        (fake_root / "gateway").mkdir()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        (fake_root / "gateway" / "run.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        original = {"platform": "slack", "chat_id": "C1", "user_id": "U1"}
+        (hermes_home / ".update_pending.json").write_text(json.dumps(original))
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", fake_file), \
+             patch("shutil.which", return_value="/usr/bin/hermes"), \
+             patch("subprocess.Popen") as popen:
+            result = await runner._handle_update_command(event)
+
+        assert "already in progress" in result
+        assert json.loads((hermes_home / ".update_pending.json").read_text()) == original
+        popen.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recovers_old_orphan_update_lock(self, tmp_path):
+        runner = _make_runner()
+        runner._schedule_update_notification_watch = MagicMock()
+        event = _make_event()
+        fake_root = tmp_path / "project"
+        (fake_root / ".git").mkdir(parents=True)
+        (fake_root / "gateway").mkdir()
+        fake_file = str(fake_root / "gateway" / "run.py")
+        (fake_root / "gateway" / "run.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        lock_path = hermes_home / ".update_request.lock"
+        # The old owner PID can be reused by an unrelated live process.
+        lock_path.write_text(json.dumps({"pid": os.getpid(), "created_at": "old"}))
+        old = lock_path.stat().st_mtime - 120
+        os.utime(lock_path, (old, old))
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", fake_file), \
+             patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+             patch("subprocess.Popen"):
+            result = await runner._handle_update_command(event)
+
+        assert "Starting Hermes update" in result
+        assert (hermes_home / ".update_pending.json").exists()
+        lock = json.loads(lock_path.read_text())
+        assert lock["pid"] == os.getpid()
 
     @pytest.mark.asyncio
     async def test_spawns_setsid(self, tmp_path):
@@ -605,8 +686,8 @@ class TestSendUpdateNotification:
         assert not exit_code_path.exists()
 
     @pytest.mark.asyncio
-    async def test_cleans_up_on_error(self, tmp_path):
-        """Files are cleaned up even if notification fails."""
+    async def test_retains_files_on_delivery_error(self, tmp_path):
+        """Files remain available for retry when notification fails."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -628,10 +709,10 @@ class TestSendUpdateNotification:
         with patch("gateway.run._hermes_home", hermes_home):
             await runner._send_update_notification()
 
-        # Files should still be cleaned up (finally block)
         assert not pending_path.exists()
-        assert not output_path.exists()
-        assert not exit_code_path.exists()
+        assert (hermes_home / ".update_pending.claimed.json").exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
 
     @pytest.mark.asyncio
     async def test_handles_corrupt_pending_file(self, tmp_path):
@@ -651,8 +732,8 @@ class TestSendUpdateNotification:
         assert not pending_path.exists()
 
     @pytest.mark.asyncio
-    async def test_no_adapter_for_platform(self, tmp_path):
-        """Does not crash if the platform adapter is not connected."""
+    async def test_no_adapter_for_platform_retains_retry_state(self, tmp_path):
+        """Keep update evidence when the platform adapter is not connected."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -674,9 +755,234 @@ class TestSendUpdateNotification:
 
         # send should not have been called (wrong platform)
         mock_adapter.send.assert_not_called()
-        # Files should still be cleaned up
         assert not pending_path.exists()
-        assert not exit_code_path.exists()
+        assert (hermes_home / ".update_pending.claimed.json").exists()
+        assert exit_code_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_send_failure_retains_update_artifacts_for_retry(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        pending_path = tmp_path / ".update_pending.json"
+        output_path = tmp_path / ".update_output.txt"
+        exit_path = tmp_path / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+            "session_key": "slack:C1:U1",
+        }))
+        output_path.write_text("")
+        exit_path.write_text("0")
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+        adapter._is_retryable_error.return_value = False
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            await runner._watch_update_progress(poll_interval=0, timeout=0.1)
+
+        assert pending_path.exists()
+        assert exit_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_private_update_completion_never_uses_public_send(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+            "session_key": "slack:C1:U1",
+            "private_user_id": "U1",
+        }))
+        (tmp_path / ".update_exit_code").write_text("0")
+        adapter = MagicMock()
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        adapter.send = AsyncMock()
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            await runner._watch_update_progress(poll_interval=0, timeout=0.1)
+
+        adapter.send_private_notice.assert_awaited_once()
+        adapter.send.assert_not_awaited()
+        assert not (tmp_path / ".update_pending.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_private_update_completion_preserves_workspace_route(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+            "session_key": "slack:C1:U1",
+            "private_user_id": "U1",
+            "team_id": "T2",
+        }))
+        (tmp_path / ".update_exit_code").write_text("0")
+        adapter = MagicMock()
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            await runner._watch_update_progress(poll_interval=0, timeout=0.1)
+
+        assert adapter.send_private_notice.await_args.kwargs["metadata"] == {
+            "team_id": "T2"
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_native_update_prompt_uses_text_fallback(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "C1",
+            "session_key": "telegram:C1:U1",
+        }))
+        (tmp_path / ".update_prompt.json").write_text(json.dumps({
+            "prompt": "Continue update?",
+            "default": "yes",
+        }))
+        class PromptAdapter:
+            def __init__(self):
+                self.prompt = AsyncMock(
+                    return_value=SendResult(success=False, error="offline")
+                )
+                self.send = AsyncMock(return_value=SendResult(success=True))
+
+            async def send_update_prompt(self, **kwargs):
+                return await self.prompt(**kwargs)
+
+            @staticmethod
+            def _is_retryable_error(_error):
+                return False
+
+        adapter = PromptAdapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            await runner._watch_update_progress(poll_interval=0.01, timeout=0.1)
+
+        adapter.prompt.assert_awaited_once()
+        assert any(
+            "Update needs your input" in call.args[1]
+            for call in adapter.send.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_deferred_delivery_worker_retries_update_marker(self, tmp_path):
+        runner = _make_runner()
+        runner._deferred_delivery_lock = asyncio.Lock()
+        runner._background_task_outcomes = {}
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+        }))
+        (tmp_path / ".update_exit_code").write_text("0")
+        adapter = MagicMock()
+        adapter.retry_pending_private_notices = AsyncMock(return_value=0)
+        adapter.send = AsyncMock(side_effect=[
+            SendResult(success=False, error="offline"),
+            SendResult(success=False, error="offline"),
+            SendResult(success=True),
+        ])
+        adapter._is_retryable_error.return_value = False
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            await runner._retry_deferred_deliveries(include_lifecycle=True)
+            assert (tmp_path / ".update_pending.claimed.json").exists()
+            await runner._retry_deferred_deliveries(include_lifecycle=True)
+
+        assert not (tmp_path / ".update_pending.claimed.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_deferred_worker_does_not_race_active_update_watcher(self):
+        runner = _make_runner()
+        runner._deferred_delivery_lock = asyncio.Lock()
+        runner._background_task_outcomes = {}
+        runner._send_update_notification = AsyncMock()
+        runner._send_restart_notification = AsyncMock()
+        active = asyncio.create_task(asyncio.sleep(60))
+        runner._update_notification_task = active
+
+        try:
+            await runner._retry_deferred_deliveries(include_lifecycle=True)
+        finally:
+            active.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+
+        runner._send_update_notification.assert_not_awaited()
+        runner._send_restart_notification.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_send_failure_retains_update_artifacts_for_retry(self, tmp_path):
+        runner = _make_runner()
+        pending_path = tmp_path / ".update_pending.json"
+        output_path = tmp_path / ".update_output.txt"
+        exit_path = tmp_path / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+        }))
+        output_path.write_text("done")
+        exit_path.write_text("0")
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+        adapter._is_retryable_error.return_value = False
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        assert (tmp_path / ".update_pending.claimed.json").exists()
+        assert output_path.exists()
+        assert exit_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_legacy_private_update_never_uses_public_send(self, tmp_path):
+        runner = _make_runner()
+        (tmp_path / ".update_pending.json").write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+            "private_user_id": "U1",
+        }))
+        (tmp_path / ".update_exit_code").write_text("0")
+        adapter = MagicMock()
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        adapter.send = AsyncMock()
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            result = await runner._send_update_notification()
+
+        assert result is True
+        adapter.send_private_notice.assert_awaited_once()
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_send_failure_retains_update_artifacts(self, tmp_path):
+        runner = _make_runner()
+        runner._update_prompt_pending = {}
+        pending_path = tmp_path / ".update_pending.json"
+        exit_path = tmp_path / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C1",
+            "session_key": "slack:C1:U1",
+        }))
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+        adapter._is_retryable_error.return_value = False
+        runner.adapters = {Platform.SLACK: adapter}
+
+        with patch("gateway.run._hermes_home", tmp_path):
+            await runner._watch_update_progress(poll_interval=0, timeout=0)
+
+        assert pending_path.exists()
+        assert exit_path.read_text() == "124"
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ We mock the slack modules at import time to avoid collection errors.
 
 import asyncio
 from io import BytesIO
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -20,9 +21,12 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
+    SessionSource,
     SUPPORTED_DOCUMENT_TYPES,
     is_host_excluded_by_no_proxy,
 )
@@ -87,8 +91,9 @@ def _upload_response(filename: str, *, file_id: str = "F123") -> dict:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def adapter():
-    config = PlatformConfig(enabled=True, token="xoxb-fake-token")
+def adapter(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = PlatformConfig(enabled=True, token="test-token")
     a = SlackAdapter(config)
     # Mock the Slack app client
     a._app = MagicMock()
@@ -821,6 +826,45 @@ class TestSendDocument:
         sleep_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_send_document_reports_exhausted_metadata_without_reupload(
+        self, adapter, tmp_path
+    ):
+        test_file = tmp_path / "report.html"
+        test_file.write_bytes(b"<p>safe</p>")
+        adapter._app.client.files_upload_v2 = AsyncMock(
+            return_value={"ok": True, "files": [{"id": "F123"}]}
+        )
+        adapter._app.client.files_info = AsyncMock(
+            return_value={"ok": True, "file": {"id": "F123"}}
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter.send_document("C123", str(test_file))
+
+        assert not result.success
+        assert "could not be verified" in result.error
+        adapter._app.client.files_upload_v2.assert_awaited_once()
+        assert adapter._app.client.files_info.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_image_batch_missing_file_error_hides_parent_path(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        artifact_root = tmp_path / "artifacts"
+        artifact_root.mkdir()
+        missing = artifact_root / "private" / "chart.png"
+        monkeypatch.setenv("HERMES_SLACK_LOCAL_UPLOADS_ENABLED", "true")
+        monkeypatch.setenv("HERMES_SLACK_ARTIFACT_ROOT", str(artifact_root))
+
+        result = await adapter.send_multiple_images(
+            "C123", [(f"file://{missing}", "chart")]
+        )
+
+        assert not result.success
+        assert "File not found: chart.png" in result.error
+        assert str(artifact_root) not in result.error
+
+    @pytest.mark.asyncio
     async def test_send_document_with_thread(self, adapter, tmp_path):
         test_file = tmp_path / "notes.txt"
         test_file.write_bytes(b"some notes")
@@ -946,7 +990,7 @@ class TestSendVideo:
         assert "Not connected" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_video_api_error_falls_back(self, adapter, tmp_path):
+    async def test_send_video_api_error_returns_failure(self, adapter, tmp_path):
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"fake video")
 
@@ -954,13 +998,14 @@ class TestSendVideo:
             side_effect=RuntimeError("Slack API error")
         )
 
-        # Should fall back to base class (text message)
         result = await adapter.send_video(
             chat_id="C123",
             video_path=str(video),
         )
 
-        adapter._app.client.chat_postMessage.assert_called_once()
+        assert not result.success
+        assert "RuntimeError" in result.error
+        adapter._app.client.chat_postMessage.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1066,18 @@ class TestBangPrefixCommands:
         # thread_id is preserved on the source so the reply lands in the
         # same thread.
         assert msg_event.source.thread_id == "1111111111.000001"
+
+    @pytest.mark.asyncio
+    async def test_bang_update_preserves_secondary_workspace(self, adapter):
+        """Deferred update notices must return to the originating workspace."""
+        event = self._make_event("!update")
+        event["team"] = "T_SECONDARY"
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args.args[0]
+        assert msg_event.text == "/update"
+        assert msg_event.platform_team_id == "T_SECONDARY"
 
     @pytest.mark.asyncio
     async def test_bang_unknown_token_passes_through_unchanged(self, adapter):
@@ -1103,7 +1160,7 @@ class TestIncomingDocumentHandling:
         assert msg_event.media_types == ["application/pdf"]
 
     @pytest.mark.asyncio
-    async def test_video_url_does_not_emit_unsupported_document_notice(self, adapter):
+    async def test_video_url_emits_explicit_unsupported_notice(self, adapter):
         with patch.object(
             adapter, "_download_slack_file_bytes", new_callable=AsyncMock
         ) as download:
@@ -1116,7 +1173,8 @@ class TestIncomingDocumentHandling:
             await adapter._handle_slack_message(event)
 
         msg_event = adapter.handle_message.call_args[0][0]
-        assert "unsupported file type" not in msg_event.text
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "clip.mp4 is not supported" in msg_event.text
         download.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1445,6 +1503,74 @@ class TestIncomingDocumentHandling:
         assert "what's in this?" in msg_event.text
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_kind", ["timeout", "429", "500"])
+    async def test_retry_exhaustion_is_surfaced_in_message_text(
+        self,
+        adapter,
+        failure_kind,
+    ):
+        import httpx
+
+        req = httpx.Request("GET", "https://files.slack.com/photo.jpg")
+        if failure_kind == "timeout":
+            failure = httpx.ConnectTimeout("timed out", request=req)
+        else:
+            response = httpx.Response(int(failure_kind), request=req)
+            failure = httpx.HTTPStatusError(
+                failure_kind,
+                request=req,
+                response=response,
+            )
+
+        with patch.object(
+            adapter,
+            "_download_slack_file",
+            new_callable=AsyncMock,
+        ) as download:
+            download.side_effect = failure
+            event = self._make_event(text="what is in this?", files=[{
+                "id": "F123",
+                "mimetype": "image/jpeg",
+                "name": "photo.jpg",
+                "url_private_download": "https://files.slack.com/photo.jpg",
+                "size": 1024,
+            }])
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "photo.jpg could not be downloaded after retries" in msg_event.text
+        assert "what is in this?" in msg_event.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mimetype", "filename"),
+        [
+            ("image/jpeg", "photo.jpg"),
+            ("audio/mpeg", "meeting.mp3"),
+            ("application/octet-stream", "archive.bin"),
+        ],
+    )
+    async def test_attachment_without_authorized_url_surfaces_notice(
+        self,
+        adapter,
+        mimetype,
+        filename,
+    ):
+        event = self._make_event(text="inspect this", files=[{
+            "id": "F_NO_URL",
+            "mimetype": mimetype,
+            "name": filename,
+            "size": 10,
+        }])
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "[Slack attachment notice]" in msg_event.text
+        assert f"{filename} has no authorized download URL" in msg_event.text
+
+    @pytest.mark.asyncio
     async def test_rich_text_blocks_do_not_duplicate_plain_text(self, adapter):
         """Plain rich_text composer blocks match the plain text field exactly,
         so the dedupe guard keeps the message clean."""
@@ -1634,6 +1760,7 @@ class TestMessageRouting:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_called_once()
+        assert adapter.handle_message.call_args.args[0].expects_reply is True
 
     @pytest.mark.asyncio
     async def test_channel_message_requires_mention(self, adapter):
@@ -1662,6 +1789,7 @@ class TestMessageRouting:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "what's the weather?"
         assert "<@U_BOT>" not in msg_event.text
+        assert msg_event.expects_reply is True
 
     @pytest.mark.asyncio
     async def test_bot_messages_ignored(self, adapter):
@@ -2365,6 +2493,41 @@ class TestReactions:
         adapter._app.client.reactions_remove.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_admitted_unmentioned_followup_gets_failure_signal(self, adapter):
+        """A required thread reply stays quiet on success but shows failure."""
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._app.client.users_info = AsyncMock(return_value={
+            "user": {"profile": {"display_name": "Tyler"}}
+        })
+        adapter._mentioned_threads.add("1234567890.000000")
+
+        event = {
+            "text": "follow-up",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "thread_ts": "1234567890.000000",
+            "ts": "1234567890.000005",
+        }
+        await adapter._handle_slack_message(event)
+        msg_event = adapter.handle_message.call_args.args[0]
+
+        assert msg_event.expects_reply is True
+        assert "1234567890.000005" not in adapter._reacting_message_ids
+        assert "1234567890.000005" in adapter._required_reply_message_ids
+
+        from gateway.platforms.base import ProcessingOutcome
+
+        await adapter.on_processing_complete(msg_event, ProcessingOutcome.FAILURE)
+
+        adapter._app.client.reactions_add.assert_awaited_once_with(
+            channel="C123", timestamp="1234567890.000005", name="x"
+        )
+        adapter._app.client.reactions_remove.assert_not_awaited()
+        assert "1234567890.000005" not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
     async def test_reactions_disabled_via_env(self, adapter, monkeypatch):
         """SLACK_REACTIONS=false should suppress all reaction lifecycle."""
         monkeypatch.setenv("SLACK_REACTIONS", "false")
@@ -2383,10 +2546,12 @@ class TestReactions:
         }
         await adapter._handle_slack_message(event)
 
-        # Should NOT register for reactions when toggle is off
+        # Track required replies independently from optional reactions.
         assert "1234567890.000004" not in adapter._reacting_message_ids
+        assert "1234567890.000004" in adapter._required_reply_message_ids
+        assert adapter.handle_message.call_args.args[0].expects_reply is True
 
-        # Hooks should also be no-ops when disabled
+        # A failed turn must use a visible text fallback when reactions are off.
         from gateway.platforms.base import MessageEvent, MessageType, SessionSource, ProcessingOutcome
         from gateway.config import Platform
         source = SessionSource(
@@ -2401,13 +2566,291 @@ class TestReactions:
             source=source,
             message_id="1234567890.000004",
         )
-        # Force-add to verify hooks respect the toggle independently
-        adapter._reacting_message_ids.add("1234567890.000004")
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
         await adapter.on_processing_start(msg_event)
-        await adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS)
+        await adapter.on_processing_complete(msg_event, ProcessingOutcome.FAILURE)
 
         adapter._app.client.reactions_add.assert_not_called()
         adapter._app.client.reactions_remove.assert_not_called()
+        adapter.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_required_failure_uses_text_when_reactions_are_disabled(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback"))
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000006",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["reply_to"] == event.message_id
+
+    @pytest.mark.asyncio
+    async def test_detailed_error_reply_suppresses_generic_failure_text(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="detail"))
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000010",
+            expects_reply=True,
+        )
+        event.delivery_state.reply_attempted = True
+        event.delivery_state.reply_delivered = True
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.send.assert_not_awaited()
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_partial_delivery_failure_uses_text_when_reactions_are_disabled(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000011",
+            expects_reply=True,
+        )
+        event.delivery_state.reply_attempted = True
+        event.delivery_state.reply_delivered = True
+        event.delivery_state.reply_failed = True
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["reply_to"] == event.message_id
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_delivered_failure_notice_avoids_duplicate_terminal_fallback(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("SLACK_REACTIONS", "false")
+        adapter.send = AsyncMock()
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000012",
+            expects_reply=True,
+        )
+        event.delivery_state.reply_attempted = True
+        event.delivery_state.reply_failed = True
+        event.delivery_state.failure_notice_delivered = True
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.send.assert_not_awaited()
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_required_failure_uses_text_when_reaction_fails(self, adapter):
+        adapter._add_reaction = AsyncMock(return_value=False)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback"))
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000007",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter._add_reaction.assert_awaited_once_with(
+            "C123", event.message_id, "x"
+        )
+        adapter.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_required_failure_retries_text_before_clearing_state(
+        self, adapter, monkeypatch
+    ):
+        adapter._add_reaction = AsyncMock(return_value=False)
+        adapter.send = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="temporary", retryable=True),
+                SendResult(success=True, message_id="fallback"),
+            ]
+        )
+        monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", AsyncMock())
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="dm",
+            user_id="U_USER",
+        )
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="1234567890.000008",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        assert adapter.send.await_count == 2
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_required_failure_clears_state_after_delivery_exhaustion(
+        self, adapter, monkeypatch
+    ):
+        adapter._add_reaction = AsyncMock(return_value=False)
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="Slack unavailable")
+        )
+        monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", AsyncMock())
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000011",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        assert adapter.send.await_count > 1
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_discard_reply_requirement_clears_slack_lifecycle_state(self, adapter):
+        event = MessageEvent(
+            text="ignored",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="group",
+                user_id="U_UNKNOWN",
+            ),
+            message_id="1234567890.000009",
+            expects_reply=True,
+        )
+        adapter._reacting_message_ids.add(event.message_id)
+        adapter._required_reply_message_ids.add(event.message_id)
+
+        await adapter.discard_reply_requirement(event)
+
+        assert event.expects_reply is False
+        assert event.message_id not in adapter._reacting_message_ids
+        assert event.message_id not in adapter._required_reply_message_ids
+
+    @pytest.mark.asyncio
+    async def test_discard_reply_requirement_removes_existing_eyes(self, adapter):
+        event = MessageEvent(
+            text="ignored",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="group",
+                user_id="U_UNKNOWN",
+            ),
+            message_id="1234567890.000011",
+            expects_reply=True,
+        )
+        adapter._reacting_message_ids.add(event.message_id)
+        adapter._required_reply_message_ids.add(event.message_id)
+        adapter._remove_reaction = AsyncMock(return_value=True)
+
+        await adapter.discard_reply_requirement(event)
+
+        adapter._remove_reaction.assert_awaited_once_with(
+            "C123",
+            event.message_id,
+            "eyes",
+        )
+        assert event.message_id not in adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_expected_cancellation_clears_reply_state_without_failure_signal(
+        self, adapter, caplog
+    ):
+        event = MessageEvent(
+            text="cancelled",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="dm",
+                user_id="U_USER",
+            ),
+            message_id="1234567890.000010",
+            expects_reply=True,
+        )
+        adapter._required_reply_message_ids.add(event.message_id)
+        adapter.send = AsyncMock()
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+        assert event.message_id not in adapter._required_reply_message_ids
+        adapter.send.assert_not_awaited()
+        assert "Exhausted terminal reply delivery" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_reactions_enabled_by_default(self, adapter):
@@ -2490,6 +2933,7 @@ class TestThreadReplyHandling:
         # Verify the text is passed through unchanged (no mention stripping needed)
         msg_event = adapter_with_session_store.handle_message.call_args[0][0]
         assert msg_event.text == "Follow-up question"
+        assert msg_event.expects_reply is True
 
     @pytest.mark.asyncio
     async def test_thread_reply_with_mention_strips_bot_id(
@@ -2951,55 +3395,74 @@ class TestReplyBroadcast:
 # TestFallbackPreservesThreadContext
 # ---------------------------------------------------------------------------
 
-class TestFallbackPreservesThreadContext:
-    """Bug fix: file upload fallbacks lost thread context (metadata) when
-    calling super() without metadata, causing replies to appear outside
-    the thread."""
+class TestFailedLocalUploadReporting:
+    """Local upload failures must not expose inaccessible local paths."""
 
     @pytest.mark.asyncio
-    async def test_send_image_file_fallback_preserves_thread(self, adapter, tmp_path):
+    async def test_send_image_file_failure_does_not_post_path(self, adapter, tmp_path):
         test_file = tmp_path / "photo.jpg"
         test_file.write_bytes(b"\xff\xd8\xff\xe0")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
-            side_effect=Exception("upload failed")
+            side_effect=Exception(f"upload failed at {test_file}")
         )
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "msg_ts"}
         )
 
         metadata = {"thread_id": "parent_ts_123"}
-        await adapter.send_image_file(
+        result = await adapter.send_image_file(
             chat_id="C123",
             image_path=str(test_file),
             caption="test image",
             metadata=metadata,
         )
 
-        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
-        assert call_kwargs.get("thread_ts") == "parent_ts_123"
+        assert not result.success
+        assert "Slack image upload failed" in result.error
+        assert str(tmp_path) not in result.error
+        adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_send_video_fallback_preserves_thread(self, adapter, tmp_path):
+    async def test_send_video_failure_does_not_post_path(self, adapter, tmp_path):
         test_file = tmp_path / "clip.mp4"
         test_file.write_bytes(b"\x00\x00\x00\x1c")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
-            side_effect=Exception("upload failed")
+            side_effect=Exception(f"upload failed at {test_file}")
         )
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "msg_ts"}
         )
 
         metadata = {"thread_id": "parent_ts_456"}
-        await adapter.send_video(
+        result = await adapter.send_video(
             chat_id="C123",
             video_path=str(test_file),
             metadata=metadata,
         )
 
-        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
-        assert call_kwargs.get("thread_ts") == "parent_ts_456"
+        assert not result.success
+        assert "Slack video upload failed" in result.error
+        assert str(tmp_path) not in result.error
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_voice_failure_does_not_expose_path(self, adapter, tmp_path):
+        test_file = tmp_path / "voice.mp3"
+        test_file.write_bytes(b"ID3")
+        adapter._app.client.files_upload_v2 = AsyncMock(
+            side_effect=Exception(f"upload failed at {test_file}")
+        )
+
+        result = await adapter.send_voice(
+            chat_id="C123",
+            audio_path=str(test_file),
+        )
+
+        assert not result.success
+        assert "Slack audio upload failed" in result.error
+        assert str(tmp_path) not in result.error
 
     @pytest.mark.asyncio
     async def test_send_document_failure_does_not_post_path_fallback(
@@ -3009,7 +3472,7 @@ class TestFallbackPreservesThreadContext:
         test_file.write_bytes(b"%PDF-1.4")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
-            side_effect=Exception("upload failed")
+            side_effect=Exception(f"upload failed at {test_file}")
         )
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "msg_ts"}
@@ -3024,11 +3487,12 @@ class TestFallbackPreservesThreadContext:
         )
 
         assert not result.success
-        assert "upload failed" in result.error
+        assert "Slack document upload failed" in result.error
+        assert str(tmp_path) not in result.error
         adapter._app.client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_send_image_file_fallback_includes_caption(self, adapter, tmp_path):
+    async def test_send_image_file_failure_does_not_post_caption(self, adapter, tmp_path):
         test_file = tmp_path / "photo.jpg"
         test_file.write_bytes(b"\xff\xd8\xff\xe0")
 
@@ -3039,14 +3503,50 @@ class TestFallbackPreservesThreadContext:
             return_value={"ts": "msg_ts"}
         )
 
-        await adapter.send_image_file(
+        result = await adapter.send_image_file(
             chat_id="C123",
             image_path=str(test_file),
             caption="important screenshot",
         )
 
-        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
-        assert "important screenshot" in call_kwargs["text"]
+        assert not result.success
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method_name", "path_parameter", "filename"),
+        [
+            ("send_image_file", "image_path", "missing.png"),
+            ("send_voice", "audio_path", "missing.mp3"),
+            ("send_video", "video_path", "missing.mp4"),
+            ("send_document", "file_path", "missing.pdf"),
+        ],
+    )
+    async def test_missing_local_file_error_hides_parent_path(
+        self,
+        adapter,
+        tmp_path,
+        method_name,
+        path_parameter,
+        filename,
+    ):
+        missing = tmp_path / "private" / filename
+
+        result = await getattr(adapter, method_name)(
+            chat_id="C123",
+            **{path_parameter: str(missing)},
+        )
+
+        assert not result.success
+        assert filename in result.error
+        expected_prefix = {
+            "send_image_file": "Image file not found: ",
+            "send_voice": "Audio file not found: ",
+            "send_video": "Video file not found: ",
+            "send_document": "File not found: ",
+        }[method_name]
+        assert result.error == expected_prefix + filename
+        assert str(tmp_path) not in result.error
 
 
 # ---------------------------------------------------------------------------
@@ -3360,16 +3860,23 @@ class TestSlashEphemeralAck:
             "text": "follow-up question",
             "user_id": "U_SLASH",
             "channel_id": "C_SLASH",
+            "team_id": "T_SECONDARY",
             "response_url": "https://hooks.slack.com/commands/T123/456/abc",
         }
         await adapter._handle_slash_command(command)
 
-        # The context should be stashed under (channel_id, user_id).
-        key = ("C_SLASH", "U_SLASH")
-        assert key in adapter._slash_command_contexts
-        ctx = adapter._slash_command_contexts[key]
+        matching = [
+            ctx for key, ctx in adapter._slash_command_contexts.items()
+            if key[:2] == ("C_SLASH", "U_SLASH")
+        ]
+        assert len(matching) == 1
+        ctx = matching[0]
         assert ctx["response_url"] == "https://hooks.slack.com/commands/T123/456/abc"
         assert "ts" in ctx
+        event = adapter.handle_message.await_args.args[0]
+        assert event.expects_reply is True
+        assert event.private_reply_user_id == "U_SLASH"
+        assert event.platform_team_id == "T_SECONDARY"
 
     @pytest.mark.asyncio
     async def test_slash_command_without_response_url_does_not_stash(self, adapter):
@@ -3388,12 +3895,18 @@ class TestSlashEphemeralAck:
     async def test_pop_slash_context_returns_and_removes(self, adapter):
         """_pop_slash_context returns the context and removes it."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/test",
             "ts": time.monotonic(),
         }
 
-        ctx = adapter._pop_slash_context("C1")
+        token = _slash_user_id.set("U1")
+        try:
+            ctx = adapter._pop_slash_context("C1")
+        finally:
+            _slash_user_id.reset(token)
         assert ctx is not None
         assert ctx["response_url"] == "https://hooks.slack.com/test"
         # Must be removed after pop
@@ -3422,6 +3935,8 @@ class TestSlashEphemeralAck:
     async def test_send_uses_response_url_when_context_exists(self, adapter):
         """send() should POST to response_url for slash command replies."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C_SLASH", "U_SLASH")] = {
             "response_url": "https://hooks.slack.com/commands/T123/456/abc",
             "ts": time.monotonic(),
@@ -3437,8 +3952,12 @@ class TestSlashEphemeralAck:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
-            result = await adapter.send("C_SLASH", "Queued for the next turn.")
+        token = _slash_user_id.set("U_SLASH")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+                result = await adapter.send("C_SLASH", "Queued for the next turn.")
+        finally:
+            _slash_user_id.reset(token)
 
         assert result.success is True
         # Verify response_url was POSTed to
@@ -3454,6 +3973,240 @@ class TestSlashEphemeralAck:
         assert len(adapter._slash_command_contexts) == 0
 
     @pytest.mark.asyncio
+    async def test_long_slash_reply_delivers_remaining_chunks_privately(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/long",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "follow-up"}
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        content = "x" * (adapter.MAX_MESSAGE_LENGTH + 10)
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+                result = await adapter.send("C1", content)
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        assert adapter._app.client.chat_postEphemeral.await_args.kwargs["user"] == "U1"
+        remainder = adapter._app.client.chat_postEphemeral.await_args.kwargs["text"]
+        assert remainder.startswith("x" * 10)
+        assert remainder.endswith("(2/2)")
+
+    @pytest.mark.asyncio
+    async def test_slash_continuation_is_not_formatted_twice(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/format",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "fallback-1"}
+        )
+        response = AsyncMock()
+        response.status = 500
+        response.text = AsyncMock(return_value="failed")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+                result = await adapter.send("C1", "**bold**")
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        assert adapter._app.client.chat_postEphemeral.await_args.kwargs["text"] == "*bold*"
+
+    @pytest.mark.asyncio
+    async def test_response_url_timeout_does_not_resend_payload(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/timeout",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter.send_private_notice = AsyncMock()
+        response = AsyncMock()
+        response.__aenter__ = AsyncMock(side_effect=asyncio.TimeoutError())
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+                result = await adapter.send("C1", "command result")
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success is False
+        assert "timed out" in result.error
+        adapter.send_private_notice.assert_not_awaited()
+
+        second_result = await adapter._send_slash_ephemeral(
+            adapter._slash_command_contexts[("C1", "U1")],
+            "later status",
+        )
+        assert second_result.success is False
+        assert "timed out" in second_result.error
+        session.post.assert_called_once()
+        adapter.send_private_notice.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_slash_retry_resumes_failed_suffix(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_invocation_id, _slash_user_id
+
+        invocation_id = "invoke-1"
+        adapter._slash_command_contexts[("C1", "U1", invocation_id)] = {
+            "response_url": "https://hooks.slack.com/commands/resume",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "invocation_id": invocation_id,
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            side_effect=[
+                {"message_ts": "chunk-2"},
+                RuntimeError("transient chunk failure"),
+                {"message_ts": "chunk-3"},
+            ]
+        )
+        response = AsyncMock()
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        content = "x" * (adapter.MAX_MESSAGE_LENGTH * 2 + 10)
+        user_token = _slash_user_id.set("U1")
+        invocation_token = _slash_invocation_id.set(invocation_id)
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await adapter._send_with_retry(
+                    "C1", content, max_retries=1, base_delay=0
+                )
+        finally:
+            _slash_invocation_id.reset(invocation_token)
+            _slash_user_id.reset(user_token)
+
+        assert result.success
+        session.post.assert_called_once()
+        assert adapter._app.client.chat_postEphemeral.await_count == 3
+        calls = adapter._app.client.chat_postEphemeral.await_args_list
+        assert calls[0].kwargs["text"].endswith("(2/3)")
+        assert calls[1].kwargs["text"].endswith("(3/3)")
+        assert calls[2].kwargs["text"].endswith("(3/3)")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_user_slashes_keep_exact_context(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_invocation_id, _slash_user_id
+
+        contexts = {}
+        for invocation_id in ("first", "second"):
+            key = ("C1", "U1", invocation_id)
+            contexts[invocation_id] = {
+                "response_url": f"https://hooks.slack.com/commands/{invocation_id}",
+                "channel_id": "C1",
+                "user_id": "U1",
+                "invocation_id": invocation_id,
+                "ts": time.monotonic(),
+            }
+            adapter._slash_command_contexts[key] = contexts[invocation_id]
+
+        seen = []
+
+        async def capture(ctx, content):
+            seen.append((ctx["invocation_id"], content))
+            return SendResult(success=True)
+
+        adapter._send_slash_ephemeral = AsyncMock(side_effect=capture)
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        async def send_bound(invocation_id, content):
+            user_token = _slash_user_id.set("U1")
+            invocation_token = _slash_invocation_id.set(invocation_id)
+            try:
+                return await adapter.send("C1", content)
+            finally:
+                _slash_invocation_id.reset(invocation_token)
+                _slash_user_id.reset(user_token)
+
+        results = await asyncio.gather(
+            send_bound("first", "first reply"),
+            send_bound("second", "second reply"),
+        )
+
+        assert all(result.success for result in results)
+        assert sorted(seen) == [("first", "first reply"), ("second", "second reply")]
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bound_delayed_slash_context_is_not_expired_publicly(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_invocation_id, _slash_user_id
+
+        invocation_id = "slow"
+        adapter._slash_command_contexts[("C1", "U1", invocation_id)] = {
+            "response_url": "https://hooks.slack.com/commands/slow",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "invocation_id": invocation_id,
+            "ts": time.monotonic() - adapter._SLASH_CTX_TTL - 1,
+        }
+        adapter._send_slash_ephemeral = AsyncMock(return_value=SendResult(success=True))
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        user_token = _slash_user_id.set("U1")
+        invocation_token = _slash_invocation_id.set(invocation_id)
+        try:
+            result = await adapter.send("C1", "delayed private reply")
+        finally:
+            _slash_invocation_id.reset(invocation_token)
+            _slash_user_id.reset(user_token)
+
+        assert result.success
+        adapter._send_slash_ephemeral.assert_awaited_once()
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_send_falls_through_without_context(self, adapter):
         """send() should use normal chat_postMessage when no slash context exists."""
         mock_result = {"ts": "1234.5678", "ok": True}
@@ -3466,12 +4219,19 @@ class TestSlashEphemeralAck:
 
     @pytest.mark.asyncio
     async def test_send_slash_ephemeral_fallback_on_post_failure(self, adapter):
-        """_send_slash_ephemeral returns success=True even if POST fails."""
+        """A failed response_url uses a second private Slack message."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/commands/bad",
+            "channel_id": "C1",
+            "user_id": "U1",
             "ts": time.monotonic(),
         }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "fallback-1"}
+        )
 
         mock_resp = AsyncMock()
         mock_resp.status = 500
@@ -3484,30 +4244,585 @@ class TestSlashEphemeralAck:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
-            result = await adapter.send("C1", "Some response")
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+                result = await adapter.send("C1", "Some response")
+        finally:
+            _slash_user_id.reset(token)
 
-        # Still success — the user saw the initial ack already
         assert result.success is True
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        fallback = adapter._app.client.chat_postEphemeral.await_args.kwargs
+        assert fallback["channel"] == "C1"
+        assert fallback["user"] == "U1"
+        assert fallback["text"] == "Some response"
 
     @pytest.mark.asyncio
     async def test_send_slash_ephemeral_fallback_on_exception(self, adapter):
-        """_send_slash_ephemeral returns success=True even if aiohttp raises."""
+        """Both private-delivery failures return a terminal failure."""
         import time
+        from gateway.platforms.slack import _slash_user_id
+
         adapter._slash_command_contexts[("C1", "U1")] = {
             "response_url": "https://hooks.slack.com/commands/timeout",
+            "channel_id": "C1",
+            "user_id": "U1",
             "ts": time.monotonic(),
         }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            side_effect=RuntimeError("ephemeral failed")
+        )
 
         mock_session = AsyncMock()
         mock_session.post = MagicMock(side_effect=Exception("connection timeout"))
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
-            result = await adapter.send("C1", "Some response")
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+                result = await adapter.send("C1", "Some response")
+        finally:
+            _slash_user_id.reset(token)
 
-        assert result.success is True
+        assert result.success is False
+        assert "ephemeral failed" in result.error
+        assert ("C1", "U1") in adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_prompt_is_private_and_bound_to_invoker(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/confirm",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "ephemeral-confirm"}
+        )
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        token = _slash_user_id.set("U1")
+        try:
+            result = await adapter.send_slash_confirm(
+                "C1", "Confirm", "Run /new?", "session-1", "confirm-1"
+            )
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        assert adapter._app.client.chat_postEphemeral.await_args.kwargs["user"] == "U1"
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+        assert adapter._slash_confirm_owners[("session-1", "confirm-1")]["user_id"] == "U1"
+        assert adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_owner_state_is_bounded(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        now = time.monotonic()
+        adapter._slash_confirm_owners = {
+            ("session", str(index)): {"user_id": "U1", "created_at": now}
+            for index in range(256)
+        }
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/confirm",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": now,
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "ephemeral-confirm"}
+        )
+
+        token = _slash_user_id.set("U1")
+        try:
+            result = await adapter.send_slash_confirm(
+                "C1", "Confirm", "Proceed?", "new-session", "new-confirm"
+            )
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        assert len(adapter._slash_confirm_owners) == 256
+        assert ("session", "0") not in adapter._slash_confirm_owners
+        assert ("new-session", "new-confirm") in adapter._slash_confirm_owners
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_keeps_final_answer_private(self, adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/confirm-final",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "ephemeral-confirm"}
+        )
+        adapter._send_slash_ephemeral = AsyncMock(return_value=SendResult(success=True))
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        token = _slash_user_id.set("U1")
+        try:
+            confirm_result = await adapter.send_slash_confirm(
+                "C1", "Confirm", "Run /new?", "session-1", "confirm-1"
+            )
+            final_result = await adapter.send("C1", "Private final answer")
+        finally:
+            _slash_user_id.reset(token)
+
+        assert confirm_result.success
+        assert final_result.success
+        adapter._send_slash_ephemeral.assert_awaited_once()
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+        assert not adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_rejects_other_allowed_user(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1,U2")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        resolve = AsyncMock(return_value="done")
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        ack = AsyncMock()
+        body = {
+            "user": {"id": "U2", "name": "other"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        await adapter._handle_slash_confirm_action(ack, body, action)
+
+        ack.assert_awaited_once()
+        resolve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_rejects_expired_owner(self, adapter, monkeypatch):
+        import time
+
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {
+            "user_id": "U1",
+            "created_at": time.monotonic() - adapter._SLASH_CTX_TTL - 1,
+        }
+        resolve = AsyncMock(return_value="done")
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        resolve.assert_not_awaited()
+        assert ("session-1", "confirm-1") not in adapter._slash_confirm_owners
+        adapter.send_private_notice.assert_awaited_once()
+        assert (
+            adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"]
+            == "expired_notified"
+        )
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_resolves_only_once(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        resolve = AsyncMock(return_value="done")
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        ack = AsyncMock()
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        await asyncio.gather(
+            adapter._handle_slash_confirm_action(ack, body, action),
+            adapter._handle_slash_confirm_action(ack, body, action),
+        )
+
+        assert ack.await_count == 2
+        resolve.assert_awaited_once_with("session-1", "confirm-1", "once")
+        adapter.send_private_notice.assert_awaited_once_with(
+            chat_id="C1",
+            user_id="U1",
+            content="done",
+            reply_to=None,
+            metadata=None,
+        )
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_slash_confirm_never_displays_approved(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        resolve = AsyncMock(return_value=None)
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        adapter.send_private_notice = AsyncMock()
+        response = AsyncMock()
+        response.status = 200
+        session = AsyncMock()
+        session.post = AsyncMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        ack = AsyncMock()
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.com/actions/update",
+            "message": {
+                "ts": "prompt-1",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "Confirm?"}}
+                ],
+            },
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+            await adapter._handle_slash_confirm_action(ack, body, action)
+
+        payload = session.post.await_args.kwargs["json"]
+        assert payload["response_type"] == "ephemeral"
+        assert payload["replace_original"] is True
+        assert "expired or was superseded" in payload["text"]
+        assert "Approved" not in payload["text"]
+        adapter.send_private_notice.assert_not_awaited()
+        assert adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_retries_private_result(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="completed privately"),
+        )
+        adapter.send_private_notice = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="connection reset", retryable=True),
+                SendResult(success=True, message_id="private-result"),
+            ]
+        )
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert adapter.send_private_notice.await_count == 2
+        assert adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_records_private_delivery_failure_notice(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="completed privately"),
+        )
+        adapter.send_private_notice = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="not_allowed"),
+                SendResult(success=False, error="not_allowed"),
+            ]
+        )
+        failed_update = AsyncMock(status=500)
+        notice_update = AsyncMock(status=200)
+        session = AsyncMock()
+        session.post = AsyncMock(side_effect=[failed_update, notice_update])
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.com/actions/update",
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session):
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert session.post.await_count == 2
+        assert "could not be delivered" in session.post.await_args.kwargs["json"]["text"]
+        assert (
+            adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"]
+            == "delivery_failed_notified"
+        )
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_records_private_delivery_exceptions(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="completed privately"),
+        )
+        adapter.send_private_notice = AsyncMock(side_effect=RuntimeError("offline"))
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert adapter.send_private_notice.await_count == 4
+        assert (
+            adapter._slash_confirm_outcomes[("session-1", "confirm-1")]["status"]
+            == "delivery_failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_outcome_state_is_bounded(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_outcomes = {
+            ("session", str(index)): {"status": "delivered"}
+            for index in range(256)
+        }
+        adapter._slash_confirm_owners[("new-session", "new-confirm")] = {
+            "user_id": "U1"
+        }
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="done"),
+        )
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "new-session|new-confirm",
+        }
+
+        await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        assert len(adapter._slash_confirm_outcomes) == 256
+        assert ("session", "0") not in adapter._slash_confirm_outcomes
+        assert ("new-session", "new-confirm") in adapter._slash_confirm_outcomes
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_failure_persists_and_retries(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U1")
+        adapter._slash_confirm_owners[("session-1", "confirm-1")] = {"user_id": "U1"}
+        monkeypatch.setattr(
+            "tools.slash_confirm.resolve",
+            AsyncMock(return_value="completed privately"),
+        )
+        adapter.send_private_notice = AsyncMock(
+            return_value=SendResult(success=False, error="offline")
+        )
+        body = {
+            "user": {"id": "U1", "name": "owner"},
+            "team": {"id": "T2"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "prompt-1", "blocks": []},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "session-1|confirm-1",
+        }
+
+        await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        saved = json.loads(adapter._slash_confirm_outcomes_path.read_text())
+        assert saved[-1]["status"] == "delivery_failed"
+        assert saved[-1]["pending_notice"]["team_id"] == "T2"
+
+        restarted = SlackAdapter(PlatformConfig(enabled=True, token="test-token"))
+        restarted._app = MagicMock()
+        restarted.send_private_notice = AsyncMock(return_value=SendResult(success=True))
+        assert await restarted.retry_pending_private_notices() == 1
+        assert restarted.send_private_notice.await_args.kwargs["metadata"] == {
+            "team_id": "T2"
+        }
+        assert (
+            restarted._slash_confirm_outcomes[("session-1", "confirm-1")]["status"]
+            == "retry_delivered"
+        )
+
+    @pytest.mark.asyncio
+    async def test_private_notice_uses_explicit_workspace_client(self, adapter):
+        secondary = AsyncMock()
+        secondary.chat_postEphemeral = AsyncMock(return_value={"message_ts": "m1"})
+        adapter._team_clients["T2"] = secondary
+
+        result = await adapter.send_private_notice(
+            chat_id="C1",
+            user_id="U1",
+            content="private result",
+            metadata={"team_id": "T2"},
+        )
+
+        assert result.success
+        secondary.chat_postEphemeral.assert_awaited_once()
+        adapter._app.client.chat_postEphemeral.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_retry_keeps_slash_fallback_private(self, adapter):
+        """A failed private slash send retries privately and never posts publicly."""
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/retry",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            side_effect=[RuntimeError("private failed"), {"message_ts": "private-2"}]
+        )
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        failed = AsyncMock()
+        failed.status = 500
+        failed.text = AsyncMock(return_value="failed")
+        failed.__aenter__ = AsyncMock(return_value=failed)
+        failed.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=failed)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        token = _slash_user_id.set("U1")
+        try:
+            with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=session), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await adapter._send_with_retry(
+                    "C1", "private result", max_retries=1, base_delay=0
+                )
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success
+        assert adapter._app.client.chat_postEphemeral.await_count == 2
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+        assert ("C1", "U1") not in adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_private_route_metadata_stays_private_after_queue(self, adapter):
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "private-1"}
+        )
+        adapter._app.client.chat_postMessage = AsyncMock()
+
+        result = await adapter.send(
+            "C1",
+            "queued private result",
+            metadata={"private_reply_user_id": "U1", "team_id": "T2"},
+        )
+
+        assert result.success
+        adapter._app.client.chat_postEphemeral.assert_awaited_once()
+        adapter._app.client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_public_reply_is_persisted_and_retried(
+        self, adapter
+    ):
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="offline", retryable=True)
+        )
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await BasePlatformAdapter._send_with_retry(
+                adapter,
+                "C1",
+                "durable answer",
+                reply_to="thread-1",
+                metadata={"team_id": "T2"},
+                max_retries=1,
+                base_delay=0,
+            )
+
+        assert not result.success
+        saved = json.loads(adapter._slash_confirm_outcomes_path.read_text())
+        assert saved[-1]["pending_notice"]["content"] == "durable answer"
+        assert saved[-1]["pending_notice"]["team_id"] == "T2"
+
+        restarted = SlackAdapter(PlatformConfig(enabled=True, token="test-token"))
+        restarted._app = MagicMock()
+        restarted.send = AsyncMock(return_value=SendResult(success=True))
+        assert await restarted.retry_pending_private_notices() == 1
+        restarted.send.assert_awaited_once_with(
+            chat_id="C1",
+            content="durable answer",
+            reply_to="thread-1",
+            metadata={"team_id": "T2"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_private_timeout_persists_uncertain_delivery_notice(self, adapter):
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="ReadTimeout: request timed out",
+            )
+        )
+
+        result = await BasePlatformAdapter._send_with_retry(
+            adapter,
+            "C1",
+            "possibly delivered private answer",
+            metadata={"private_reply_user_id": "U1", "team_id": "T2"},
+        )
+
+        assert not result.success
+        saved = json.loads(adapter._slash_confirm_outcomes_path.read_text())
+        pending = saved[-1]["pending_notice"]
+        assert "could not confirm" in pending["content"]
+        assert "possibly delivered private answer" not in pending["content"]
+        assert pending["user_id"] == "U1"
+        assert pending["team_id"] == "T2"
 
     @pytest.mark.asyncio
     async def test_native_slash_stashes_context_and_dispatches(self, adapter):
@@ -3528,7 +4843,7 @@ class TestSlashEphemeralAck:
         assert event.message_type == MessageType.COMMAND
 
         # 2. Context stashed for ephemeral routing
-        assert ("C_Q", "U_Q") in adapter._slash_command_contexts
+        assert any(key[:2] == ("C_Q", "U_Q") for key in adapter._slash_command_contexts)
 
     @pytest.mark.asyncio
     async def test_legacy_hermes_slash_stashes_context(self, adapter):
@@ -3543,7 +4858,7 @@ class TestSlashEphemeralAck:
         await adapter._handle_slash_command(command)
 
         adapter.handle_message.assert_called_once()
-        assert ("C_H", "U_H") in adapter._slash_command_contexts
+        assert any(key[:2] == ("C_H", "U_H") for key in adapter._slash_command_contexts)
 
     @pytest.mark.asyncio
     async def test_freeform_hermes_question_does_not_stash_context(self, adapter):
@@ -3619,7 +4934,25 @@ class TestSlashEphemeralAck:
         # ContextVar is unset (default=None) — simulates a normal message send.
         assert _slash_user_id.get() is None
         ctx = adapter._pop_slash_context("C1")
-        # Fallback scan still finds it (channel-only) — this is fine for
-        # the normal single-user case; the ContextVar path is the precise one.
-        # The key invariant is: when the ContextVar IS set, it matches exactly.
-        assert ctx is not None  # fallback path finds the entry
+        assert ctx is None
+        assert ("C1", "U1") in adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_stale_slash_context_cannot_steal_ordinary_reply(self, adapter):
+        import time
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/stale",
+            "channel_id": "C1",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "ordinary-1"}
+        )
+
+        result = await adapter.send("C1", "ordinary reply")
+
+        assert result.success
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        assert ("C1", "U1") in adapter._slash_command_contexts

@@ -36,7 +36,8 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
     runner.session_store = _FakeSessionStore()
-    runner.adapters = {}
+    adapter = type("GoalAdapter", (), {"_pending_messages": {}})()
+    runner.adapters = {Platform.DISCORD: adapter}
     runner._queued_events = {}
 
     event = MessageEvent(
@@ -49,6 +50,8 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
             user_id="user-goal-config",
         ),
         message_id="msg-goal-config",
+        private_reply_user_id="U_PRIVATE",
+        platform_team_id="T_SECONDARY",
     )
 
     response = await GatewayRunner._handle_goal_command(runner, event)
@@ -58,5 +61,9 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         state = goals.GoalManager("sid-gateway-goal-config").state
         assert state is not None
         assert state.max_turns == 7
+        kickoff = next(iter(adapter._pending_messages.values()))
+        assert kickoff.private_reply_user_id == "U_PRIVATE"
+        assert kickoff.platform_team_id == "T_SECONDARY"
+        assert kickoff.expects_reply is True
     finally:
         goals._DB_CACHE.clear()

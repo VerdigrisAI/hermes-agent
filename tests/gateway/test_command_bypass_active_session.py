@@ -13,13 +13,24 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
 from gateway.session import SessionSource, build_session_key
+from gateway.run import _queued_reply_event
+from gateway.run import GatewayRunner
+from run_agent import AIAgent
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +172,48 @@ class TestCommandBypassActiveSession:
         assert any("handled:status" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
+    async def test_busy_private_command_error_is_persisted(self):
+        adapter = _make_adapter()
+        session_key = _session_key()
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._message_handler = AsyncMock(side_effect=RuntimeError("boom"))
+        adapter._send_with_retry = AsyncMock(side_effect=RuntimeError("send failed"))
+        adapter.persist_delivery_retry = MagicMock(return_value=True)
+        event = _make_event("/status")
+        event.expects_reply = True
+        event.private_reply_user_id = "U_PRIVATE"
+        event.platform_team_id = "T_SECONDARY"
+
+        await adapter.handle_message(event)
+
+        adapter.persist_delivery_retry.assert_called_once()
+        metadata = adapter.persist_delivery_retry.call_args.kwargs["metadata"]
+        assert metadata["private_reply_user_id"] == "U_PRIVATE"
+        assert metadata["team_id"] == "T_SECONDARY"
+        assert event.delivery_state.reply_failed is True
+
+    @pytest.mark.asyncio
+    async def test_busy_private_reset_error_is_persisted(self):
+        adapter = _make_adapter()
+        session_key = _session_key()
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._message_handler = AsyncMock(side_effect=RuntimeError("boom"))
+        adapter._send_with_retry = AsyncMock(side_effect=RuntimeError("send failed"))
+        adapter.persist_delivery_retry = MagicMock(return_value=True)
+        event = _make_event("/reset")
+        event.expects_reply = True
+        event.private_reply_user_id = "U_PRIVATE"
+        event.platform_team_id = "T_SECONDARY"
+
+        await adapter.handle_message(event)
+
+        adapter.persist_delivery_retry.assert_called_once()
+        metadata = adapter.persist_delivery_retry.call_args.kwargs["metadata"]
+        assert metadata["private_reply_user_id"] == "U_PRIVATE"
+        assert metadata["team_id"] == "T_SECONDARY"
+        assert event.delivery_state.reply_failed is True
+
+    @pytest.mark.asyncio
     async def test_agents_bypasses_guard(self):
         """/agents must bypass so active-task queries don't interrupt runs."""
         adapter = _make_adapter()
@@ -266,6 +319,249 @@ class TestCommandBypassActiveSession:
         assert any("handled:queue" in r for r in adapter.sent_responses), (
             "/queue response was not sent back to the user"
         )
+
+    def test_start_records_reply_owner_before_background_task_runs(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_adapter()
+        event = _make_event("hello")
+        sk = _session_key()
+
+        def fake_create_task(coro):
+            coro.close()
+            return MagicMock()
+
+        monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+        assert adapter._start_session_processing(event, sk) is True
+        assert adapter._active_message_events[sk] is event
+
+    def test_queued_turn_preserves_the_original_reply_contract(self):
+        event = _make_event("/queue follow up")
+        event.expects_reply = True
+        event.private_reply_user_id = "U_PRIVATE"
+        event.platform_team_id = "T_SECONDARY"
+
+        queued = _queued_reply_event(event, "follow up")
+
+        assert queued.text == "follow up"
+        assert queued.message_id == event.message_id
+        assert queued.expects_reply is True
+        assert queued.private_reply_user_id == "U_PRIVATE"
+        assert queued.platform_team_id == "T_SECONDARY"
+        assert queued.delivery_state is event.delivery_state
+        assert event.delivery_state.completion_deferred is True
+
+    def test_busy_queue_merges_rapid_text_and_reply_owners(self):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        adapter = _make_adapter()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        sk = _session_key()
+        first = _make_event("first")
+        second = _make_event("second")
+        first.expects_reply = True
+        second.expects_reply = True
+
+        runner._queue_or_replace_pending_event(sk, first)
+        runner._queue_or_replace_pending_event(sk, second)
+
+        pending = adapter._pending_messages[sk]
+        assert pending is first
+        assert pending.text == "first\nsecond"
+        assert any(item is second for item in pending.delivery_state.merged_events)
+
+    def test_leftover_steer_moves_its_reply_owner_to_the_queued_turn(self):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._steer_reply_events = {}
+        original = _make_event("original")
+        steer = _make_event("/steer check logs")
+        original.delivery_state.final_response_events.extend([original, steer])
+        original.delivery_state.completion_events.append(steer)
+        runner._remember_steer_event(_session_key(), "check logs", steer)
+
+        queued = runner._take_leftover_steer_event(
+            _session_key(),
+            "check logs",
+            original,
+        )
+
+        assert queued is not None
+        assert queued.text == "check logs"
+        assert queued.delivery_state is steer.delivery_state
+        assert all(
+            item is not steer
+            for item in original.delivery_state.final_response_events
+        )
+        assert all(
+            item is not steer
+            for item in original.delivery_state.completion_events
+        )
+
+    def test_agent_rejects_steer_after_atomic_final_drain(self):
+        agent = object.__new__(AIAgent)
+        agent._pending_steer = None
+        agent._pending_steer_lock = threading.Lock()
+        agent._open_steering()
+
+        assert agent.steer("check logs") is True
+        assert agent._close_steering() == "check logs"
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
+    @pytest.mark.asyncio
+    async def test_failed_bypass_reply_completes_as_failure(self):
+        """A failed direct command send must clear Slack lifecycle state."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None)
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/status")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.FAILURE,
+        )
+        assert event.delivery_state.reply_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_bypass_reply_preserves_delivered_failure_notice(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                failure_notice_delivered=True,
+            )
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/status")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_successful_bypass_reply_records_delivery(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="reply-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/status")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_deferred_bypass_ack_does_not_complete_the_event(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        async def deferred_handler(event):
+            event.delivery_state.completion_deferred = True
+            return "Steer queued."
+
+        adapter._message_handler = deferred_handler
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="ack-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/steer also check tests")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._send_with_retry.assert_awaited_once()
+        adapter._run_processing_hook.assert_not_awaited()
+        assert event.delivery_state.reply_attempted is False
+        assert event.delivery_state.reply_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_failed_reset_like_reply_completes_as_failure(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=False, message_id=None)
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/stop")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.FAILURE,
+        )
+        assert event.delivery_state.reply_attempted is True
+        assert event.delivery_state.reply_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_reset_reply_preserves_delivered_failure_notice(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                failure_notice_delivered=True,
+            )
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/stop")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_successful_reset_like_reply_records_delivery(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="reply-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        event = _make_event("/new")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_attempted is True
+        assert event.delivery_state.reply_delivered is True
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +686,122 @@ class TestNonBypassStillQueued:
 
         assert sk in adapter._pending_messages
         assert len(adapter.sent_responses) == 0
+
+    @pytest.mark.asyncio
+    async def test_clarify_text_gets_confirmed_ack_and_completion(self, monkeypatch):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._message_handler = AsyncMock(return_value="")
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="ack-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        sent_text = adapter._send_with_retry.await_args.kwargs["content"]
+        assert "continue" in sent_text
+        adapter._run_processing_hook.assert_awaited_once_with(
+            "on_processing_complete",
+            event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert event.delivery_state.reply_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_clarify_reply_preserves_delivered_failure_notice(self, monkeypatch):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._message_handler = AsyncMock(return_value="Thanks.")
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                failure_notice_delivered=True,
+            )
+        )
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        assert event.delivery_state.reply_failed is True
+        assert event.delivery_state.failure_notice_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_clarify_text_defers_to_active_turn_when_owner_exists(
+        self,
+        monkeypatch,
+    ):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        active_event = _make_event("original question")
+        active_event.expects_reply = True
+        adapter._active_message_events[sk] = active_event
+        adapter._message_handler = AsyncMock(return_value="")
+        adapter._send_with_retry = AsyncMock()
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._send_with_retry.assert_not_awaited()
+        adapter._run_processing_hook.assert_not_awaited()
+        assert event.delivery_state.completion_deferred is True
+        assert any(
+            candidate is event
+            for candidate in active_event.delivery_state.completion_events
+        )
+        assert any(
+            candidate is event
+            for candidate in active_event.delivery_state.final_response_events
+        )
+
+    @pytest.mark.asyncio
+    async def test_clarify_ack_is_not_the_deferred_final_reply(self, monkeypatch):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+        active_event = _make_event("original question")
+        active_event.expects_reply = True
+        adapter._active_message_events[sk] = active_event
+        adapter._message_handler = AsyncMock(return_value="Clarification received.")
+        adapter._send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="ack-1")
+        )
+        adapter._run_processing_hook = AsyncMock()
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_pending_for_session",
+            lambda _session_key: object(),
+        )
+        event = _make_event("use the first option")
+        event.expects_reply = True
+
+        await adapter.handle_message(event)
+
+        adapter._send_with_retry.assert_awaited_once()
+        adapter._run_processing_hook.assert_not_awaited()
+        assert event.delivery_state.reply_attempted is False
+        assert event.delivery_state.reply_delivered is False
 
 
 # ---------------------------------------------------------------------------

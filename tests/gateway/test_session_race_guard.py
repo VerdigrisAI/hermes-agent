@@ -125,6 +125,39 @@ async def test_sentinel_cleaned_up_after_handler_returns():
     )
 
 
+@pytest.mark.asyncio
+async def test_goal_continuation_uses_queued_final_response_owner():
+    runner = _make_runner()
+    event = _make_event()
+    queued_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="private-destination",
+        chat_type="dm",
+        user_id="u1",
+    )
+    queued = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=queued_source,
+        private_reply_user_id="u1",
+        platform_team_id="team-2",
+    )
+    runner._post_turn_goal_continuation = AsyncMock()
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        ev.delivery_state.final_response_events.append(queued)
+        return {"final_response": "queued answer"}
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    call = runner._post_turn_goal_continuation.await_args.kwargs
+    assert call["source"] is queued_source
+    assert call["event"] is queued
+    assert call["event"].private_reply_user_id == "u1"
+    assert call["event"].platform_team_id == "team-2"
+
+
 # ------------------------------------------------------------------
 # Test 3: Sentinel cleaned up on exception
 # ------------------------------------------------------------------
@@ -214,6 +247,7 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
         source=source,
         media_urls=["/tmp/test.png"],
         media_types=["image/png"],
+        expects_reply=True,
     )
 
     merge_pending_message_event(pending, session_key, text_event, merge_text=True)
@@ -224,6 +258,37 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.text == "first follow-up\n\nsee screenshot"
     assert merged.media_urls == ["/tmp/test.png"]
     assert merged.media_types == ["image/png"]
+    assert merged.expects_reply is True
+
+
+def test_merge_pending_message_event_retains_required_reply_before_optional_followup():
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+    required = MessageEvent(
+        text="answer this",
+        message_type=MessageType.TEXT,
+        source=source,
+        expects_reply=True,
+    )
+    optional = MessageEvent(
+        text="extra context",
+        message_type=MessageType.TEXT,
+        source=source,
+        expects_reply=False,
+    )
+
+    merge_pending_message_event(pending, session_key, required, merge_text=True)
+    merge_pending_message_event(pending, session_key, optional, merge_text=True)
+
+    merged = pending[session_key]
+    assert merged.expects_reply is True
+    assert merged.delivery_state.merged_events == [optional]
 
 
 def test_merge_pending_message_event_promotes_document_followups_over_text():

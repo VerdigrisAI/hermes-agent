@@ -452,7 +452,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        self._approval_state: Dict[int, str | tuple[str, Optional[str]]] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -2383,6 +2383,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
@@ -2409,16 +2410,16 @@ class TelegramAdapter(BasePlatformAdapter):
             import itertools
             if not hasattr(self, "_approval_counter"):
                 self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            button_id = next(self._approval_counter)
 
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}"),
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}"),
+                    InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{button_id}"),
+                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{button_id}"),
                 ],
                 [
-                    InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}"),
-                    InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"),
+                    InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{button_id}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{button_id}"),
                 ],
             ])
 
@@ -2444,7 +2445,9 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            self._approval_state[button_id] = (
+                (session_key, approval_id) if approval_id else session_key
+            )
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -2950,10 +2953,40 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
-                if not session_key:
+                approval_state = self._approval_state.get(approval_id)
+                if not approval_state:
                     await query.answer(text="This approval has already been resolved.")
                     return
+                if isinstance(approval_state, tuple):
+                    session_key, gateway_approval_id = approval_state
+                else:
+                    session_key, gateway_approval_id = approval_state, None
+
+                # Resolve before showing success. A missing queue entry means
+                # this button is stale and must not authorize another command.
+                try:
+                    from tools.approval import resolve_gateway_approval
+                    if gateway_approval_id:
+                        count = resolve_gateway_approval(
+                            session_key,
+                            choice,
+                            approval_id=gateway_approval_id,
+                        )
+                    else:
+                        count = resolve_gateway_approval(session_key, choice)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to resolve gateway approval from Telegram button: %s",
+                        exc,
+                    )
+                    count = 0
+                if count <= 0:
+                    self._approval_state.pop(approval_id, None)
+                    await query.answer(
+                        text="This approval is no longer active. Run the command again."
+                    )
+                    return
+                self._approval_state.pop(approval_id, None)
 
                 # Map choice to human-readable label
                 label_map = {
@@ -2977,17 +3010,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # non-fatal if edit fails
 
-                # Resolve the approval — unblocks the agent thread
-                try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
-                    logger.info(
-                        "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
-                    )
-                except Exception as exc:
-                    logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
-                    count = 0
+                logger.info(
+                    "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                    count, session_key, choice, user_display,
+                )
 
                 # Resume the typing indicator — paused when the approval was
                 # sent (gateway/run.py).  The text /approve and /deny paths
@@ -3467,7 +3493,7 @@ class TelegramAdapter(BasePlatformAdapter):
         images: List[tuple],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images natively via Telegram's media group API.
 
         Telegram's ``send_media_group`` bundles up to 10 photos/videos into
@@ -3480,9 +3506,9 @@ class TelegramAdapter(BasePlatformAdapter):
         the base adapter's per-image loop.
         """
         if not self._bot:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=False, error="no images to deliver")
 
         try:
             from telegram import InputMediaPhoto
@@ -3491,8 +3517,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
             )
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         # Peel off animations — they need send_animation, not send_media_group
         animations: List[tuple] = []
@@ -3504,13 +3529,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 photos.append((image_url, alt_text))
 
         # Animations: route through the base default (per-image send_animation)
+        all_delivered = True
+        last_error: Optional[str] = None
+        last_message_id: Optional[str] = None
         if animations:
-            await super().send_multiple_images(
+            animation_result = await super().send_multiple_images(
                 chat_id, animations, metadata, human_delay=human_delay,
             )
+            if not animation_result.success:
+                all_delivered = False
+                last_error = str(animation_result.error or "animation delivery failed")
 
         if not photos:
-            return
+            return SendResult(
+                success=all_delivered,
+                error=None if all_delivered else last_error,
+            )
 
         from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
@@ -3535,6 +3569,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 "[%s] Skipping missing image in media group: %s",
                                 self.name, local_path,
                             )
+                            all_delivered = False
+                            last_error = f"image file not found: {local_path}"
                             continue
                         fh = open(local_path, "rb")
                         opened_files.append(fh)
@@ -3543,6 +3579,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         media.append(InputMediaPhoto(media=image_url, caption=caption))
 
                 if not media:
+                    all_delivered = False
+                    last_error = last_error or "no valid images to deliver"
                     continue
 
                 logger.info(
@@ -3565,7 +3603,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                await self._send_with_dm_topic_reply_anchor_retry(
+                sent_messages = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
                         "chat_id": int(chat_id),
@@ -3579,6 +3617,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+                if sent_messages:
+                    last_message_id = str(sent_messages[-1].message_id)
+                else:
+                    all_delivered = False
+                    last_error = "Telegram returned no delivery confirmation"
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
@@ -3586,15 +3629,23 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 # Fallback: send each photo in this chunk individually
-                await super().send_multiple_images(
+                fallback_result = await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay,
                 )
+                if not fallback_result.success:
+                    all_delivered = False
+                    last_error = str(fallback_result.error or e)
             finally:
                 for fh in opened_files:
                     try:
                         fh.close()
                     except Exception:
                         pass
+        return SendResult(
+            success=all_delivered,
+            message_id=last_message_id,
+            error=None if all_delivered else (last_error or "an image was not delivered"),
+        )
 
     async def send_image_file(
         self,

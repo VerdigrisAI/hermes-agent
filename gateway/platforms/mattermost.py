@@ -523,7 +523,7 @@ class MattermostAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Mattermost post with multiple attachments.
 
         Mattermost supports up to 5 ``file_ids`` per post. Each image is
@@ -533,7 +533,7 @@ class MattermostAdapter(BasePlatformAdapter):
         base per-image loop on total failure.
         """
         if not images:
-            return
+            return SendResult(success=False, error="no images to deliver")
 
         import mimetypes
         import aiohttp
@@ -541,6 +541,9 @@ class MattermostAdapter(BasePlatformAdapter):
 
         CHUNK = 5  # Mattermost post file_ids cap
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
+        all_delivered = True
+        last_error: Optional[str] = None
+        last_message_id: Optional[str] = None
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -558,6 +561,8 @@ class MattermostAdapter(BasePlatformAdapter):
                         p = Path(local_path)
                         if not p.exists():
                             logger.warning("Mattermost: skipping missing image %s", local_path)
+                            all_delivered = False
+                            last_error = f"image file not found: {local_path}"
                             continue
                         fname = p.name
                         ct = mimetypes.guess_type(fname)[0] or "image/png"
@@ -566,6 +571,8 @@ class MattermostAdapter(BasePlatformAdapter):
                         from tools.url_safety import is_safe_url
                         if not is_safe_url(image_url):
                             logger.warning("Mattermost: blocked unsafe image URL in batch")
+                            all_delivered = False
+                            last_error = "unsafe image URL was blocked"
                             continue
                         try:
                             async with self._session.get(
@@ -576,19 +583,28 @@ class MattermostAdapter(BasePlatformAdapter):
                                         "Mattermost: failed to download image (HTTP %d): %s",
                                         resp.status, image_url[:80],
                                     )
+                                    all_delivered = False
+                                    last_error = f"image download returned HTTP {resp.status}"
                                     continue
                                 file_data = await resp.read()
                                 ct = resp.content_type or "image/png"
                         except Exception as dl_err:
                             logger.warning("Mattermost: download failed for %s: %s", image_url[:80], dl_err)
+                            all_delivered = False
+                            last_error = str(dl_err)
                             continue
                         fname = image_url.rsplit("/", 1)[-1].split("?")[0] or f"image_{len(file_ids)}.png"
 
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
+                    else:
+                        all_delivered = False
+                        last_error = "image upload failed"
 
                 if not file_ids:
+                    all_delivered = False
+                    last_error = last_error or "no valid images to deliver"
                     continue
 
                 payload: Dict[str, Any] = {
@@ -603,13 +619,30 @@ class MattermostAdapter(BasePlatformAdapter):
                 data = await self._api_post("posts", payload)
                 if not data or "id" not in data:
                     logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    fallback_result = await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay
+                    )
+                    if not fallback_result.success:
+                        all_delivered = False
+                        last_error = str(fallback_result.error or "image fallback failed")
+                else:
+                    last_message_id = str(data["id"])
             except Exception as e:
                 logger.warning(
                     "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback_result = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                if not fallback_result.success:
+                    all_delivered = False
+                    last_error = str(fallback_result.error or e)
+        return SendResult(
+            success=all_delivered,
+            message_id=last_message_id,
+            error=None if all_delivered else (last_error or "an image was not delivered"),
+        )
 
     # ------------------------------------------------------------------
     # WebSocket
@@ -869,5 +902,4 @@ class MattermostAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(msg_event)
-
 

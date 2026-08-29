@@ -1658,7 +1658,7 @@ class DiscordAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Discord message with multiple attachments.
 
         Discord permits up to 10 file attachments per message. Batches are
@@ -1669,17 +1669,16 @@ class DiscordAdapter(BasePlatformAdapter):
         fall back to the base per-image loop.
         """
         if not self._client:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=False, error="no images to deliver")
 
         try:
             import discord as _discord_mod
             import io as _io
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         try:
             channel = self._client.get_channel(int(chat_id))
@@ -1687,14 +1686,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
-                return
+                return SendResult(success=False, error=f"Channel {chat_id} not found")
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
+        all_delivered = True
+        last_error: Optional[str] = None
+        last_message_id: Optional[str] = None
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -1711,11 +1712,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         local_path = _unquote(image_url[7:])
                         if not os.path.exists(local_path):
                             logger.warning("[%s] Skipping missing image: %s", self.name, local_path)
+                            all_delivered = False
+                            last_error = f"image file not found: {local_path}"
                             continue
                         files.append(_discord_mod.File(local_path, filename=os.path.basename(local_path)))
                     else:
                         if not is_safe_url(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
+                            all_delivered = False
+                            last_error = "unsafe image URL was blocked"
                             continue
                         # Download to BytesIO so it renders inline
                         try:
@@ -1733,6 +1738,8 @@ class DiscordAdapter(BasePlatformAdapter):
                                         "[%s] Failed to download image (HTTP %d) in batch: %s",
                                         self.name, resp.status, image_url[:80],
                                     )
+                                    all_delivered = False
+                                    last_error = f"image download returned HTTP {resp.status}"
                                     continue
                                 data = await resp.read()
                                 ct = resp.headers.get("content-type", "image/png")
@@ -1746,9 +1753,13 @@ class DiscordAdapter(BasePlatformAdapter):
                                 files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
+                            all_delivered = False
+                            last_error = str(dl_err)
                             continue
 
                 if not files:
+                    all_delivered = False
+                    last_error = last_error or "no valid images to deliver"
                     continue
 
                 # Use the first caption if any (Discord only has one message body for the group)
@@ -1759,26 +1770,42 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    forum_result = await self._forum_post_file(
                         channel,
                         content=(content or "").strip(),
                         files=files,
                     )
+                    if not forum_result.success:
+                        all_delivered = False
+                        last_error = str(forum_result.error or "forum image upload failed")
+                    else:
+                        last_message_id = forum_result.message_id
                 else:
-                    await channel.send(content=content, files=files)
+                    sent_message = await channel.send(content=content, files=files)
+                    last_message_id = str(sent_message.id)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback_result = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                if not fallback_result.success:
+                    all_delivered = False
+                    last_error = str(fallback_result.error or e)
             finally:
                 if aiohttp_session is not None:
                     try:
                         await aiohttp_session.close()
                     except Exception:
                         pass
+        return SendResult(
+            success=all_delivered,
+            message_id=last_message_id,
+            error=None if all_delivered else (last_error or "an image was not delivered"),
+        )
 
     async def play_tts(
         self,
@@ -4028,6 +4055,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -4060,6 +4088,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             view = ExecApprovalView(
                 session_key=session_key,
+                approval_id=approval_id,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
@@ -5016,9 +5045,11 @@ def _define_discord_view_classes() -> None:
             session_key: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            approval_id: Optional[str] = None,
         ):
             super().__init__(timeout=300)  # 5-minute timeout
             self.session_key = session_key
+            self.approval_id = approval_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.resolved = False
@@ -5046,6 +5077,30 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            try:
+                from tools.approval import resolve_gateway_approval
+                if self.approval_id:
+                    count = resolve_gateway_approval(
+                        self.session_key,
+                        choice,
+                        approval_id=self.approval_id,
+                    )
+                else:
+                    count = resolve_gateway_approval(self.session_key, choice)
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from button: %s", exc)
+                await interaction.response.send_message(
+                    "This approval is no longer active. Run the command again.",
+                    ephemeral=True,
+                )
+                return
+            if count <= 0:
+                await interaction.response.send_message(
+                    "This approval is no longer active. Run the command again.",
+                    ephemeral=True,
+                )
+                return
+
             self.resolved = True
 
             # Update the embed with the decision
@@ -5060,16 +5115,10 @@ def _define_discord_view_classes() -> None:
 
             await interaction.response.edit_message(embed=embed, view=self)
 
-            # Unblock the waiting agent thread via the gateway approval queue
-            try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
-                logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
-                )
-            except Exception as exc:
-                logger.error("Failed to resolve gateway approval from button: %s", exc)
+            logger.info(
+                "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                count, self.session_key, choice, interaction.user.display_name,
+            )
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(

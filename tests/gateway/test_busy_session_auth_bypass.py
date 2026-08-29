@@ -90,6 +90,7 @@ def _make_adapter(platform_val="slack"):
     adapter = MagicMock()
     adapter._pending_messages = {}
     adapter._send_with_retry = AsyncMock()
+    adapter.discard_reply_requirement = AsyncMock()
     adapter.config = MagicMock()
     adapter.config.extra = {}
     adapter.platform = MagicMock(value=platform_val)
@@ -126,6 +127,9 @@ class TestBusySessionAuthBypass:
             chat_id="123",
             thread_id="thread-abc",  # same thread → same session_key
         )
+        intruder_event.expects_reply = True
+        runner.adapters = MagicMock()
+        runner.adapters.get.return_value = adapter
 
         result = await GatewayRunner._handle_active_session_busy_message(
             runner, intruder_event, sk
@@ -139,6 +143,8 @@ class TestBusySessionAuthBypass:
         runner._running_agents[sk].interrupt.assert_not_called()
         # Must NOT send any acknowledgment to the channel
         adapter._send_with_retry.assert_not_called()
+        assert intruder_event.expects_reply is False
+        adapter.discard_reply_requirement.assert_awaited_once_with(intruder_event)
 
     @pytest.mark.asyncio
     async def test_authorized_user_still_processed_in_busy_path(self):

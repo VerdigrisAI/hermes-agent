@@ -99,8 +99,9 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
     running_agent = MagicMock()
     running_agent.steer.return_value = True
     runner._running_agents[sk] = running_agent
+    event = _make_event("/steer also check auth.log")
 
-    result = await runner._handle_message(_make_event("/steer also check auth.log"))
+    result = await runner._handle_message(event)
 
     # The handler replied with a confirmation
     assert result is not None
@@ -113,6 +114,7 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
     # _pending_messages (that would be turn-boundary /queue semantics).
     assert runner._pending_messages == {}
     assert adapter._pending_messages == {}
+    assert runner._steer_reply_events[sk] == [("also check auth.log", event)]
 
 
 @pytest.mark.asyncio
@@ -150,6 +152,25 @@ async def test_steer_with_pending_sentinel_falls_back_to_queue():
 
 
 @pytest.mark.asyncio
+async def test_steer_with_pending_sentinel_preserves_an_existing_queue():
+    from gateway.run import _AGENT_PENDING_SENTINEL, _queued_reply_event
+
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+    first = _make_event("/queue first")
+    adapter._pending_messages[sk] = _queued_reply_event(first, "first")
+
+    event = _make_event("/steer second")
+    result = await runner._handle_message(event)
+
+    assert "queued" in result.lower()
+    assert adapter._pending_messages[sk].text == "first"
+    assert runner._queued_events[sk][0].text == "second"
+    assert runner._queued_events[sk][0].delivery_state is event.delivery_state
+
+
+@pytest.mark.asyncio
 async def test_steer_agent_without_steer_method_falls_back():
     """If the running agent somehow lacks the steer() method (older build,
     test stub), the handler must not explode — fall back to /queue."""
@@ -171,10 +192,9 @@ async def test_steer_agent_without_steer_method_falls_back():
 
 
 @pytest.mark.asyncio
-async def test_steer_rejected_payload_returns_rejection_message():
-    """If agent.steer() returns False (e.g. empty after strip — though
-    the gateway already guards this), surface a rejection message."""
-    runner, _adapter = _make_runner(_session_entry())
+async def test_steer_rejected_after_final_drain_queues_the_next_turn():
+    """A steer that loses the final-drain race must remain executable."""
+    runner, adapter = _make_runner(_session_entry())
     sk = build_session_key(_make_source())
 
     running_agent = MagicMock()
@@ -184,7 +204,8 @@ async def test_steer_rejected_payload_returns_rejection_message():
     result = await runner._handle_message(_make_event("/steer hello"))
 
     assert result is not None
-    assert "rejected" in result.lower() or "empty" in result.lower()
+    assert "next turn" in result.lower()
+    assert adapter._pending_messages[sk].text == "hello"
 
 
 if __name__ == "__main__":  # pragma: no cover

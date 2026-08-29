@@ -12,6 +12,7 @@ import contextvars
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -550,11 +551,13 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result")
+    __slots__ = ("approval_id", "event", "data", "result")
 
     def __init__(self, data: dict):
+        self.approval_id = secrets.token_urlsafe(18)
         self.event = threading.Event()
-        self.data = data          # command, description, pattern_keys, …
+        self.data = dict(data)    # command, description, pattern_keys, …
+        self.data["approval_id"] = self.approval_id
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
 
 
@@ -587,14 +590,18 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
-def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
+def resolve_gateway_approval(
+    session_key: str,
+    choice: str,
+    resolve_all: bool = False,
+    approval_id: Optional[str] = None,
+) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    When *approval_id* is supplied, only that approval is resolved. When
+    *resolve_all* is True, every pending approval in the session is resolved.
+    Otherwise only the oldest approval is resolved (FIFO).
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
@@ -602,7 +609,16 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if approval_id:
+            target = next(
+                (entry for entry in queue if entry.approval_id == approval_id),
+                None,
+            )
+            if target is None:
+                return 0
+            queue.remove(target)
+            targets = [target]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -1265,7 +1281,7 @@ def check_all_command_guards(command: str, env_type: str,
 
             # Notify the user (bridges sync agent thread → async gateway)
             try:
-                notify_cb(approval_data)
+                notify_cb(entry.data)
             except Exception as exc:
                 logger.warning("Gateway approval notify failed: %s", exc)
                 with _lock:
