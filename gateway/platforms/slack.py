@@ -4121,11 +4121,16 @@ class SlackAdapter(BasePlatformAdapter):
         )
 
         response_url = command.get("response_url", "")
+        # Slack retries reuse trigger_id.  It is therefore both unique per
+        # invocation and stable across transport retries.  Fall back to a
+        # generated identifier only for non-Slack test callers that omit it.
+        invocation_id = command.get("trigger_id") or os.urandom(12).hex()
         event = MessageEvent(
             text=text,
             message_type=MessageType.COMMAND if text.startswith("/") else MessageType.TEXT,
             source=source,
             raw_message=command,
+            message_id=invocation_id,
             expects_reply=bool(response_url and text.startswith("/")),
             private_reply_user_id=(
                 user_id if response_url and text.startswith("/") else None
@@ -4139,7 +4144,6 @@ class SlackAdapter(BasePlatformAdapter):
         # Only stash for COMMAND events (text starts with "/") — free-form
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
-        invocation_id = os.urandom(12).hex()
         if response_url and user_id and channel_id and text.startswith("/"):
             self._slash_command_contexts[(channel_id, user_id, invocation_id)] = {
                 "response_url": response_url,

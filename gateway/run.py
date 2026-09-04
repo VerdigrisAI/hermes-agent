@@ -9123,6 +9123,38 @@ class GatewayRunner:
             # content the user hasn't seen (streaming only sent earlier
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
+            def _emit_completed_turn_outcome() -> None:
+                """Emit only after all turn post-processing succeeds."""
+                try:
+                    from gateway.typed_outcomes import (
+                        build_turn_terminal_event,
+                        classify_agent_result,
+                        emit_plugin_event,
+                        extract_tool_names,
+                    )
+
+                    _turn_outcome, _failure_class = classify_agent_result(agent_result)
+                    emit_plugin_event(
+                        "turn_terminal",
+                        build_turn_terminal_event(
+                            event=event,
+                            session_id=session_entry.session_id,
+                            run_generation=run_generation,
+                            outcome=_turn_outcome,
+                            failure_class=_failure_class,
+                            error=agent_result.get("error"),
+                            api_calls=agent_result.get("api_calls", 0),
+                            tool_names=extract_tool_names(agent_result),
+                            response=response,
+                        ),
+                    )
+                except Exception as _typed_outcome_error:
+                    logger.warning(
+                        "typed turn outcome failed for session %s: %s",
+                        session_key,
+                        _typed_outcome_error,
+                    )
+
             if _record_confirmed_reply_delivery(event, agent_result):
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
@@ -9147,8 +9179,10 @@ class GatewayRunner:
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                _emit_completed_turn_outcome()
                 return None
 
+            _emit_completed_turn_outcome()
             return response
             
         except Exception as e:
@@ -9160,6 +9194,29 @@ class GatewayRunner:
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            try:
+                from gateway.typed_outcomes import (
+                    build_turn_terminal_event,
+                    emit_plugin_event,
+                )
+
+                emit_plugin_event(
+                    "turn_terminal",
+                    build_turn_terminal_event(
+                        event=event,
+                        session_id=getattr(session_entry, "session_id", ""),
+                        run_generation=run_generation,
+                        outcome="failed",
+                        failure_class="unhandled_exception",
+                        error=e,
+                    ),
+                )
+            except Exception as _typed_outcome_error:
+                logger.warning(
+                    "typed turn failure outcome failed for session %s: %s",
+                    session_key,
+                    _typed_outcome_error,
+                )
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
             status_hint = ""
