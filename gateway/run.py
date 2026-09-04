@@ -8853,6 +8853,38 @@ class GatewayRunner:
             )
             response = _sanitize_gateway_final_response(source.platform, response)
 
+            # Emit a content-minimized terminal result before platform delivery.
+            # Delivery has its own event in BasePlatformAdapter after transport.
+            try:
+                from gateway.typed_outcomes import (
+                    build_turn_terminal_event,
+                    classify_agent_result,
+                    emit_plugin_event,
+                    extract_tool_names,
+                )
+
+                _turn_outcome, _failure_class = classify_agent_result(agent_result)
+                emit_plugin_event(
+                    "turn_terminal",
+                    build_turn_terminal_event(
+                        event=event,
+                        session_id=session_entry.session_id,
+                        run_generation=run_generation,
+                        outcome=_turn_outcome,
+                        failure_class=_failure_class,
+                        error=agent_result.get("error"),
+                        api_calls=agent_result.get("api_calls", 0),
+                        tool_names=extract_tool_names(agent_result),
+                        response=response,
+                    ),
+                )
+            except Exception as _typed_outcome_error:
+                logger.warning(
+                    "typed turn outcome failed for session %s: %s",
+                    session_key,
+                    _typed_outcome_error,
+                )
+
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -9160,6 +9192,29 @@ class GatewayRunner:
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            try:
+                from gateway.typed_outcomes import (
+                    build_turn_terminal_event,
+                    emit_plugin_event,
+                )
+
+                emit_plugin_event(
+                    "turn_terminal",
+                    build_turn_terminal_event(
+                        event=event,
+                        session_id=getattr(session_entry, "session_id", ""),
+                        run_generation=run_generation,
+                        outcome="failed",
+                        failure_class="unhandled_exception",
+                        error=e,
+                    ),
+                )
+            except Exception as _typed_outcome_error:
+                logger.warning(
+                    "typed turn failure outcome failed for session %s: %s",
+                    session_key,
+                    _typed_outcome_error,
+                )
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
             status_hint = ""

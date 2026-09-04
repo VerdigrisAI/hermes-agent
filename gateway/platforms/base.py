@@ -1041,6 +1041,7 @@ class MessageDeliveryState:
     reply_attempted: bool = False
     reply_failed: bool = False
     failure_notice_delivered: bool = False
+    reply_message_ids: List[str] = field(default_factory=list)
     merged_events: List[Any] = field(default_factory=list)
     completion_events: List[Any] = field(default_factory=list)
     final_response_events: List[Any] = field(default_factory=list)
@@ -3469,6 +3470,19 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 for delivery_event in delivery_targets:
                     delivery_event.delivery_state.reply_delivered = True
+                    message_ids = [getattr(result, "message_id", None)]
+                    message_ids.extend(
+                        getattr(result, "continuation_message_ids", ()) or ()
+                    )
+                    for message_id in message_ids:
+                        if (
+                            message_id
+                            and str(message_id)
+                            not in delivery_event.delivery_state.reply_message_ids
+                        ):
+                            delivery_event.delivery_state.reply_message_ids.append(
+                                str(message_id)
+                            )
             else:
                 for delivery_event in delivery_targets:
                     delivery_event.delivery_state.reply_failed = True
@@ -3512,6 +3526,25 @@ class BasePlatformAdapter(ABC):
                     completion_event,
                     outcome,
                 )
+                try:
+                    from gateway.typed_outcomes import (
+                        build_delivery_complete_event,
+                        emit_plugin_event,
+                    )
+
+                    emit_plugin_event(
+                        "delivery_complete",
+                        build_delivery_complete_event(
+                            event=completion_event,
+                            outcome=outcome,
+                        ),
+                    )
+                except Exception as outcome_error:
+                    logger.warning(
+                        "[%s] typed delivery outcome failed: %s",
+                        self.name,
+                        outcome_error,
+                    )
 
         self._active_message_events[session_key] = event
 

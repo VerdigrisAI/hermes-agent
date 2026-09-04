@@ -165,6 +165,11 @@ VALID_HOOKS: Set[str] = {
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     "pre_approval_request",
     "post_approval_response",
+    # Typed, content-minimized gateway lifecycle events. ``turn_terminal``
+    # describes agent execution. ``delivery_complete`` describes the final
+    # platform transport result. Callbacks receive ``event=<dataclass>``.
+    "turn_terminal",
+    "delivery_complete",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
