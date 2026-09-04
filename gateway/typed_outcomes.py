@@ -15,19 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(api[_ -]?key|authorization|bearer|token|secret|password)"
-    r"\s*[:=]\s*[^\s,;]+"
-)
-
-
 def _source_value(event: Any, name: str) -> str:
     source = getattr(event, "source", None)
     value = getattr(source, name, None)
@@ -61,15 +54,11 @@ def _safe_error(error: BaseException | str | None) -> tuple[str | None, str | No
     if error is None:
         return None, None
     error_type = type(error).__name__ if isinstance(error, BaseException) else "Error"
-    detail = " ".join(str(error).split())[:300]
-    try:
-        from agent.redact import redact_sensitive_text
-
-        detail = redact_sensitive_text(detail, force=True)
-    except Exception:
-        pass
-    detail = _SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}=<redacted>", detail)
-    return error_type, detail or None
+    # Exception messages can contain the inbound request, provider response,
+    # credentials, or customer data.  A best-effort redactor cannot prove that
+    # arbitrary prose is safe.  Keep the schema field for compatibility, but
+    # publish only the controlled exception class.
+    return error_type, None
 
 
 def _coordinates(event: Any) -> dict[str, Any]:

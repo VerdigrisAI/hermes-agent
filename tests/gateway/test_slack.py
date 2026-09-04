@@ -3187,6 +3187,42 @@ class TestSlashCommands:
         assert msg.text == "/compress"
 
     @pytest.mark.asyncio
+    async def test_trigger_id_is_stable_slash_message_id(self, adapter):
+        command = {
+            "command": "/status",
+            "text": "",
+            "trigger_id": "123456.abcdef.stable",
+            "user_id": "U1",
+            "channel_id": "C1",
+        }
+
+        await adapter._handle_slash_command(command)
+        first = adapter.handle_message.call_args[0][0]
+        await adapter._handle_slash_command(command)
+        second = adapter.handle_message.call_args[0][0]
+
+        assert first.message_id == "123456.abcdef.stable"
+        assert second.message_id == first.message_id
+
+    @pytest.mark.asyncio
+    async def test_distinct_slash_triggers_get_distinct_message_ids(self, adapter):
+        base = {
+            "command": "/status",
+            "text": "",
+            "user_id": "U1",
+            "channel_id": "C1",
+        }
+
+        await adapter._handle_slash_command({**base, "trigger_id": "trigger-1"})
+        first = adapter.handle_message.call_args[0][0]
+        await adapter._handle_slash_command({**base, "trigger_id": "trigger-2"})
+        second = adapter.handle_message.call_args[0][0]
+
+        assert first.message_id == "trigger-1"
+        assert second.message_id == "trigger-2"
+        assert first.message_id != second.message_id
+
+    @pytest.mark.asyncio
     async def test_resume_command(self, adapter):
         command = {"text": "resume my session", "user_id": "U1", "channel_id": "C1"}
         await adapter._handle_slash_command(command)

@@ -3170,6 +3170,66 @@ class BasePlatformAdapter(ABC):
         await self._drain_pending_after_session_command(session_key, command_guard)
         return delivered
 
+    async def _complete_delivery_events(
+        self,
+        event: MessageEvent,
+        default_outcome: ProcessingOutcome,
+    ) -> None:
+        """Emit legacy and typed completion hooks for every routed event."""
+        pending_completion_events = [
+            event,
+            *event.delivery_state.merged_events,
+            *event.delivery_state.completion_events,
+        ]
+        seen_event_ids: set[int] = set()
+        while pending_completion_events:
+            completion_event = pending_completion_events.pop(0)
+            if id(completion_event) in seen_event_ids:
+                continue
+            seen_event_ids.add(id(completion_event))
+            pending_completion_events.extend(
+                completion_event.delivery_state.merged_events
+            )
+            pending_completion_events.extend(
+                completion_event.delivery_state.completion_events
+            )
+            delivery_state = completion_event.delivery_state
+            if default_outcome != ProcessingOutcome.SUCCESS:
+                outcome = default_outcome
+            elif delivery_state.reply_attempted or completion_event.expects_reply:
+                outcome = (
+                    ProcessingOutcome.SUCCESS
+                    if delivery_state.reply_delivered
+                    and not delivery_state.reply_failed
+                    else ProcessingOutcome.FAILURE
+                )
+            else:
+                outcome = default_outcome
+            await self._run_processing_hook(
+                "on_processing_complete",
+                completion_event,
+                outcome,
+            )
+            try:
+                from gateway.typed_outcomes import (
+                    build_delivery_complete_event,
+                    emit_plugin_event,
+                )
+
+                emit_plugin_event(
+                    "delivery_complete",
+                    build_delivery_complete_event(
+                        event=completion_event,
+                        outcome=outcome,
+                    ),
+                )
+            except Exception as outcome_error:
+                logger.warning(
+                    "[%s] typed delivery outcome failed: %s",
+                    self.name,
+                    outcome_error,
+                )
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -3238,8 +3298,7 @@ class BasePlatformAdapter(ABC):
                             event.delivery_state.reply_failed = True
                         if error_result.failure_notice_delivered:
                             event.delivery_state.failure_notice_delivered = True
-                    await self._run_processing_hook(
-                        "on_processing_complete",
+                    await self._complete_delivery_events(
                         event,
                         ProcessingOutcome.SUCCESS
                         if _delivered
@@ -3295,8 +3354,7 @@ class BasePlatformAdapter(ABC):
                         if error_result.failure_notice_delivered:
                             event.delivery_state.failure_notice_delivered = True
                 if not event.delivery_state.completion_deferred:
-                    await self._run_processing_hook(
-                        "on_processing_complete",
+                    await self._complete_delivery_events(
                         event,
                         ProcessingOutcome.SUCCESS
                         if _delivered
@@ -3371,8 +3429,7 @@ class BasePlatformAdapter(ABC):
                         )
                         _delivered = False
                     if not event.delivery_state.completion_deferred:
-                        await self._run_processing_hook(
-                            "on_processing_complete",
+                        await self._complete_delivery_events(
                             event,
                             ProcessingOutcome.SUCCESS
                             if _delivered
@@ -3486,65 +3543,6 @@ class BasePlatformAdapter(ABC):
             else:
                 for delivery_event in delivery_targets:
                     delivery_event.delivery_state.reply_failed = True
-
-        async def _complete_delivery_events(
-            default_outcome: ProcessingOutcome,
-        ) -> None:
-            pending_completion_events = [
-                event,
-                *event.delivery_state.merged_events,
-                *event.delivery_state.completion_events,
-            ]
-            seen_event_ids: set[int] = set()
-            while pending_completion_events:
-                completion_event = pending_completion_events.pop(0)
-                if id(completion_event) in seen_event_ids:
-                    continue
-                seen_event_ids.add(id(completion_event))
-                pending_completion_events.extend(
-                    completion_event.delivery_state.merged_events
-                )
-                pending_completion_events.extend(
-                    completion_event.delivery_state.completion_events
-                )
-                delivery_state = completion_event.delivery_state
-                if default_outcome != ProcessingOutcome.SUCCESS:
-                    outcome = default_outcome
-                elif delivery_state.reply_attempted or completion_event.expects_reply:
-                    outcome = (
-                        ProcessingOutcome.SUCCESS
-                        if (
-                            delivery_state.reply_delivered
-                            and not delivery_state.reply_failed
-                        )
-                        else ProcessingOutcome.FAILURE
-                    )
-                else:
-                    outcome = default_outcome
-                await self._run_processing_hook(
-                    "on_processing_complete",
-                    completion_event,
-                    outcome,
-                )
-                try:
-                    from gateway.typed_outcomes import (
-                        build_delivery_complete_event,
-                        emit_plugin_event,
-                    )
-
-                    emit_plugin_event(
-                        "delivery_complete",
-                        build_delivery_complete_event(
-                            event=completion_event,
-                            outcome=outcome,
-                        ),
-                    )
-                except Exception as outcome_error:
-                    logger.warning(
-                        "[%s] typed delivery outcome failed: %s",
-                        self.name,
-                        outcome_error,
-                    )
 
         self._active_message_events[session_key] = event
 
@@ -4025,7 +4023,7 @@ class BasePlatformAdapter(ABC):
                         ))
 
             # Determine overall success for the processing hook
-            await _complete_delivery_events(ProcessingOutcome.SUCCESS)
+            await self._complete_delivery_events(event, ProcessingOutcome.SUCCESS)
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
@@ -4072,14 +4070,14 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
-            await _complete_delivery_events(outcome)
+            await self._complete_delivery_events(event, outcome)
             raise
         except Exception as e:
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             error_result = await self._send_terminal_error_notice(event, e)
             _record_delivery(error_result)
-            await _complete_delivery_events(ProcessingOutcome.FAILURE)
+            await self._complete_delivery_events(event, ProcessingOutcome.FAILURE)
         finally:
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
