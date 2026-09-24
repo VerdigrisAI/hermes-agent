@@ -111,7 +111,11 @@ async def test_clean_queue_still_reports_success():
 
 
 def _count_free_slots(slots) -> int:
-    """Take every free slot, count them, give them all back. Public API only."""
+    """Take every free slot, count them, give them all back.
+
+    Uses only acquire/release, never the private counter, so it measures what
+    callers actually get.
+    """
     taken = 0
     while slots.acquire(blocking=False):
         taken += 1
@@ -125,7 +129,8 @@ def test_the_run_cap_is_fixed_at_import(monkeypatch):
     returns and leaves _run_slots alone.
 
     The semaphore is built at module scope in agui_adapter/server.py. This test
-    pins that gap so the comment above _run_slots stays true. It measures the
+    pins the import-time freeze described in the first paragraph of the comment
+    above _run_slots; it does not exercise the .env load timing. It measures the
     live semaphore by acquiring slots, so a semaphore that re-read the
     environment on acquire would hand out more and fail here.
     """

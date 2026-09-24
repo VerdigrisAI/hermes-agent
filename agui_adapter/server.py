@@ -345,17 +345,20 @@ def _max_concurrent_runs() -> int:
 
 # Built ONCE, at import. _max_concurrent_runs() re-reads the environment on
 # every call, but nothing rebuilds this semaphore, so a change to
-# HERMES_AGUI_MAX_CONCURRENT_RUNS after this line moves the function's answer
-# and not the cap. HERMES_AGUI_MAX_QUEUE_EVENTS differs: the run handler calls
-# _max_queue_events() on every run.
+# HERMES_AGUI_MAX_CONCURRENT_RUNS after this line changes what the function
+# returns and not the semaphore's size. HERMES_AGUI_MAX_QUEUE_EVENTS differs:
+# the run handler calls _max_queue_events() on every run.
 #
 # That is fine when the platform sets the environment before Python starts.
-# It bites when the variable lives in ~/.hermes/.env: Hermes loads that file
-# (with override) when run_agent is first imported, and session.py imports
-# run_agent lazily on the first POST, long after this line ran. The queue cap
-# picks the .env value up; the run cap stays at the default. Set the run cap
-# in the process environment, not in .env.
-# tests/agui_adapter/test_resource_caps.py pins the gap.
+# Whatever loads a Hermes .env file ($HERMES_HOME/.env, default ~/.hermes/.env)
+# must run before this module is imported for the value to count. On the
+# hermes-agui entry path nothing does: run_agent loads .env (with override) at
+# its own import, and session.py imports run_agent lazily inside the first
+# run's worker thread. So the run cap never sees a .env value, and the queue
+# cap sees it from the second run onward. Set the run cap in the process
+# environment, not in .env.
+# tests/agui_adapter/test_resource_caps.py pins the import-time freeze; the
+# .env timing above is not under test.
 _run_slots = threading.BoundedSemaphore(_max_concurrent_runs())
 
 
