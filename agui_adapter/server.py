@@ -356,8 +356,11 @@ def _max_concurrent_runs() -> int:
 # nothing does: run_agent loads them at its own import, and session.py imports
 # run_agent lazily inside the first run's worker thread. So the run cap never
 # sees a .env value. The queue cap sees it only in runs that start after the
-# first worker has imported run_agent, and from then on a .env value replaces
-# the process value. Set both caps in the process environment, not in .env.
+# first worker has imported run_agent. From then on, a value in
+# $HERMES_HOME/.env replaces the process value. A value in the project .env
+# replaces it only when $HERMES_HOME/.env does not exist; otherwise it fills in
+# only an unset variable. Set both caps in the process environment and keep
+# them out of both .env files.
 # tests/agui_adapter/test_resource_caps.py pins that the semaphore ignores a
 # later environment change; the .env timing above is not under test.
 _run_slots = threading.BoundedSemaphore(_max_concurrent_runs())
