@@ -344,21 +344,22 @@ def _max_concurrent_runs() -> int:
 
 
 # Built ONCE, at import. _max_concurrent_runs() re-reads the environment on
-# every call, but nothing rebuilds this semaphore, so a change to
-# HERMES_AGUI_MAX_CONCURRENT_RUNS after this line changes what the function
+# every call, but nothing rebuilds this semaphore. A change to
+# HERMES_AGUI_MAX_CONCURRENT_RUNS after import changes what the function
 # returns and not the semaphore's size. HERMES_AGUI_MAX_QUEUE_EVENTS differs:
-# the run handler calls _max_queue_events() on every run.
+# the run handler calls _max_queue_events() at the start of every new run.
 #
 # That is fine when the platform sets the environment before Python starts.
-# Whatever loads a Hermes .env file ($HERMES_HOME/.env, default ~/.hermes/.env)
-# must run before this module is imported for the value to count. On the
-# hermes-agui entry path nothing does: run_agent loads .env (with override) at
-# its own import, and session.py imports run_agent lazily inside the first
-# run's worker thread. So the run cap never sees a .env value, and the queue
-# cap sees it from the second run onward. Set the run cap in the process
-# environment, not in .env.
-# tests/agui_adapter/test_resource_caps.py pins the import-time freeze; the
-# .env timing above is not under test.
+# The Hermes .env files are $HERMES_HOME/.env (default ~/.hermes/.env) and the
+# .env next to run_agent.py. Whatever loads them must run before this module
+# is imported for a value in them to count. On the hermes-agui entry path
+# nothing does: run_agent loads them at its own import, and session.py imports
+# run_agent lazily inside the first run's worker thread. So the run cap never
+# sees a .env value. The queue cap sees it only in runs that start after the
+# first worker has imported run_agent, and from then on a .env value replaces
+# the process value. Set both caps in the process environment, not in .env.
+# tests/agui_adapter/test_resource_caps.py pins that the semaphore ignores a
+# later environment change; the .env timing above is not under test.
 _run_slots = threading.BoundedSemaphore(_max_concurrent_runs())
 
 

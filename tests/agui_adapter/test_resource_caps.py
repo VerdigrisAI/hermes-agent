@@ -124,13 +124,14 @@ def _count_free_slots(slots) -> int:
     return taken
 
 
-def test_the_run_cap_is_fixed_at_import(monkeypatch):
+def test_run_cap_ignores_env_changes_after_the_semaphore_is_built(monkeypatch):
     """Setting the variable after import changes what _max_concurrent_runs()
     returns and leaves _run_slots alone.
 
-    The semaphore is built at module scope in agui_adapter/server.py. This test
-    pins the import-time freeze described in the first paragraph of the comment
-    above _run_slots; it does not exercise the .env load timing. It measures the
+    The semaphore is built at module scope in agui_adapter/server.py, as the
+    comment above _run_slots describes. This test pins that nothing rebuilds it
+    after an environment change. It does not prove where the semaphore is
+    built, and it does not exercise when the .env files load. It measures the
     live semaphore by acquiring slots, so a semaphore that re-read the
     environment on acquire would hand out more and fail here.
     """
