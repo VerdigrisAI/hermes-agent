@@ -67,6 +67,8 @@ local quick start above.
 | `HERMES_AGUI_API_MODE` | *(auto)* | `chat_completions` or `responses`. |
 | `HERMES_AGUI_BASE_URL` / `OPENAI_BASE_URL` | — | **Bypass** the hermes resolver and send every LLM call straight to this OpenAI-compatible endpoint. |
 | `HERMES_AGUI_API_KEY` / `OPENAI_API_KEY` | — | Key for the explicit-endpoint path above. |
+| `HERMES_AGUI_MAX_CONCURRENT_RUNS` | `8` | Cap on concurrent runs (one OS thread each). Read once at process start; set it in the process environment, not in `~/.hermes/.env`, which loads too late to reach it. |
+| `HERMES_AGUI_MAX_QUEUE_EVENTS` | `1000` | Cap on buffered SSE events per run. Read on every run. |
 
 **Two ways it finds a provider:**
 
