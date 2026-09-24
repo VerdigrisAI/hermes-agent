@@ -108,3 +108,35 @@ async def test_clean_queue_still_reports_success():
     body = "".join(frames)
     assert "RUN_FINISHED" in body
     assert "RUN_ERROR" not in body
+
+
+def _count_free_slots(slots) -> int:
+    """Take every free slot, count them, give them all back.
+
+    Uses only acquire/release, never the private counter, so it measures what
+    callers actually get.
+    """
+    taken = 0
+    while slots.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        slots.release()
+    return taken
+
+
+def test_run_cap_ignores_env_changes_after_the_semaphore_is_built(monkeypatch):
+    """Setting the variable after import changes what _max_concurrent_runs()
+    returns and leaves _run_slots alone.
+
+    The semaphore is built at module scope in agui_adapter/server.py, as the
+    comment above _run_slots describes. This test pins that nothing rebuilds it
+    after an environment change. It does not prove where the semaphore is
+    built, and it does not exercise when the .env files load. It measures the
+    live semaphore by acquiring slots, so a semaphore that re-read the
+    environment on acquire would hand out more and fail here.
+    """
+    before = _count_free_slots(server._run_slots)
+    assert before > 0
+    monkeypatch.setenv("HERMES_AGUI_MAX_CONCURRENT_RUNS", str(before + 5))
+    assert server._max_concurrent_runs() == before + 5
+    assert _count_free_slots(server._run_slots) == before
