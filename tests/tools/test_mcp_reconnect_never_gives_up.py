@@ -14,8 +14,218 @@ Two causes, and they compound:
   reconnect leaves behind.
 """
 import asyncio
+import time
 
 import pytest
+
+
+async def _assert_inner_deadline(awaitable, *, watchdog_seconds=0.5):
+    """A test watchdog cannot stand in for the production handshake timer."""
+    handshake = asyncio.create_task(awaitable)
+    try:
+        completed, _ = await asyncio.wait({handshake}, timeout=watchdog_seconds)
+        if not completed:
+            pytest.fail("outer test watchdog fired; handshake has no deadline")
+        with pytest.raises(TimeoutError):
+            await handshake
+    finally:
+        if not handshake.done():
+            handshake.cancel()
+            await asyncio.gather(handshake, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stalled_reconnect_setup_expires_and_retries(monkeypatch):
+    """A stalled initialize must not hold the reconnect loop forever."""
+    from tools import mcp_tool
+
+    attempts = 0
+    cancelled = asyncio.Event()
+
+    class HangingSession:
+        async def initialize(self):
+            nonlocal attempts
+            attempts += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    task = mcp_tool.MCPServerTask("test")
+    task._ready.set()  # A previously connected server is reconnecting.
+    real_sleep = asyncio.sleep
+
+    async def no_wait(_delay):
+        await real_sleep(0)
+
+    async def connect(self, config):
+        if attempts:
+            self._shutdown_event.set()
+            return
+        await self._initialize_and_discover(HangingSession(), config)
+
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_run_http", connect)
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_is_http", lambda self: True)
+    monkeypatch.setattr(mcp_tool.asyncio, "sleep", no_wait)
+
+    await asyncio.wait_for(
+        task.run({"url": "https://example.invalid/mcp", "connect_timeout": 0.02}),
+        timeout=0.5,
+    )
+    assert attempts == 1
+    assert cancelled.is_set()
+    assert task.session is None
+
+
+@pytest.mark.asyncio
+async def test_stalled_tool_discovery_expires_without_retaining_session(monkeypatch):
+    """The handshake includes discovery, not only initialize()."""
+    from tools import mcp_tool
+
+    class Session:
+        async def initialize(self):
+            return object()
+
+    async def stuck_discovery(self):
+        await asyncio.Event().wait()
+
+    task = mcp_tool.MCPServerTask("test")
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_discover_tools", stuck_discovery)
+
+    await _assert_inner_deadline(
+        task._initialize_and_discover(Session(), {"connect_timeout": 0.02})
+    )
+    assert task.session is None
+
+
+@pytest.mark.asyncio
+async def test_http_transport_entry_has_a_handshake_deadline(monkeypatch):
+    """The SDK can hang before it yields the session to initialize()."""
+    import httpx
+    from tools import mcp_tool
+
+    cancelled = asyncio.Event()
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class StalledTransport:
+        async def __aenter__(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_MCP_NEW_HTTP", True)
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(
+        mcp_tool, "streamable_http_client", lambda *args, **kwargs: StalledTransport(),
+        raising=False,
+    )
+    task = mcp_tool.MCPServerTask("meridian")
+
+    await _assert_inner_deadline(
+        task._run_http({"url": "https://example.invalid/mcp", "connect_timeout": 0.02})
+    )
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_sse_transport_entry_has_a_handshake_deadline(monkeypatch):
+    """An SSE stream without an endpoint event must not stall reconnection."""
+    from tools import mcp_tool
+
+    cancelled = asyncio.Event()
+
+    class StalledTransport:
+        async def __aenter__(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "sse_client", lambda **kwargs: StalledTransport())
+    task = mcp_tool.MCPServerTask("meridian")
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            task._run_http({
+                "url": "https://example.invalid/sse", "transport": "sse",
+                "connect_timeout": 0.02,
+            }),
+            timeout=0.5,
+        )
+    assert cancelled.is_set()
+    assert time.monotonic() - started < 0.2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "sse"])
+async def test_successful_handshake_stays_connected_past_connect_timeout(monkeypatch, transport):
+    """The handshake deadline must not kill a healthy long-lived session."""
+    import httpx
+    from tools import mcp_tool
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Transport(Client):
+        async def __aenter__(self):
+            if transport == "sse":
+                return object(), object()
+            return object(), object(), lambda: "session"
+
+    class Session(Client):
+        async def initialize(self):
+            return object()
+
+        async def list_tools(self):
+            return type("Tools", (), {"tools": []})()
+
+    async def wait_for_shutdown(self):
+        await asyncio.sleep(0.06)  # Longer than the 0.02s connect deadline.
+        return "shutdown"
+
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_MCP_NEW_HTTP", True)
+    monkeypatch.setattr(mcp_tool, "ClientSession", Session)
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_wait_for_lifecycle_event", wait_for_shutdown)
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(mcp_tool, "streamable_http_client", lambda *args, **kwargs: Transport())
+    monkeypatch.setattr(mcp_tool, "sse_client", lambda **kwargs: Transport())
+    task = mcp_tool.MCPServerTask("meridian")
+    config = {"url": "https://example.invalid/mcp", "connect_timeout": 0.02}
+    if transport == "sse":
+        config["transport"] = "sse"
+
+    await asyncio.wait_for(task._run_http(config), timeout=0.5)
+    assert task._ready.is_set()
+    assert task.session is not None
 
 
 @pytest.mark.asyncio

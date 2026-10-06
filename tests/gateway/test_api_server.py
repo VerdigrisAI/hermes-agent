@@ -35,6 +35,22 @@ from gateway.platforms.api_server import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _close_response_stores_after_test(monkeypatch):
+    """Close each test's SQLite handles before the next HTTP test starts."""
+    stores = []
+    original_init = ResponseStore.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        stores.append(self)
+
+    monkeypatch.setattr(ResponseStore, "__init__", tracked_init)
+    yield
+    for store in stores:
+        store.close()
+
+
 # ---------------------------------------------------------------------------
 # check_api_server_requirements
 # ---------------------------------------------------------------------------

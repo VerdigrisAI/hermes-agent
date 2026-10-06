@@ -557,6 +557,9 @@ def _live_system_guard(request, monkeypatch):
     except Exception:
         _psutil = None
         _initial_children = set()
+    # Retain handles for children spawned by this test. Some macOS sandboxes
+    # deny psutil's ancestry walk even for our own subprocesses.
+    _spawned_children = {}
 
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
@@ -569,13 +572,29 @@ def _live_system_guard(request, monkeypatch):
             return False
         if pid == test_pid or pid in _initial_children:
             return True
+        child = _spawned_children.get(pid)
+        if child is not None:
+            try:
+                if hasattr(child, "poll"):
+                    # Popen.poll() reaps this exact child; a reused PID cannot
+                    # pass after its process object has exited.
+                    if child.poll() is None:
+                        return True
+                elif (child.returncode is None and _psutil is not None
+                      and _psutil.Process(pid).ppid() == test_pid):
+                    return True
+            except Exception:
+                pass
+            _spawned_children.pop(pid, None)
         if _psutil is None:
             return False
         try:
             walker = _psutil.Process(pid)
-        except Exception:
+        except _psutil.NoSuchProcess:
             # Stale PID — kill would be a no-op anyway, allow it.
             return True
+        except Exception:
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
@@ -734,6 +753,7 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
+                _spawned_children[self.pid] = self
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -806,11 +826,15 @@ def _live_system_guard(request, monkeypatch):
             _check_subprocess_cmd(
                 "asyncio.create_subprocess_exec", [program, *args]
             )
-            return await real_async_exec(program, *args, **kwargs)
+            proc = await real_async_exec(program, *args, **kwargs)
+            _spawned_children.setdefault(proc.pid, proc)
+            return proc
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
             _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
-            return await real_async_shell(cmd, *args, **kwargs)
+            proc = await real_async_shell(cmd, *args, **kwargs)
+            _spawned_children.setdefault(proc.pid, proc)
+            return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
         monkeypatch.setattr(

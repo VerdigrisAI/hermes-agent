@@ -1541,9 +1541,7 @@ class MCPServerTask:
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
-                    self.initialize_result = await session.initialize()
-                    self.session = session
-                    await self._discover_tools()
+                    await self._initialize_and_discover(session, config)
                     self._ready.set()
                     # stdio transport does not use OAuth, but we still honor
                     # _reconnect_event (e.g. future manual /mcp refresh) for
@@ -1673,20 +1671,23 @@ class MCPServerTask:
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
-            async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
-                async with ClientSession(
-                    read_stream, write_stream, **sampling_kwargs
-                ) as session:
-                    self.initialize_result = await session.initialize()
-                    self.session = session
-                    await self._discover_tools()
-                    self._ready.set()
-                    reason = await self._wait_for_lifecycle_event()
-                    if reason == "reconnect":
-                        logger.info(
-                            "MCP server '%s': reconnect requested — "
-                            "tearing down SSE session", self.name,
-                        )
+            # sse_client waits for the initial endpoint event before it yields.
+            # Include that wait in the handshake deadline, but never time out
+            # a healthy SSE stream after tool discovery is complete.
+            async with asyncio.timeout(float(connect_timeout)) as handshake_deadline:
+                async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
+                    async with ClientSession(
+                        read_stream, write_stream, **sampling_kwargs
+                    ) as session:
+                        await self._initialize_and_discover(session, config)
+                        self._ready.set()
+                        handshake_deadline.reschedule(None)
+                        reason = await self._wait_for_lifecycle_event()
+                        if reason == "reconnect":
+                            logger.info(
+                                "MCP server '%s': reconnect requested — "
+                                "tearing down SSE session", self.name,
+                            )
             return
 
         if _MCP_NEW_HTTP:
@@ -1777,21 +1778,25 @@ class MCPServerTask:
 
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
-            async with httpx.AsyncClient(**client_kwargs) as http_client:
-                async with streamable_http_client(url, http_client=http_client) as (
-                    read_stream, write_stream, _get_session_id,
-                ):
-                    async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                        self.initialize_result = await session.initialize()
-                        self.session = session
-                        await self._discover_tools()
-                        self._ready.set()
-                        reason = await self._wait_for_lifecycle_event()
-                        if reason == "reconnect":
-                            logger.info(
-                                "MCP server '%s': reconnect requested — "
-                                "tearing down HTTP session", self.name,
-                            )
+            # The SDK transport can hang before it yields a ClientSession (for
+            # example while reopening a 429'd stream). A deadline around only
+            # initialize() would never run. Disarm it after the handshake so
+            # a healthy, long-lived connection is not interrupted.
+            async with asyncio.timeout(float(connect_timeout)) as handshake_deadline:
+                async with httpx.AsyncClient(**client_kwargs) as http_client:
+                    async with streamable_http_client(url, http_client=http_client) as (
+                        read_stream, write_stream, _get_session_id,
+                    ):
+                        async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                            await self._initialize_and_discover(session, config)
+                            self._ready.set()
+                            handshake_deadline.reschedule(None)
+                            reason = await self._wait_for_lifecycle_event()
+                            if reason == "reconnect":
+                                logger.info(
+                                    "MCP server '%s': reconnect requested — "
+                                    "tearing down HTTP session", self.name,
+                                )
         else:
             # Deprecated API (mcp < 1.24.0): manages httpx client internally,
             # so we can't install a per-request event hook.  Resolve any
@@ -1824,9 +1829,7 @@ class MCPServerTask:
                 read_stream, write_stream, _get_session_id,
             ):
                 async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                    self.initialize_result = await session.initialize()
-                    self.session = session
-                    await self._discover_tools()
+                    await self._initialize_and_discover(session, config)
                     self._ready.set()
                     reason = await self._wait_for_lifecycle_event()
                     if reason == "reconnect":
@@ -1834,6 +1837,28 @@ class MCPServerTask:
                             "MCP server '%s': reconnect requested — "
                             "tearing down legacy HTTP session", self.name,
                         )
+
+    async def _initialize_and_discover(self, session, config: dict):
+        """Bound one MCP handshake, including discovery, on every reconnect.
+
+        A stalled SDK initialize/list_tools call otherwise holds the sole
+        reconnect task forever after a 429 or a transport drop. The steady
+        connected session is not subject to this deadline.
+        """
+        try:
+            timeout = float(config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT))
+        except (TypeError, ValueError):
+            timeout = float(_DEFAULT_CONNECT_TIMEOUT)
+        if timeout <= 0:
+            timeout = float(_DEFAULT_CONNECT_TIMEOUT)
+        try:
+            async with asyncio.timeout(timeout):
+                self.initialize_result = await session.initialize()
+                self.session = session
+                await self._discover_tools()
+        except BaseException:
+            self.session = None
+            raise
 
     async def _discover_tools(self):
         """Discover tools from the connected session."""

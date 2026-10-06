@@ -192,13 +192,16 @@ class TestBuildAnthropicClient:
             assert "context-1m-2025-08-07" in betas
 
 
+@pytest.fixture(autouse=True)
+def no_real_keychain(monkeypatch):
+    """Keep credential tests independent of a developer's real macOS Keychain."""
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        lambda: None,
+    )
+
+
 class TestReadClaudeCodeCredentials:
-    @pytest.fixture(autouse=True)
-    def no_keychain(self, monkeypatch):
-        monkeypatch.setattr(
-            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
-            lambda: None,
-        )
 
     def test_reads_valid_credentials(self, tmp_path, monkeypatch):
         cred_file = tmp_path / ".claude" / ".credentials.json"

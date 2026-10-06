@@ -95,8 +95,9 @@ class TestStdioPidTracking:
         # Should not raise
         _kill_orphaned_mcp_children()
 
-    def test_kill_orphaned_handles_dead_pids(self):
+    def test_kill_orphaned_handles_dead_pids(self, monkeypatch):
         """_kill_orphaned_mcp_children gracefully handles already-dead PIDs."""
+        from tools import mcp_tool
         from tools.mcp_tool import (
             _kill_orphaned_mcp_children,
             _orphan_stdio_pids,
@@ -105,6 +106,13 @@ class TestStdioPidTracking:
 
         # Use a PID that definitely doesn't exist
         fake_pid = 999999999
+        def already_dead(pid, sig):
+            assert pid == fake_pid
+            raise ProcessLookupError(pid)
+
+        # The live-system guard correctly rejects even a fake external PID.
+        # Stub the OS boundary and still exercise the production exception path.
+        monkeypatch.setattr(mcp_tool.os, "kill", already_dead)
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
 
