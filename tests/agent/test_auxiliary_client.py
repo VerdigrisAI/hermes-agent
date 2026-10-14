@@ -2368,6 +2368,9 @@ class TestCodexAuxiliaryAdapterTimeout:
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class SlowAliveStream:
+            def __init__(self):
+                self.events_emitted = 0
+
             def __enter__(self):
                 return self
 
@@ -2377,6 +2380,7 @@ class TestCodexAuxiliaryAdapterTimeout:
             def __iter__(self):
                 for _ in range(5):
                     time.sleep(0.03)
+                    self.events_emitted += 1
                     yield SimpleNamespace(type="response.in_progress")
 
             def get_final_response(self):
@@ -2390,19 +2394,22 @@ class TestCodexAuxiliaryAdapterTimeout:
 
         class FakeResponses:
             def stream(self, **kwargs):
-                return SlowAliveStream()
+                return slow_stream
 
+        slow_stream = SlowAliveStream()
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # Five 30ms events would finish the stream after at least 150ms.
+        # Assert the deadline stopped it before completion, without depending
+        # on a 10ms wall-clock scheduling margin under parallel test load.
+        assert slow_stream.events_emitted < 5
 
 
 # ---------------------------------------------------------------------------
