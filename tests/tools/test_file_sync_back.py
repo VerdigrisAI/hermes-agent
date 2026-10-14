@@ -173,6 +173,8 @@ class TestSyncBackNewRemoteFile:
         assert host_file.read_bytes() == b"original"
 
     def test_existing_fifo_cannot_block_before_regular_file_check(self, tmp_path):
+        if os.name != "posix" or not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO creation needs POSIX mkfifo")
         mapped_dir = tmp_path / "skills"
         mapped_dir.mkdir()
         fifo = mapped_dir / "pipe"

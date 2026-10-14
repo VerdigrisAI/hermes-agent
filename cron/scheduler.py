@@ -534,7 +534,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> str | None:
+) -> tuple[str | None, list[tuple[str, bool]]]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -546,6 +546,7 @@ def _send_media_via_adapter(
     from gateway.platforms.base import should_send_media_as_audio
 
     first_error = None
+    failed_files: list[tuple[str, bool]] = []
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
@@ -568,6 +569,7 @@ def _send_media_via_adapter(
                 )
                 coro.close()
                 first_error = first_error or "gateway loop unavailable for native media delivery"
+                failed_files.append((media_path, _is_voice))
                 continue
             try:
                 result = future.result(timeout=30)
@@ -580,10 +582,12 @@ def _send_media_via_adapter(
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
                 first_error = first_error or "native media delivery failed"
+                failed_files.append((media_path, _is_voice))
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
             first_error = first_error or "native media delivery failed"
-    return first_error
+            failed_files.append((media_path, _is_voice))
+    return first_error, failed_files
 
 
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
@@ -694,6 +698,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         live_required = platform_name.lower() in require_live_for
         delivered = False
         live_text_delivered = False
+        retry_media_files = media_files
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
@@ -736,7 +741,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
                 # Send extracted media files as native attachments via the live adapter
                 if adapter_ok and media_files:
-                    media_error = _send_media_via_adapter(
+                    media_error, failed_media_files = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -747,6 +752,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
                     if media_error:
                         adapter_ok = False
+                        retry_media_files = failed_media_files
                         if live_required:
                             delivery_errors.append(f"delivery to {platform_name}:{chat_id} failed: {media_error}")
 
@@ -767,7 +773,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             fallback_content = "" if live_text_delivered else cleaned_delivery_content
-            coro = _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=retry_media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -777,7 +783,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=retry_media_files))
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"

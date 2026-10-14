@@ -2540,6 +2540,40 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert standalone.await_args.args[3] == ""
         assert standalone.await_args.kwargs["media_files"] == [("/tmp/report.pdf", False)]
 
+    def test_unguarded_partial_media_retry_omits_successful_attachment(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult, BasePlatformAdapter
+
+        config = MagicMock(platforms={Platform.DISCORD: MagicMock(enabled=True)})
+        adapter = MagicMock(send=AsyncMock(), send_document=AsyncMock())
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        attempts = []
+
+        def schedule(coro, _loop):
+            attempts.append(True)
+            coro.close()
+            future = Future()
+            future.set_result(SendResult(success=len(attempts) <= 2, error="upload denied"))
+            return future
+
+        attachments = [("/tmp/sent.pdf", False), ("/tmp/failed.pdf", False)]
+        standalone = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch.object(BasePlatformAdapter, "extract_media", return_value=(attachments, "text")), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            result = _deliver_result(
+                {"id": "partial-job", "deliver": "discord:12345"}, "text MEDIA:/tmp/sent.pdf MEDIA:/tmp/failed.pdf",
+                adapters={Platform.DISCORD: adapter}, loop=loop,
+            )
+        assert result is None
+        standalone.assert_awaited_once()
+        assert standalone.await_args.args[3] == ""
+        assert standalone.await_args.kwargs["media_files"] == [("/tmp/failed.pdf", False)]
+
     def test_live_adapter_timeout_cancels_future_and_falls_back(self):
         """End-to-end: live adapter hangs past the 60s budget, _deliver_result
         patches the timeout down to a fast value, confirms future.cancel() fires,
