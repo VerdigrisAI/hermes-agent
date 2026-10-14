@@ -144,6 +144,35 @@ async def test_http_transport_entry_has_a_handshake_deadline(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_legacy_http_transport_entry_has_a_handshake_deadline(monkeypatch):
+    """The older HTTP SDK also has to bound transport entry on reconnect."""
+    from tools import mcp_tool
+
+    cancelled = asyncio.Event()
+
+    class StalledTransport:
+        async def __aenter__(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_MCP_NEW_HTTP", False)
+    monkeypatch.setattr(mcp_tool, "streamablehttp_client", lambda *args, **kwargs: StalledTransport(), raising=False)
+    task = mcp_tool.MCPServerTask("meridian")
+
+    await _assert_inner_deadline(
+        task._run_http({"url": "https://example.invalid/mcp", "connect_timeout": 0.02})
+    )
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_sse_transport_entry_has_a_handshake_deadline(monkeypatch):
     """An SSE stream without an endpoint event must not stall reconnection."""
     from tools import mcp_tool

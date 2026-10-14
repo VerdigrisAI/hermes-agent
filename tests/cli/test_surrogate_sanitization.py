@@ -6,6 +6,7 @@ editors like Google Docs, OR from byte-level reasoning models (xiaomi/mimo,
 kimi, glm) emitting lone halves in reasoning output.
 """
 import json
+from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -320,14 +321,19 @@ class TestRunConversationSurrogateSanitization:
         mock_stream.return_value = mock_response
         mock_api.return_value = mock_response
 
-        agent = AIAgent(model="test/model", api_key="test-key", base_url="http://localhost:1234/v1", quiet_mode=True, skip_memory=True, skip_context_files=True)
+        # Keep the fake local URL from triggering a real model-metadata probe.
+        with patch("agent.context_compressor.get_model_context_length", return_value=128000):
+            agent = AIAgent(model="test/model", api_key="test-key", base_url="http://localhost:1234/v1", quiet_mode=True, skip_memory=True, skip_context_files=True)
         agent.client = MagicMock()
 
         # Pass a message with surrogates
-        result = agent.run_conversation(
-            user_message="test \udce2 message",
-            conversation_history=[],
-        )
+        with patch("agent.conversation_loop.estimate_usage_cost", return_value=SimpleNamespace(
+            amount_usd=None, status="unknown", source="test",
+        )):
+            result = agent.run_conversation(
+                user_message="test \udce2 message",
+                conversation_history=[],
+            )
 
         # The message stored in history should have surrogates replaced
         for msg in result.get("messages", []):

@@ -184,6 +184,27 @@ Cron job results can be delivered to any supported platform:
 
 For Telegram topics, use the format `telegram:<chat_id>:<thread_id>` (e.g., `telegram:-1001234567890:17585`).
 
+`cron.require_live_adapter_for` is an optional list of platform names. A
+listed platform uses only the running gateway adapter; missing or failed
+adapter delivery returns an error and never calls the standalone sender.
+Native media send failures are returned to the scheduler instead of counted
+as successful delivery. A text send may already have happened, so the caller
+must inspect the destination before a manual retry. The adapter remains
+responsible for its own policy checks at the mutation point.
+
+`run_job()` issues `HERMES_CRON_JOB_ID` from its actual job record as a
+task-local ContextVar. Its worker thread inherits a shared revocable identity.
+Timeout revokes it before interrupting the worker, and `finally` revokes it
+again, including on failure. A stored `origin` does not assert
+the running job's identity.
+
+An explicit `platform_toolsets.cron` list is an upper bound on agent tools.
+Saved per-job toolsets can restrict this list but cannot expand it. New plugins
+are not added to this explicit cron list. An empty or malformed list grants no
+agent tools. When the cron platform list is absent, legacy per-job and default
+toolset selection remains in effect. Native job setup and delivery are separate
+from model-invoked tools.
+
 ### Response Wrapping
 
 By default (`cron.wrap_response: true`), cron deliveries are wrapped with:

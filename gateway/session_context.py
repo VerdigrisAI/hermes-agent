@@ -38,6 +38,7 @@ needs to replace the import + call site:
 
 import threading
 from contextvars import ContextVar
+from threading import Event
 from typing import Any
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -67,6 +68,30 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+# Scheduler-issued identity for a running job. This is task-local; never read a
+# process-wide environment fallback as proof that a specific job is active.
+_CRON_JOB_ID: ContextVar = ContextVar("HERMES_CRON_JOB_ID", default="")
+
+
+class CronJobIdentity:
+    """Shared revocable identity across copied scheduler/worker contexts."""
+
+    def __init__(self, job_id: str):
+        self.job_id = str(job_id)
+        self._revoked = Event()
+
+    def revoke(self) -> None:
+        self._revoked.set()
+
+    def current(self) -> str:
+        return "" if self._revoked.is_set() else self.job_id
+
+
+def issue_cron_job_identity(job_id: str) -> CronJobIdentity:
+    """Issue one run identity; the scheduler must revoke it on exit."""
+    identity = CronJobIdentity(job_id)
+    _CRON_JOB_ID.set(identity)
+    return identity
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -81,6 +106,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_JOB_ID": _CRON_JOB_ID,
 }
 
 # Guards _VAR_MAP mutation + iteration. Plugin ``register(ctx)`` typically
@@ -176,6 +202,8 @@ def get_session_env(name: str, default: str = "") -> str:
     if var is not None:
         value = var.get()
         if value is not _UNSET:
+            if name == "HERMES_CRON_JOB_ID" and isinstance(value, CronJobIdentity):
+                return value.current()
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)

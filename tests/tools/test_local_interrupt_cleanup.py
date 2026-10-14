@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import tools.environments.base as base
 from tools.environments.local import LocalEnvironment
 
 
@@ -56,6 +57,69 @@ def _wait_for_pgid_exit(pgid: int, timeout: float = 10.0) -> bool:
             return True
         time.sleep(0.1)
     return not _pgid_still_alive(pgid)
+
+
+def test_interrupt_before_poll_guard_still_kills_process(monkeypatch):
+    env = object.__new__(LocalEnvironment)
+    proc = SimpleNamespace(pid=12345)
+    killed = []
+
+    def interrupted_setup(_proc, *, timeout):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(env, "_wait_for_process_inner", interrupted_setup)
+    monkeypatch.setattr(env, "_kill_process", killed.append)
+
+    with pytest.raises(KeyboardInterrupt):
+        env._wait_for_process(proc, timeout=60)
+    assert killed == [proc]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_cleanup_error_does_not_hide_interrupt(monkeypatch, interrupt):
+    env = object.__new__(LocalEnvironment)
+    proc = SimpleNamespace(pid=12345)
+
+    def interrupted_setup(_proc, *, timeout):
+        raise interrupt
+
+    def failed_cleanup(_proc):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(env, "_wait_for_process_inner", interrupted_setup)
+    monkeypatch.setattr(env, "_kill_process", failed_cleanup)
+
+    with pytest.raises(interrupt):
+        env._wait_for_process(proc)
+
+
+def test_interrupt_during_poll_kills_process_only_once(monkeypatch):
+    env = LocalEnvironment(cwd="/tmp")
+    proc = subprocess.Popen(
+        ["sleep", "30"], stdout=subprocess.PIPE, start_new_session=True,
+    )
+    kill = env._kill_process
+    killed = []
+
+    def count_and_kill(child):
+        killed.append(child)
+        kill(child)
+
+    def interrupt_poll(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(env, "_kill_process", count_and_kill)
+    monkeypatch.setattr(base, "touch_activity_if_due", interrupt_poll)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            env._wait_for_process(proc, timeout=60)
+        assert killed == [proc]
+    finally:
+        if proc.poll() is None:
+            kill(proc)
+        proc.wait(timeout=5)
+        if proc.stdout:
+            proc.stdout.close()
 
 
 def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):

@@ -1825,18 +1825,22 @@ class MCPServerTask:
             }
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
-            async with streamablehttp_client(url, **_http_kwargs) as (
-                read_stream, write_stream, _get_session_id,
-            ):
-                async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                    await self._initialize_and_discover(session, config)
-                    self._ready.set()
-                    reason = await self._wait_for_lifecycle_event()
-                    if reason == "reconnect":
-                        logger.info(
-                            "MCP server '%s': reconnect requested — "
-                            "tearing down legacy HTTP session", self.name,
-                        )
+            # The legacy SDK can also stall before yielding its transport.
+            # Limit only the handshake; leave an established session alive.
+            async with asyncio.timeout(float(connect_timeout)) as handshake_deadline:
+                async with streamablehttp_client(url, **_http_kwargs) as (
+                    read_stream, write_stream, _get_session_id,
+                ):
+                    async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                        await self._initialize_and_discover(session, config)
+                        self._ready.set()
+                        handshake_deadline.reschedule(None)
+                        reason = await self._wait_for_lifecycle_event()
+                        if reason == "reconnect":
+                            logger.info(
+                                "MCP server '%s': reconnect requested — "
+                                "tearing down legacy HTTP session", self.name,
+                            )
 
     async def _initialize_and_discover(self, session, config: dict):
         """Bound one MCP handshake, including discovery, on every reconnect.

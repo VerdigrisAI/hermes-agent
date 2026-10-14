@@ -74,6 +74,12 @@ Other supported platforms include `mattermost`, `homeassistant`, `dingtalk`, `fe
 
 If delivery fails, the job still runs — it just won't send anywhere. Check `hermes cron list` for updated `last_error` field (if available).
 
+If `cron.require_live_adapter_for` includes `slack`, the scheduler refuses a
+standalone Slack fallback. Check that the gateway is running, its Slack adapter
+is connected, and the adapter accepted both the message and any attachment.
+A failed native upload is a delivery error even if text was already sent.
+Do not retry automatically: first inspect the target for a partial delivery.
+
 ### Check 2: Check `[SILENT]` usage
 
 If your cron job produces no output or the agent responds with `[SILENT]`, delivery is suppressed. This is intentional for monitoring jobs — but make sure your prompt isn't accidentally suppressing everything.

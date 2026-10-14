@@ -101,6 +101,52 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _open_sync_back_destination(host_path: str, mapped_dir: str) -> tuple[int, bool]:
+    """Open a mapped file without following untrusted descendant directories.
+
+    Keep directory descriptors open while traversing so a remote-controlled
+    nested path cannot escape through an existing or swapped parent symlink.
+    """
+    relative = os.path.relpath(host_path, mapped_dir)
+    parts = Path(relative).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"unsafe sync-back destination: {host_path!r}")
+
+    # A path-based fallback can race a replacement of even a mapped leaf.
+    # Refuse all sync-back writes when handle-safe traversal is unavailable.
+    if os.name != "posix" or not getattr(os, "O_NOFOLLOW", 0) or not hasattr(os, "O_DIRECTORY"):
+        raise ValueError("secure sync-back requires POSIX O_NOFOLLOW and O_DIRECTORY")
+
+    dir_fd = None
+    try:
+        # The mapped directory itself is an explicit, trusted input. Resolve
+        # its existing location once; only descendants come from remote paths.
+        root = os.path.realpath(mapped_dir)
+        os.makedirs(root, exist_ok=True)
+        dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=dir_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+
+        leaf = parts[-1]
+        try:
+            fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+            return fd, False
+        except FileExistsError:
+            fd = os.open(leaf, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            return fd, True
+    except OSError as exc:
+        raise ValueError(f"unsafe sync-back destination: {host_path!r}") from exc
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
 _SYNC_BACK_MAX_RETRIES = 3
 _SYNC_BACK_BACKOFF = (2, 4, 8)  # seconds between retries
 _SYNC_BACK_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB — refuse to extract larger tars
@@ -442,14 +488,16 @@ class FileSyncManager:
 
                         # Resolve host path from cached mapping
                         host_path = self._resolve_host_path(remote_path, file_mapping)
+                        mapped_dir = os.path.dirname(host_path) if host_path is not None else None
                         if host_path is None:
-                            host_path = self._infer_host_path(remote_path, file_mapping)
-                            if host_path is None:
+                            inferred = self._infer_host_target(remote_path, file_mapping)
+                            if inferred is None:
                                 logger.debug(
                                     "sync_back: skipping %s (no host mapping)",
                                     remote_path,
                                 )
                                 continue
+                            host_path, mapped_dir = inferred
 
                         if os.path.exists(host_path) and pushed_hash is not None:
                             host_hash = _sha256_file(host_path)
@@ -461,27 +509,19 @@ class FileSyncManager:
                                     remote_path,
                                 )
 
-                        os.makedirs(os.path.dirname(host_path), exist_ok=True)
-                        if os.path.lexists(host_path) and not (
-                            os.path.isfile(host_path) and not os.path.islink(host_path)
-                        ):
-                            raise ValueError(f"unsafe sync-back destination: {host_path!r}")
-                        existed = os.path.exists(host_path)
-                        flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-                        flags |= 0 if existed else os.O_CREAT | os.O_EXCL
                         # Create private BEFORE writing. copy2's copyfile
                         # creates mode 0666 until copystat runs, exposing
                         # credentials during the copy under a permissive umask.
-                        fd = os.open(host_path, flags, 0o600)
+                        fd, existed = _open_sync_back_destination(host_path, mapped_dir)
                         try:
                             if not stat.S_ISREG(os.fstat(fd).st_mode):
                                 raise ValueError(f"unsafe sync-back destination: {host_path!r}")
+                            if not existed and executable_files.get(rel, False):
+                                os.fchmod(fd, 0o700)
                             os.ftruncate(fd, 0)
                             with open(staged_file, "rb") as source, os.fdopen(fd, "wb") as dest:
                                 fd = -1  # fdopen now owns the descriptor.
                                 shutil.copyfileobj(source, dest)
-                            if not existed and executable_files.get(rel, False):
-                                os.chmod(host_path, 0o700)
                         finally:
                             if fd >= 0:
                                 os.close(fd)
@@ -511,11 +551,17 @@ class FileSyncManager:
         ``~/.hermes/skills/a.md``, a new remote file at
         ``/root/.hermes/skills/b.md`` maps to ``~/.hermes/skills/b.md``.
         """
+        target = self._infer_host_target(remote_path, file_mapping)
+        return target[0] if target is not None else None
+
+    def _infer_host_target(self, remote_path: str,
+                           file_mapping: list[tuple[str, str]] | None = None) -> tuple[str, str] | None:
+        """Return an inferred destination and the explicitly mapped parent."""
         mapping = file_mapping if file_mapping is not None else []
         for host, remote in mapping:
             remote_dir = str(Path(remote).parent)
             if remote_path.startswith(remote_dir + "/"):
                 host_dir = str(Path(host).parent)
                 suffix = remote_path[len(remote_dir):]
-                return host_dir + suffix
+                return host_dir + suffix, host_dir
         return None

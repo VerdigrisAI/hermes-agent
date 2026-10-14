@@ -16,6 +16,7 @@ fcntl = pytest.importorskip("fcntl")
 
 from tools.environments.file_sync import (
     FileSyncManager,
+    _open_sync_back_destination,
     _sha256_file,
     _SYNC_BACK_BACKOFF,
     _SYNC_BACK_MAX_RETRIES,
@@ -158,6 +159,36 @@ class TestSyncBackAppliesChanged:
 
 class TestSyncBackNewRemoteFile:
     """File created on remote (not in _pushed_hashes) is applied via _infer_host_path."""
+
+    def test_unsupported_host_rejects_even_mapped_leaf(self, tmp_path):
+        mapped_dir = tmp_path / "host" / "skills"
+        mapped_dir.mkdir(parents=True)
+        host_file = mapped_dir / "existing.py"
+        host_file.write_bytes(b"original")
+
+        with patch("tools.environments.file_sync.os.O_NOFOLLOW", 0):
+            with pytest.raises(ValueError, match="secure sync-back requires POSIX"):
+                _open_sync_back_destination(str(host_file), str(mapped_dir))
+
+        assert host_file.read_bytes() == b"original"
+
+    def test_inferred_nested_file_cannot_follow_host_parent_symlink(self, tmp_path, caplog):
+        mapped = tmp_path / "host" / "skills" / "existing.py"
+        _write_file(mapped, b"original")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (mapped.parent / "redirect").symlink_to(outside, target_is_directory=True)
+        manager = _make_manager(
+            tmp_path, [(str(mapped), "/root/.hermes/skills/existing.py")],
+            _make_download_fn({"root/.hermes/skills/redirect/escape.py": b"remote"}),
+        )
+
+        with patch("tools.environments.file_sync._sleep"):
+            with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                manager.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert not (outside / "escape.py").exists()
+        assert any("unsafe sync-back destination" in record.message for record in caplog.records)
 
     def test_sync_back_detects_new_remote_file(self, tmp_path):
         # Existing mapping gives _infer_host_path a prefix to work with
