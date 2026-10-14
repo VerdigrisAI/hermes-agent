@@ -2507,6 +2507,39 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert "native media delivery failed" in result
         standalone.assert_not_awaited()
 
+    def test_unguarded_media_retry_does_not_repeat_sent_text_or_keep_stale_error(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult, BasePlatformAdapter
+
+        config = MagicMock(platforms={Platform.DISCORD: MagicMock(enabled=True)})
+        adapter = MagicMock(send=AsyncMock(), send_document=AsyncMock())
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        attempts = []
+
+        def schedule(coro, _loop):
+            attempts.append(True)
+            coro.close()
+            future = Future()
+            future.set_result(SendResult(success=len(attempts) == 1, error="upload denied"))
+            return future
+
+        standalone = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch.object(BasePlatformAdapter, "extract_media", return_value=([("/tmp/report.pdf", False)], "text")), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            result = _deliver_result(
+                {"id": "ordinary-job", "deliver": "discord:12345"}, "text MEDIA:/tmp/report.pdf",
+                adapters={Platform.DISCORD: adapter}, loop=loop,
+            )
+        assert result is None
+        standalone.assert_awaited_once()
+        assert standalone.await_args.args[3] == ""
+        assert standalone.await_args.kwargs["media_files"] == [("/tmp/report.pdf", False)]
+
     def test_live_adapter_timeout_cancels_future_and_falls_back(self):
         """End-to-end: live adapter hangs past the 60s budget, _deliver_result
         patches the timeout down to a fast value, confirms future.cancel() fires,

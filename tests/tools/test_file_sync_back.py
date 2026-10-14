@@ -172,6 +172,22 @@ class TestSyncBackNewRemoteFile:
 
         assert host_file.read_bytes() == b"original"
 
+    def test_existing_fifo_cannot_block_before_regular_file_check(self, tmp_path):
+        mapped_dir = tmp_path / "skills"
+        mapped_dir.mkdir()
+        fifo = mapped_dir / "pipe"
+        os.mkfifo(fifo)
+        real_open = os.open
+
+        def check_nonblocking(path, flags, *args, **kwargs):
+            if path == "pipe" and not flags & os.O_EXCL:
+                assert flags & os.O_NONBLOCK, "FIFO open would hang without a reader"
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch("tools.environments.file_sync.os.open", side_effect=check_nonblocking):
+            with pytest.raises(ValueError, match="unsafe sync-back destination"):
+                _open_sync_back_destination(str(fifo), str(mapped_dir))
+
     def test_inferred_nested_file_cannot_follow_host_parent_symlink(self, tmp_path, caplog):
         mapped = tmp_path / "host" / "skills" / "existing.py"
         _write_file(mapped, b"original")

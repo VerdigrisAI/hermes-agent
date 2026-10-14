@@ -693,6 +693,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         live_required = platform_name.lower() in require_live_for
         delivered = False
+        live_text_delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
@@ -718,19 +719,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             logger.warning("Job '%s': live adapter send to %s:%s failed (%s)",
                                            job["id"], platform_name, chat_id, err)
                             adapter_ok = False  # fall through to standalone path
-                        elif (
-                            send_result
-                            and thread_id
-                            and getattr(send_result, "raw_response", None)
-                            and send_result.raw_response.get("thread_fallback")
-                        ):
-                            requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
-                            msg = (
-                                f"configured thread_id {requested_thread_id} for "
-                                f"{platform_name}:{chat_id} was not found; delivered without thread_id"
-                            )
-                            logger.warning("Job '%s': %s", job["id"], msg)
-                            delivery_errors.append(msg)
+                        else:
+                            live_text_delivered = True
+                            if (
+                                thread_id
+                                and getattr(send_result, "raw_response", None)
+                                and send_result.raw_response.get("thread_fallback")
+                            ):
+                                requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
+                                msg = (
+                                    f"configured thread_id {requested_thread_id} for "
+                                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                                )
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                delivery_errors.append(msg)
 
                 # Send extracted media files as native attachments via the live adapter
                 if adapter_ok and media_files:
@@ -745,7 +747,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
                     if media_error:
                         adapter_ok = False
-                        delivery_errors.append(f"delivery to {platform_name}:{chat_id} failed: {media_error}")
+                        if live_required:
+                            delivery_errors.append(f"delivery to {platform_name}:{chat_id} failed: {media_error}")
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
@@ -763,7 +766,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.append(msg)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            fallback_content = "" if live_text_delivered else cleaned_delivery_content
+            coro = _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -773,7 +777,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=media_files))
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"

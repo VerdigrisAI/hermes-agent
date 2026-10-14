@@ -138,7 +138,8 @@ def _open_sync_back_destination(host_path: str, mapped_dir: str) -> tuple[int, b
             fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
             return fd, False
         except FileExistsError:
-            fd = os.open(leaf, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            # A FIFO opened for writing blocks before fstat can reject it.
+            fd = os.open(leaf, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dir_fd)
             return fd, True
     except OSError as exc:
         raise ValueError(f"unsafe sync-back destination: {host_path!r}") from exc
