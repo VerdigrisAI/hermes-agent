@@ -129,7 +129,12 @@ def _run_switch(raw_input: str, **extra):
     with patch(
         "hermes_cli.model_switch.list_provider_models",
         side_effect=fake_list_provider_models,
+    ), patch(
+        "hermes_cli.models.validate_requested_model",
+        return_value={"accepted": True, "persist": True, "recognized": True},
     ):
+        # Keep model validation on the same catalog snapshot as the switch.
+        # Otherwise a live/provider-local catalog can rewrite the model ID.
         return switch_model(raw_input=raw_input, **defaults)
 
 

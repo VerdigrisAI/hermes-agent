@@ -49,6 +49,8 @@ def _make_agent(monkeypatch, provider, api_mode="chat_completions", base_url="ht
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: _tool_defs("web_search", "terminal"))
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
+    # These tests exercise payloads, not the local server's model metadata.
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *a, **kw: 128000)
     kwargs = dict(
         api_key="test-key",
         base_url=base_url,

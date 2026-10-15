@@ -481,6 +481,17 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
 
     def _wait_for_process(self, proc: ProcessHandle, timeout: int = 120) -> dict:
+        """Own the subprocess from entry, including poll-loop setup."""
+        try:
+            return self._wait_for_process_inner(proc, timeout=timeout)
+        except (KeyboardInterrupt, SystemExit):
+            try:
+                self._kill_process(proc)
+            except Exception:
+                pass  # Do not mask the original interruption.
+            raise
+
+    def _wait_for_process_inner(self, proc: ProcessHandle, timeout: int = 120) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
         Shared across all backends — not overridden.
@@ -489,9 +500,8 @@ class BaseEnvironment(ABC):
         while the process is running so the gateway's inactivity timeout
         doesn't kill long-running commands.
 
-        Also wraps the poll loop in a ``try/finally`` that guarantees we
-        call ``self._kill_process(proc)`` if we exit via ``KeyboardInterrupt``
-        or ``SystemExit``.  Without this, the local backend (which spawns
+        The outer guard kills the child even when setup is interrupted.
+        Without this, the local backend (which spawns
         subprocesses with ``os.setsid`` into their own process group) leaves
         an orphan with ``PPID=1`` when python is shut down mid-tool — the
         ``sleep 300``-survives-30-min bug Physikal and I both hit.
@@ -678,10 +688,7 @@ class BaseEnvironment(ABC):
             # Signal arrived (SIGTERM/SIGHUP/SIGINT) or sys.exit() was called
             # while we were polling.  The local backend spawns subprocesses
             # with os.setsid, which puts them in their own process group — so
-            # if we let the interrupt propagate without killing the child,
-            # python exits and the child is reparented to init (PPID=1) and
-            # keeps running as an orphan.  Killing the process group here
-            # guarantees the tool's side effects stop when the agent stops.
+            # The outer guard kills the child once after this propagates.
             if _DEBUG_INTERRUPT:
                 logger.info(
                     "[interrupt-debug] _wait_for_process EXCEPTION_EXIT "
@@ -689,11 +696,6 @@ class BaseEnvironment(ABC):
                     _tid, _pid, _iter_count,
                     time.monotonic() - _activity_state["start"],
                 )
-            try:
-                self._kill_process(proc)
-                drain_thread.join(timeout=2)
-            except Exception:
-                pass  # cleanup is best-effort
             raise
 
         # Drain thread now exits promptly after bash does (~300ms idle
@@ -851,4 +853,3 @@ class BaseEnvironment(ABC):
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)
-

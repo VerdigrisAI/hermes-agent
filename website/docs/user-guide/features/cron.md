@@ -319,6 +319,35 @@ cron:
   wrap_response: false
 ```
 
+### Require a live adapter for governed delivery
+
+Set `cron.require_live_adapter_for` to a list of platform names when a
+scheduled delivery must pass through the running gateway adapter:
+
+```yaml
+cron:
+  require_live_adapter_for: [slack]
+```
+
+For these platforms, an absent or failed live adapter causes a delivery error.
+The scheduler does not retry through a standalone sender. This includes a
+native attachment failure; a prior text send cannot be undone. Check the
+job's delivery error and the gateway before retrying. This setting does not
+make an arbitrary model response or local file safe to publish. The gateway
+adapter must enforce its own authorization and artifact policy.
+
+The scheduler also sets a task-local `HERMES_CRON_JOB_ID` for the active run.
+It revokes the ID before interrupting a timed-out worker and after the job.
+A caller must not treat a process environment
+variable or a saved job origin as proof of a running scheduled job.
+
+To limit tools the scheduled agent can call, set `platform_toolsets.cron` in
+the main config. An explicit list also limits any toolsets saved on a job;
+only listed toolsets remain available. Plugins installed later do not join
+the list automatically. An empty list disables agent tools. If you omit the
+cron list, normal Hermes cron defaults still apply. Adapter delivery is not
+an agent tool and still follows its separate policy checks.
+
 ### Silent suppression
 
 If the agent's final response starts with `[SILENT]`, delivery is suppressed entirely. The output is still saved locally for audit (in `~/.hermes/cron/output/`), but no message is sent to the delivery target.

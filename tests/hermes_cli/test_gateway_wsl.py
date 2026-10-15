@@ -124,6 +124,12 @@ class TestWslSystemdOperational:
 class TestSupportsSystemdServicesWSL:
     """Test that supports_systemd_services() handles WSL correctly."""
 
+    @pytest.fixture(autouse=True)
+    def simulate_linux_with_systemctl(self, monkeypatch):
+        # The host can be macOS or a Linux test container.
+        monkeypatch.setattr(gateway.shutil, "which", lambda command: "/usr/bin/systemctl" if command == "systemctl" else None)
+        monkeypatch.setattr(gateway, "is_container", lambda: False)
+
     def test_wsl_with_systemd(self, monkeypatch):
         """WSL + working systemd → True."""
         monkeypatch.setattr(gateway, "is_linux", lambda: True)
@@ -146,6 +152,12 @@ class TestSupportsSystemdServicesWSL:
         monkeypatch.setattr(gateway, "is_termux", lambda: False)
         monkeypatch.setattr(gateway, "is_wsl", lambda: False)
         assert gateway.supports_systemd_services() is True
+
+    def test_linux_without_systemctl(self, monkeypatch):
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway.shutil, "which", lambda command: None)
+        assert gateway.supports_systemd_services() is False
 
     def test_termux_still_excluded(self, monkeypatch):
         """Termux → False regardless of WSL status."""

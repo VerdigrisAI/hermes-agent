@@ -18,6 +18,11 @@ import run_agent
 
 
 def _patch_bootstrap(monkeypatch):
+    # The token accounting tests do not need a running model metadata server.
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *a, **kw: 128000)
+    monkeypatch.setattr("agent.conversation_loop.estimate_usage_cost", lambda *a, **kw: SimpleNamespace(
+        amount_usd=None, status="unknown", source="test",
+    ))
     monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kwargs: [{
         "type": "function",
         "function": {"name": "t", "description": "t", "parameters": {"type": "object", "properties": {}}},

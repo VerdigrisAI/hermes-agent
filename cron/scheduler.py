@@ -61,12 +61,13 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
 
     Precedence:
-    1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update).
-       Keeps the agent's job-scoped toolset override intact — #6130.
-    2. Per-platform ``hermes tools`` config for the ``cron`` platform.
+    1. An explicit cron platform list is an upper bound, including for a
+       per-job override. Do not auto-enable newly installed plugins here.
+    2. Otherwise, per-job ``enabled_toolsets`` may override the defaults.
+    3. Per-platform ``hermes tools`` config for the ``cron`` platform.
        Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``)
        so users can gate cron toolsets globally without recreating every job.
-    3. ``None`` on any lookup failure — AIAgent loads the full default set
+    4. ``None`` on any lookup failure — AIAgent loads the full default set
        (legacy behavior before this change, preserved as the safety net).
 
     _DEFAULT_OFF_TOOLSETS ({moa, homeassistant, rl}) are removed by
@@ -75,6 +76,19 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     surprise $4.63 run).
     """
     per_job = job.get("enabled_toolsets")
+    configured = (cfg or {}).get("platform_toolsets") or {}
+    explicit = configured.get("cron") if isinstance(configured, dict) else None
+    if isinstance(configured, dict) and "cron" in configured and not isinstance(explicit, list):
+        logger.warning("Invalid cron platform toolset list; disabling cron agent tools")
+        return []
+    if isinstance(explicit, list):
+        allowed = [name for name in explicit if isinstance(name, str) and name.strip()]
+        if per_job:
+            allowed_names = set(allowed)
+            allowed = [name for name in per_job if name in allowed_names]
+        # AIAgent passes [] to get_tool_definitions, which treats only None as
+        # unrestricted. Empty means no agent tools, including new plugins.
+        return allowed
     if per_job:
         return per_job
     try:
@@ -520,7 +534,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+) -> tuple[str | None, list[tuple[str, bool]]]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -531,6 +545,8 @@ def _send_media_via_adapter(
 
     from gateway.platforms.base import should_send_media_as_audio
 
+    first_error = None
+    failed_files: list[tuple[str, bool]] = []
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
@@ -551,19 +567,27 @@ def _send_media_via_adapter(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
                 )
-                return
+                coro.close()
+                first_error = first_error or "gateway loop unavailable for native media delivery"
+                failed_files.append((media_path, _is_voice))
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
                 future.cancel()
                 raise
-            if result and not getattr(result, "success", True):
+            if (result is None or not getattr(result, "success", False)):
                 logger.warning(
                     "Job '%s': media send failed for %s: %s",
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
+                first_error = first_error or "native media delivery failed"
+                failed_files.append((media_path, _is_voice))
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            first_error = first_error or "native media delivery failed"
+            failed_files.append((media_path, _is_voice))
+    return first_error, failed_files
 
 
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
@@ -592,11 +616,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
     wrap_response = True
+    require_live_for: set[str] = set()
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
+        cron_cfg = user_cfg.get("cron", {})
+        wrap_response = cron_cfg.get("wrap_response", True)
+        required = cron_cfg.get("require_live_adapter_for", [])
+        if not isinstance(required, list) or any(not isinstance(p, str) for p in required):
+            return "cron.require_live_adapter_for must be a list of platform names"
+        require_live_for = {p.strip().lower() for p in required}
+    except Exception as exc:
+        logger.error("Job '%s': cron delivery policy unavailable: %s", job.get("id", "?"), exc)
+        return "cron delivery policy unavailable; delivery denied"
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -664,7 +695,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
+        live_required = platform_name.lower() in require_live_for
         delivered = False
+        live_text_delivered = False
+        retry_media_files = media_files
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
@@ -685,30 +719,29 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         except TimeoutError:
                             future.cancel()
                             raise
-                        if send_result and not getattr(send_result, "success", True):
+                        if (send_result is None or not getattr(send_result, "success", False)):
                             err = getattr(send_result, "error", "unknown")
-                            logger.warning(
-                                "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
-                                job["id"], platform_name, chat_id, err,
-                            )
+                            logger.warning("Job '%s': live adapter send to %s:%s failed (%s)",
+                                           job["id"], platform_name, chat_id, err)
                             adapter_ok = False  # fall through to standalone path
-                        elif (
-                            send_result
-                            and thread_id
-                            and getattr(send_result, "raw_response", None)
-                            and send_result.raw_response.get("thread_fallback")
-                        ):
-                            requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
-                            msg = (
-                                f"configured thread_id {requested_thread_id} for "
-                                f"{platform_name}:{chat_id} was not found; delivered without thread_id"
-                            )
-                            logger.warning("Job '%s': %s", job["id"], msg)
-                            delivery_errors.append(msg)
+                        else:
+                            live_text_delivered = True
+                            if (
+                                thread_id
+                                and getattr(send_result, "raw_response", None)
+                                and send_result.raw_response.get("thread_fallback")
+                            ):
+                                requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
+                                msg = (
+                                    f"configured thread_id {requested_thread_id} for "
+                                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                                )
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                delivery_errors.append(msg)
 
                 # Send extracted media files as native attachments via the live adapter
                 if adapter_ok and media_files:
-                    _send_media_via_adapter(
+                    media_error, failed_media_files = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -717,6 +750,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    if media_error:
+                        adapter_ok = False
+                        retry_media_files = failed_media_files
+                        if live_required:
+                            delivery_errors.append(f"delivery to {platform_name}:{chat_id} failed: {media_error}")
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
@@ -728,8 +766,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
+            if live_required:
+                msg = f"live adapter required for {platform_name}:{chat_id}; standalone delivery denied"
+                logger.error("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            fallback_content = "" if live_text_delivered else cleaned_delivery_content
+            coro = _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=retry_media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -739,7 +783,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, fallback_content, thread_id=thread_id, media_files=retry_media_files))
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
@@ -1333,7 +1377,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import set_session_vars, clear_session_vars, issue_cron_job_identity, _VAR_MAP
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -1362,6 +1406,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         chat_name="",
     )
     _cron_delivery_vars = (
+        "HERMES_CRON_JOB_ID",
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
@@ -1394,7 +1439,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         os.environ["TERMINAL_CWD"] = _job_workdir
         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
+    _job_identity = None
     try:
+        _job_identity = issue_cron_job_identity(job_id)
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
@@ -1645,6 +1692,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
         if _inactivity_timeout:
+            # A copied ContextVar stays in the agent worker after the parent
+            # returns. Revoke the shared lease before interrupting that worker.
+            _job_identity.revoke()
             # Build diagnostic summary from the agent's activity tracker.
             _activity = {}
             if hasattr(agent, "get_activity_summary"):
@@ -1743,6 +1793,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return False, output, "", error_msg
 
     finally:
+        if _job_identity is not None:
+            _job_identity.revoke()
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import signal
+import stat
 import tarfile
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ fcntl = pytest.importorskip("fcntl")
 
 from tools.environments.file_sync import (
     FileSyncManager,
+    _open_sync_back_destination,
     _sha256_file,
     _SYNC_BACK_BACKOFF,
     _SYNC_BACK_MAX_RETRIES,
@@ -157,6 +159,54 @@ class TestSyncBackAppliesChanged:
 
 class TestSyncBackNewRemoteFile:
     """File created on remote (not in _pushed_hashes) is applied via _infer_host_path."""
+
+    def test_unsupported_host_rejects_even_mapped_leaf(self, tmp_path):
+        mapped_dir = tmp_path / "host" / "skills"
+        mapped_dir.mkdir(parents=True)
+        host_file = mapped_dir / "existing.py"
+        host_file.write_bytes(b"original")
+
+        with patch("tools.environments.file_sync.os.O_NOFOLLOW", 0):
+            with pytest.raises(ValueError, match="secure sync-back requires POSIX"):
+                _open_sync_back_destination(str(host_file), str(mapped_dir))
+
+        assert host_file.read_bytes() == b"original"
+
+    def test_existing_fifo_cannot_block_before_regular_file_check(self, tmp_path):
+        if os.name != "posix" or not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO creation needs POSIX mkfifo")
+        mapped_dir = tmp_path / "skills"
+        mapped_dir.mkdir()
+        fifo = mapped_dir / "pipe"
+        os.mkfifo(fifo)
+        real_open = os.open
+
+        def check_nonblocking(path, flags, *args, **kwargs):
+            if path == "pipe" and not flags & os.O_EXCL:
+                assert flags & os.O_NONBLOCK, "FIFO open would hang without a reader"
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch("tools.environments.file_sync.os.open", side_effect=check_nonblocking):
+            with pytest.raises(ValueError, match="unsafe sync-back destination"):
+                _open_sync_back_destination(str(fifo), str(mapped_dir))
+
+    def test_inferred_nested_file_cannot_follow_host_parent_symlink(self, tmp_path, caplog):
+        mapped = tmp_path / "host" / "skills" / "existing.py"
+        _write_file(mapped, b"original")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (mapped.parent / "redirect").symlink_to(outside, target_is_directory=True)
+        manager = _make_manager(
+            tmp_path, [(str(mapped), "/root/.hermes/skills/existing.py")],
+            _make_download_fn({"root/.hermes/skills/redirect/escape.py": b"remote"}),
+        )
+
+        with patch("tools.environments.file_sync._sleep"):
+            with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                manager.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert not (outside / "escape.py").exists()
+        assert any("unsafe sync-back destination" in record.message for record in caplog.records)
 
     def test_sync_back_detects_new_remote_file(self, tmp_path):
         # Existing mapping gives _infer_host_path a prefix to work with
@@ -472,3 +522,258 @@ class TestSyncBackSizeCap:
         # Default cap (2 GiB) is far above our tiny tar; extraction should proceed
         mgr.sync_back(hermes_home=tmp_path / ".hermes")
         assert Path(host_file).read_bytes() == b"remote_version"
+
+
+class TestSyncBackArchiveSafety:
+    @pytest.mark.parametrize("original_mode", [0o600, 0o755])
+    def test_overwrite_keeps_host_permissions(self, tmp_path, original_mode):
+        host_file = tmp_path / "host" / "private"
+        _write_file(host_file, b"old")
+        host_file.chmod(original_mode)
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(str(host_file), "/root/.hermes/private")],
+            bulk_download_fn=_make_download_fn({"root/.hermes/private": b"new"}),
+        )
+        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert host_file.read_bytes() == b"new"
+        assert stat.S_IMODE(host_file.stat().st_mode) == original_mode
+
+    def test_new_remote_file_is_private_by_default(self, tmp_path):
+        host_file = tmp_path / "host" / "skills" / "old.md"
+        _write_file(host_file, b"old")
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(str(host_file), "/root/.hermes/skills/old.md")],
+            bulk_download_fn=_make_download_fn({"root/.hermes/skills/new.md": b"private"}),
+        )
+        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        new_file = host_file.parent / "new.md"
+        assert new_file.read_bytes() == b"private"
+        assert stat.S_IMODE(new_file.stat().st_mode) == 0o600
+
+    def test_new_destination_is_private_during_copy(self, tmp_path):
+        host_file = tmp_path / "host" / "skills" / "old.md"
+        _write_file(host_file, b"old")
+        new_file = host_file.parent / "new.md"
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(str(host_file), "/root/.hermes/skills/old.md")],
+            bulk_download_fn=_make_download_fn({"root/.hermes/skills/new.md": b"secret"}),
+        )
+        original_copy = __import__("shutil").copyfileobj
+        modes_during_copy = []
+
+        def checked_copy(source, dest, *args, **kwargs):
+            if new_file.exists():
+                modes_during_copy.append(stat.S_IMODE(new_file.stat().st_mode))
+            return original_copy(source, dest, *args, **kwargs)
+
+        old_umask = os.umask(0)
+        try:
+            with patch("tools.environments.file_sync.shutil.copyfileobj", checked_copy):
+                mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        finally:
+            os.umask(old_umask)
+        assert modes_during_copy == [0o600]
+        assert new_file.read_bytes() == b"secret"
+
+    def test_new_executable_is_private_and_executable(self, tmp_path):
+        host_file = tmp_path / "host" / "skills" / "old.md"
+        _write_file(host_file, b"old")
+
+        def download(dest):
+            with tarfile.open(dest, "w") as tar:
+                member = tarfile.TarInfo("root/.hermes/skills/run.sh")
+                member.mode = 0o777  # Never apply untrusted group/world permissions.
+                member.size = 3
+                tar.addfile(member, io.BytesIO(b"run"))
+
+        mgr = _make_manager(
+            tmp_path, [(str(host_file), "/root/.hermes/skills/old.md")], download,
+        )
+        old_umask = os.umask(0)
+        try:
+            mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        finally:
+            os.umask(old_umask)
+        new_file = host_file.parent / "run.sh"
+        assert new_file.read_bytes() == b"run"
+        assert stat.S_IMODE(new_file.stat().st_mode) == 0o700
+
+    def test_rejects_symlink_host_destination(self, tmp_path, caplog):
+        real_file = tmp_path / "outside" / "secret"
+        _write_file(real_file, b"secret")
+        host_file = tmp_path / "host" / "linked"
+        host_file.parent.mkdir()
+        host_file.symlink_to(real_file)
+        mgr = _make_manager(
+            tmp_path, [(str(host_file), "/root/.hermes/linked")],
+            _make_download_fn({"root/.hermes/linked": b"remote"}),
+        )
+        with patch("tools.environments.file_sync._sleep"):
+            with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert real_file.read_bytes() == b"secret"
+        assert host_file.is_symlink()
+        assert any("unsafe sync-back destination" in r.message for r in caplog.records)
+
+    def test_rejects_large_pax_metadata_before_parser_allocation(self, tmp_path, caplog):
+        host_file = _write_file(tmp_path / "host_skill.md", b"original")
+
+        def download(dest):
+            with tarfile.open(dest, "w", format=tarfile.PAX_FORMAT) as tar:
+                member = tarfile.TarInfo("root/.hermes/skill.md")
+                member.pax_headers = {"comment": "x" * 8192}
+                member.size = 6
+                tar.addfile(member, io.BytesIO(b"remote"))
+
+        mgr = _make_manager(tmp_path, [(host_file, "/root/.hermes/skill.md")], download)
+        with patch("tools.environments.file_sync._SYNC_BACK_MAX_METADATA_BYTES", 4096):
+            with patch("tools.environments.file_sync._sleep"):
+                with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                    mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert Path(host_file).read_bytes() == b"original"
+        assert any("metadata" in r.message for r in caplog.records)
+
+    def test_repeated_pax_headers_exhaust_cumulative_metadata_budget(self, tmp_path, caplog):
+        host_file = _write_file(tmp_path / "host_skill.md", b"original")
+
+        def download(dest):
+            with tarfile.open(dest, "w", format=tarfile.PAX_FORMAT) as tar:
+                for index in range(3):
+                    member = tarfile.TarInfo(f"root/.hermes/file{index}.md")
+                    member.pax_headers = {"comment": "x" * 2048}
+                    member.size = 1
+                    tar.addfile(member, io.BytesIO(b"x"))
+
+        mgr = _make_manager(tmp_path, [(host_file, "/root/.hermes/skill.md")], download)
+        with patch("tools.environments.file_sync._SYNC_BACK_MAX_METADATA_BYTES", 5120):
+            with patch("tools.environments.file_sync._sleep"):
+                with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                    mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert Path(host_file).read_bytes() == b"original"
+        assert any("metadata" in r.message for r in caplog.records)
+
+    def test_plain_file_payload_can_exceed_metadata_budget(self, tmp_path):
+        host_file = _write_file(tmp_path / "host_skill.md", b"original")
+        payload = b"x" * 32768
+        mgr = _make_manager(
+            tmp_path, [(host_file, "/root/.hermes/skill.md")],
+            _make_download_fn({"root/.hermes/skill.md": payload}),
+        )
+        with patch("tools.environments.file_sync._SYNC_BACK_MAX_METADATA_BYTES", 4096):
+            mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        assert Path(host_file).read_bytes() == payload
+
+    def test_global_pax_is_not_retained_per_member(self, tmp_path):
+        from tools.environments.file_sync import _extract_sync_back_tar
+
+        archive = tmp_path / "global-pax.tar"
+        with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as tar:
+            global_header = tarfile.TarInfo("global")
+            global_header.type = tarfile.XGLTYPE
+            global_header.pax_headers = {"comment": "x" * 4096}
+            tar.addfile(global_header)
+            for index in range(100):
+                member = tarfile.TarInfo(f"root/.hermes/{index}.txt")
+                member.size = 1
+                tar.addfile(member, io.BytesIO(b"x"))
+
+        with tarfile.open(archive, "r:") as tar:
+            _extract_sync_back_tar(tar, str(tmp_path / "stage"))
+            assert all(not member.pax_headers for member in tar.members)
+
+    def test_sync_back_limits_zero_byte_archive_entries(self, tmp_path, caplog):
+        host_file = _write_file(tmp_path / "host_skill.md", b"original")
+
+        def download(dest):
+            with tarfile.open(dest, "w") as tar:
+                for name in ("one", "two", "three"):
+                    tar.addfile(tarfile.TarInfo(f"root/.hermes/{name}"), io.BytesIO())
+
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(host_file, "/root/.hermes/skill.md")],
+            bulk_download_fn=download,
+        )
+        with patch("tools.environments.file_sync._SYNC_BACK_MAX_MEMBERS", 2):
+            with patch("tools.environments.file_sync._sleep"):
+                with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                    mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert Path(host_file).read_bytes() == b"original"
+        assert any("too many members" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("unsafe_member", [
+        "../escaped.txt",
+        "/escaped.txt",
+        "root/.hermes/../../escaped.txt",
+        "root/.hermes/../escaped.txt",
+        "root\\.hermes\\escaped.txt",
+        "C:/escaped.txt",
+    ])
+    def test_sync_back_rejects_archive_traversal(self, tmp_path, unsafe_member, caplog):
+        host_file = _write_file(tmp_path / "host_skill.md", b"original")
+        outside_file = tmp_path / "escaped.txt"
+
+        def download(dest):
+            _make_tar({unsafe_member: b"escaped"}, dest)
+
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(host_file, "/root/.hermes/skill.md")],
+            bulk_download_fn=download,
+        )
+        with patch("tools.environments.file_sync._sleep"):
+            with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert Path(host_file).read_bytes() == b"original"
+        assert not outside_file.exists()
+        assert any("all 3 attempts failed" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+    def test_sync_back_rejects_link_entries(self, tmp_path, link_type, caplog):
+        host_file = _write_file(tmp_path / "host_skill.md", b"original")
+
+        def download(dest):
+            with tarfile.open(dest, "w") as tar:
+                member = tarfile.TarInfo("root/.hermes/skill.md")
+                member.type = link_type
+                member.linkname = str(host_file)
+                tar.addfile(member)
+
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(host_file, "/root/.hermes/skill.md")],
+            bulk_download_fn=download,
+        )
+        with patch("tools.environments.file_sync._sleep"):
+            with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert Path(host_file).read_bytes() == b"original"
+        assert any("all 3 attempts failed" in r.message for r in caplog.records)
+
+    def test_sync_back_rejects_compressed_archive(self, tmp_path, caplog):
+        host_file = _write_file(tmp_path / "host_skill.md", b"original")
+
+        def download(dest):
+            with tarfile.open(dest, "w:gz") as tar:
+                member = tarfile.TarInfo("root/.hermes/skill.md")
+                content = b"x" * 65536
+                member.size = len(content)
+                tar.addfile(member, io.BytesIO(content))
+
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(host_file, "/root/.hermes/skill.md")],
+            bulk_download_fn=download,
+        )
+        with patch("tools.environments.file_sync._sleep"):
+            with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert Path(host_file).read_bytes() == b"original"
+        assert any("compressed sync-back archives" in r.message for r in caplog.records)

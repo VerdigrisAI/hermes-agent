@@ -7,9 +7,28 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestExplicitCronToolsetBoundary:
+    def test_explicit_list_excludes_implicit_plugin_defaults(self):
+        config = {"platform_toolsets": {"cron": ["mercator-report-api", "meridian"]}}
+        assert _resolve_cron_enabled_toolsets({}, config) == ["mercator-report-api", "meridian"]
+
+    def test_per_job_toolsets_cannot_expand_configured_boundary(self):
+        config = {"platform_toolsets": {"cron": ["mercator-report-api", "meridian"]}}
+        job = {"enabled_toolsets": ["terminal", "meridian", "execute_code"]}
+        assert _resolve_cron_enabled_toolsets(job, config) == ["meridian"]
+
+    def test_disjoint_job_toolsets_and_empty_platform_do_not_enable_defaults(self):
+        config = {"platform_toolsets": {"cron": ["meridian"]}}
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["terminal"]}, config) == []
+        assert _resolve_cron_enabled_toolsets({}, {"platform_toolsets": {"cron": []}}) == []
+        assert _resolve_cron_enabled_toolsets({}, {"platform_toolsets": {"cron": "terminal"}}) == []
+        from model_tools import get_tool_definitions
+        assert get_tool_definitions(enabled_toolsets=[], quiet_mode=True) == []
 
 
 class TestResolveOrigin:
@@ -853,6 +872,59 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_timed_out_worker_cannot_reuse_issued_job_id(self, tmp_path, monkeypatch):
+        """Parent cleanup must revoke the identity copied into an active worker."""
+        import threading
+        from gateway.session_context import get_session_env
+
+        job = {"id": "timed-out-job", "name": "stalled", "prompt": "hello", "deliver": "local"}
+        release = threading.Event()
+        finished = threading.Event()
+        seen = {}
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1")
+
+        class StalledAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                seen["before"] = get_session_env("HERMES_CRON_JOB_ID")
+                release.wait(timeout=5)
+                seen["after"] = get_session_env("HERMES_CRON_JOB_ID")
+                finished.set()
+                return {"final_response": "late"}
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 600}
+
+            def interrupt(self, *_args):
+                release.set()
+                assert finished.wait(timeout=5)
+
+            def close(self):
+                pass
+
+        def wait_for_started(futures, **kwargs):
+            # Let the worker record the identity before forcing inactivity.
+            for future in futures:
+                while "before" not in seen and not future.done():
+                    threading.Event().wait(0.001)
+            return set(), set()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=MagicMock()), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+                 "api_key": "test-key", "base_url": "https://example.invalid/v1",
+                 "provider": "openrouter", "api_mode": "chat_completions",
+             }), \
+             patch("run_agent.AIAgent", StalledAgent), \
+             patch("cron.scheduler.concurrent.futures.wait", side_effect=wait_for_started):
+            success, _, _, error = run_job(job)
+
+        assert not success
+        assert "timed out" in error.lower() or "idle" in error.lower()
+        assert seen == {"before": "timed-out-job", "after": ""}
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -1270,6 +1342,7 @@ class TestRunJobSessionPersistence:
         monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
         monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
         monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
+        monkeypatch.setenv("HERMES_CRON_JOB_ID", "forged-process-job")
 
         class FakeAgent:
             def __init__(self, *args, **kwargs):
@@ -1280,6 +1353,7 @@ class TestRunJobSessionPersistence:
                 seen["platform"] = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None
                 seen["chat_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None
                 seen["thread_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None
+                seen["job_id"] = get_session_env("HERMES_CRON_JOB_ID") or None
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -1304,10 +1378,14 @@ class TestRunJobSessionPersistence:
             "platform": "telegram",
             "chat_id": "-2002",
             "thread_id": None,
+            "job_id": "test-job",
         }
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        from gateway.session_context import get_session_env
+        assert get_session_env("HERMES_CRON_JOB_ID") == ""
+        assert os.getenv("HERMES_CRON_JOB_ID") == "forged-process-job"
         fake_db.close.assert_called_once()
 
     def test_run_job_clears_stale_auto_delivery_thread_id_between_jobs(self, tmp_path, monkeypatch):
@@ -1344,6 +1422,7 @@ class TestRunJobSessionPersistence:
                         "platform": get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None,
                         "chat_id": get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None,
                         "thread_id": get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None,
+                        "job_id": get_session_env("HERMES_CRON_JOB_ID") or None,
                     }
                 )
                 return {"final_response": "ok"}
@@ -1372,16 +1451,20 @@ class TestRunJobSessionPersistence:
                 "platform": "telegram",
                 "chat_id": "-1001",
                 "thread_id": "42",
+                "job_id": "threaded-job",
             },
             {
                 "platform": "telegram",
                 "chat_id": "-2002",
                 "thread_id": None,
+                "job_id": "threadless-job",
             },
         ]
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        from gateway.session_context import get_session_env
+        assert get_session_env("HERMES_CRON_JOB_ID") == ""
         assert fake_db.close.call_count == 2
 
 
@@ -2333,6 +2416,163 @@ class TestDeliverResultTimeoutCancelsFuture:
     adapter delivery path, _deliver_result must cancel the orphan
     coroutine so it cannot duplicate-send after the standalone fallback.
     """
+
+    @pytest.mark.parametrize("bad_policy", [None, "slack", ["slack", 42]])
+    def test_unreadable_or_invalid_policy_does_not_send(self, bad_policy):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        config = MagicMock(platforms={Platform.SLACK: pconfig})
+        standalone = AsyncMock(return_value={"success": True})
+        policy = (MagicMock(side_effect=ValueError("bad config")) if bad_policy is None
+                  else MagicMock(return_value={"cron": {"require_live_adapter_for": bad_policy}}))
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", new=policy), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            result = _deliver_result(
+                {"id": "job", "deliver": "slack:C12345678"}, "text",
+            )
+        assert "delivery denied" in result or "must be a list" in result
+        standalone.assert_not_awaited()
+
+    @pytest.mark.parametrize("adapter_present", [False, True])
+    def test_governed_slack_never_uses_standalone_fallback(self, adapter_present):
+        """A missing or failed gateway adapter cannot send governed Slack text."""
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        pconfig = MagicMock(enabled=True)
+        config = MagicMock(platforms={Platform.SLACK: pconfig})
+        adapter = MagicMock(send=AsyncMock(return_value=SendResult(success=False, error="denied")))
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        failure = Future()
+        failure.set_result(SendResult(success=False, error="denied"))
+
+        def schedule(coro, _loop):
+            coro.close()
+            return failure
+
+        standalone = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {
+                 "wrap_response": False, "require_live_adapter_for": ["slack"],
+             }}), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            result = _deliver_result(
+                {"id": "governed-job", "deliver": "slack:C12345678"}, "text",
+                adapters={Platform.SLACK: adapter} if adapter_present else {}, loop=loop,
+            )
+        assert "standalone delivery denied" in result
+        standalone.assert_not_awaited()
+
+    def test_governed_slack_media_failure_is_not_reported_as_success(self):
+        """A failed native upload must not trigger a second standalone send."""
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult, BasePlatformAdapter
+
+        pconfig = MagicMock(enabled=True)
+        config = MagicMock(platforms={Platform.SLACK: pconfig})
+        adapter = MagicMock(
+            send=AsyncMock(return_value=SendResult(success=True)),
+            send_document=AsyncMock(return_value=SendResult(success=False, error="upload denied")),
+        )
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        attempts = []
+
+        def schedule(coro, _loop):
+            attempts.append(True)
+            coro.close()
+            future = Future()
+            future.set_result(SendResult(success=len(attempts) == 1, error="upload denied"))
+            return future
+
+        standalone = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {
+                 "wrap_response": False, "require_live_adapter_for": ["slack"],
+             }}), \
+             patch.object(BasePlatformAdapter, "extract_media", return_value=([("/tmp/report.html", False)], "text")), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            result = _deliver_result(
+                {"id": "governed-job", "deliver": "slack:C12345678"}, "text MEDIA:/tmp/report.html",
+                adapters={Platform.SLACK: adapter}, loop=loop,
+            )
+        assert "native media delivery failed" in result
+        standalone.assert_not_awaited()
+
+    def test_unguarded_media_retry_does_not_repeat_sent_text_or_keep_stale_error(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult, BasePlatformAdapter
+
+        config = MagicMock(platforms={Platform.DISCORD: MagicMock(enabled=True)})
+        adapter = MagicMock(send=AsyncMock(), send_document=AsyncMock())
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        attempts = []
+
+        def schedule(coro, _loop):
+            attempts.append(True)
+            coro.close()
+            future = Future()
+            future.set_result(SendResult(success=len(attempts) == 1, error="upload denied"))
+            return future
+
+        standalone = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch.object(BasePlatformAdapter, "extract_media", return_value=([("/tmp/report.pdf", False)], "text")), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            result = _deliver_result(
+                {"id": "ordinary-job", "deliver": "discord:12345"}, "text MEDIA:/tmp/report.pdf",
+                adapters={Platform.DISCORD: adapter}, loop=loop,
+            )
+        assert result is None
+        standalone.assert_awaited_once()
+        assert standalone.await_args.args[3] == ""
+        assert standalone.await_args.kwargs["media_files"] == [("/tmp/report.pdf", False)]
+
+    def test_unguarded_partial_media_retry_omits_successful_attachment(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult, BasePlatformAdapter
+
+        config = MagicMock(platforms={Platform.DISCORD: MagicMock(enabled=True)})
+        adapter = MagicMock(send=AsyncMock(), send_document=AsyncMock())
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        attempts = []
+
+        def schedule(coro, _loop):
+            attempts.append(True)
+            coro.close()
+            future = Future()
+            future.set_result(SendResult(success=len(attempts) <= 2, error="upload denied"))
+            return future
+
+        attachments = [("/tmp/sent.pdf", False), ("/tmp/failed.pdf", False)]
+        standalone = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch.object(BasePlatformAdapter, "extract_media", return_value=(attachments, "text")), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            result = _deliver_result(
+                {"id": "partial-job", "deliver": "discord:12345"}, "text MEDIA:/tmp/sent.pdf MEDIA:/tmp/failed.pdf",
+                adapters={Platform.DISCORD: adapter}, loop=loop,
+            )
+        assert result is None
+        standalone.assert_awaited_once()
+        assert standalone.await_args.args[3] == ""
+        assert standalone.await_args.kwargs["media_files"] == [("/tmp/failed.pdf", False)]
 
     def test_live_adapter_timeout_cancels_future_and_falls_back(self):
         """End-to-end: live adapter hangs past the 60s budget, _deliver_result

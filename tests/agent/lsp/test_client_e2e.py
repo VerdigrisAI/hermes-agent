@@ -52,6 +52,23 @@ async def test_client_lifecycle_clean(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_mock_child_shutdown_without_psutil_ancestry(tmp_path: Path, monkeypatch):
+    """Only the spawned LSP child may receive a signal when ancestry is hidden."""
+    psutil = pytest.importorskip("psutil")
+    client = _client(tmp_path, "clean")
+    await client.start()
+    with monkeypatch.context() as mp:
+        def deny_parents(self):
+            raise psutil.AccessDenied(self.pid)
+
+        mp.setattr(psutil.Process, "parents", deny_parents)
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            os.kill(1, 0)  # Signal zero cannot terminate the foreign process.
+        await client.shutdown()
+    assert not client.is_running
+
+
+@pytest.mark.asyncio
 async def test_client_receives_published_errors(tmp_path: Path):
     f = tmp_path / "x.py"
     f.write_text("print('hi')\n")
